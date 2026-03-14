@@ -132,19 +132,33 @@ async function waitUntilReady(tabId, lockedVideoId) {
 }
 
 async function postToBackend(meta, blobs) {
+  const { token } = await chrome.storage.local.get(["token"]);
+  if (!token) {
+    throw new Error("Please sign in to the extension first.");
+  }
+
   const fd = new FormData();
   fd.append("meta", JSON.stringify(meta));
+
   for (let i = 0; i < blobs.length; i++) {
     const b = blobs[i];
     fd.append("files", b, b.__filename || `frame_${String(i).padStart(3, "0")}.jpg`);
   }
 
-  const res = await fetch(`${API_BASE}/api/analysis/capture`, { method: "POST", body: fd });
+  const res = await fetch(`${API_BASE}/api/analysis/capture`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+    body: fd,
+  });
+
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${txt}`.trim());
   }
-  return await res.json().catch(() => ({ ok: true }));
+
+  return await res.json();
 }
 
 async function ensureOffscreenDocument() {

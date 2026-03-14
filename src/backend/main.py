@@ -557,7 +557,7 @@ async def capture_analysis(
     request: Request,
     meta: str = Form(...),
     db: Session = Depends(get_db),
-    user: User = Depends(get_optional_user)
+    current_user: User = Depends(get_current_user),
 ):
     form_data = await request.form()
     files = form_data.getlist("files")
@@ -596,12 +596,9 @@ async def capture_analysis(
 
     frame_count = meta_data.get("frame_count") or (len(files) if files else None)
     frame_interval_ms = meta_data.get("frame_interval_ms")
-    
-    # Link to authenticated user if possible, otherwise fallback to user 1 or error
-    user_id = user.id if user else 1
 
     analysis = MediaAnalysis(
-        user_id=user_id,
+        user_id=current_user.id,
         platform=meta_data.get("platform"),
         page_url=meta_data.get("page_url"),
         video_id=meta_data.get("video_id"),
@@ -757,9 +754,20 @@ async def capture_analysis(
         "status": analysis.status,
     }
 
-@app.get("/api/analysis")
+@app.get("/api/analysis/{analysis_id}")
 def get_user_analyses(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    analyses = db.query(MediaAnalysis).filter(MediaAnalysis.user_id == current_user.id).order_by(MediaAnalysis.created_at.desc()).all()
+    analysis = (
+        db.query(MediaAnalysis)
+        .filter(
+            MediaAnalysis.id == analysis_id,
+            MediaAnalysis.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return {"ok": True, "data": serialize_analysis(analysis)}
+
     results = []
     for a in analyses:
         results.append({
