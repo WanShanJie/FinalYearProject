@@ -1,0 +1,209 @@
+.controlGrid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.controlCard,
+.rulesPanel,
+.workflowPanel,
+.tableSection {
+  padding: 18px;
+}
+
+.controlTop {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.controlTop strong,
+.ruleCard strong,
+.workflowItem strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.controlTop p,
+.ruleCard p,
+.workflowItem p,
+.infoBanner p {
+  color: var(--muted);
+  line-height: 1.6;
+  font-size: 0.9rem;
+}
+
+.switch {
+  width: 62px;
+  height: 34px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  padding: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.switchActive.switch_blue { background: var(--primary-soft); border-color: var(--border-strong); }
+.switchActive.switch_cyan { background: var(--cyan-soft); border-color: rgba(34, 211, 238, 0.25); }
+.switchActive.switch_amber { background: var(--warning-soft); border-color: rgba(245, 158, 11, 0.24); }
+
+.knob {
+  display: block;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--muted);
+  transition: transform 180ms ease, background 180ms ease;
+}
+
+.knobActive {
+  transform: translateX(28px);
+  background: var(--text);
+}
+
+.ruleList,
+.workflowList {
+  display: grid;
+  gap: 12px;
+}
+
+.syncButton {
+  min-height: 40px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.ruleCard {
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.ruleTopRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.ruleBadges {
+  display: grid;
+  gap: 8px;
+  justify-items: end;
+}
+
+.ruleFooter {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.workflowItem {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.stepBubble {
+  width: 32px;
+  height: 32px;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  background: var(--primary-soft);
+  border: 1px solid var(--border-strong);
+  color: var(--primary);
+  font-weight: 800;
+}
+
+.infoBanner {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.smallIcon {
+  width: 16px;
+  height: 16px;
+}
+
+.tableWrap {
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+.table th,
+.table td {
+  padding: 14px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.table th {
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.thumbCell {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.thumb {
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  display: grid;
+  place-items: center;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+  font-weight: 800;
+}
+
+.thumbCell span,
+.hashCell {
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+@media (max-width: 1100px) {
+  .controlGrid,
+  .ruleTopRow { grid-template-columns: 1fr; }
+  .controlGrid { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 760px) {
+  .ruleTopRow,
+  .ruleFooter { flex-direction: column; }
+}

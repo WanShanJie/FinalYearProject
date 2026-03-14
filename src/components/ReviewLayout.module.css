@@ -1,0 +1,229 @@
+.shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-columns: 290px 1fr;
+  background:
+    radial-gradient(circle at top right, rgba(45, 86, 255, 0.14), transparent 24%),
+    linear-gradient(180deg, #070d1a 0%, #0b1223 100%);
+  color: #edf3ff;
+}
+
+.sidebar {
+  background: linear-gradient(180deg, rgba(11, 18, 35, 0.98), rgba(9, 16, 31, 0.98));
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  padding: 24px 18px;
+}
+
+.brand {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 22px;
+}
+
+.brandMark {
+  width: 56px;
+  height: 56px;
+  display: grid;
+  place-items: center;
+  border-radius: 18px;
+  background: linear-gradient(135deg, #2d56ff, #5f87ff);
+  font-weight: 800;
+  font-size: 20px;
+  box-shadow: 0 16px 32px rgba(45, 86, 255, 0.24);
+}
+
+.brandSub {
+  font-size: 13px;
+  opacity: 0.76;
+}
+
+.sectionTitle {
+  margin: 18px 0 10px;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #90a4c9;
+}
+
+.navList {
+  display: grid;
+  gap: 10px;
+}
+
+.navCard {
+  display: grid;
+  gap: 6px;
+  padding: 15px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: rgba(255, 255, 255, 0.03);
+  text-decoration: none;
+  color: inherit;
+  transition: 0.2s ease;
+}
+
+.navCard strong {
+  font-size: 14px;
+}
+
+.navCard span {
+  font-size: 12px;
+  color: #9db0d1;
+}
+
+.navCard:hover,
+.navCardActive {
+  border-color: rgba(45, 86, 255, 0.45);
+  background: rgba(45, 86, 255, 0.18);
+  box-shadow: inset 0 0 0 1px rgba(45, 86, 255, 0.2);
+}
+
+.statGrid {
+  display: grid;
+  gap: 10px;
+}
+
+.statCard {
+  padding: 14px;
+  border-radius: 16px;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.statCard span {
+  display: block;
+  font-size: 12px;
+  color: #9db0d1;
+}
+
+.statCard strong {
+  display: block;
+  margin-top: 6px;
+  font-size: 24px;
+}
+
+.sideButton,
+.sideButtonAlt {
+  width: 100%;
+  padding: 12px 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  color: #edf3ff;
+  cursor: pointer;
+  margin-bottom: 10px;
+}
+
+.sideButton {
+  background: rgba(45, 86, 255, 0.2);
+}
+
+.sideButtonAlt {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.main {
+  padding: 24px;
+}
+
+.topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+
+.kicker {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: #8ea3cb;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.topbar h1 {
+  margin: 0;
+  font-size: 32px;
+}
+
+.subtitle {
+  margin: 8px 0 0;
+  max-width: 780px;
+  color: #9db0d1;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+.topActions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.iconButton,
+.logoutButton,
+.topTab {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.04);
+  color: #edf3ff;
+}
+
+.iconButton {
+  width: 42px;
+  height: 42px;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.logoutButton {
+  height: 42px;
+  padding: 0 16px;
+  border-radius: 14px;
+  cursor: pointer;
+}
+
+.tabRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.topTab {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 16px;
+  border-radius: 14px;
+  text-decoration: none;
+  transition: 0.2s ease;
+}
+
+.topTabActive,
+.topTab:hover {
+  background: rgba(45, 86, 255, 0.2);
+  border-color: rgba(45, 86, 255, 0.38);
+}
+
+.content {
+  display: grid;
+  gap: 18px;
+}
+
+@media (max-width: 1100px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    display: none;
+  }
+
+  .main {
+    padding: 18px;
+  }
+
+  .topbar {
+    flex-direction: column;
+  }
+}

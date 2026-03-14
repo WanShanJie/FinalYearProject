@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="popup.css" />
+  <title>Deepfake Verification</title>
+</head>
+
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">A²U</div>
+    </div>
+    <div class="status">
+      <span id="connDot" class="dot"></span>
+      <span id="connText">Ready</span>
+      <button id="btnSettings" class="iconBtn" title="Settings (placeholder)">⚙️</button>
+    </div>
+  </header>
+
+  <main class="card">
+    <section class="row">
+      <div class="label">Real-Time Protection</div>
+      <label class="switch" aria-label="Real-time protection toggle">
+        <input id="toggleMonitoring" type="checkbox" />
+        <span class="slider"></span>
+      </label>
+    </section>
+
+    <section class="center">
+      <div class="shield" aria-hidden="true">
+        <div class="shieldGlow"></div>
+        <div class="shieldIcon">🛡️</div>
+      </div>
+      <div class="title" id="fpTitle">Protection Paused</div>
+      <div class="sub" id="fpSub">Turn on Real-Time Protection to monitor media fingerprints.</div>
+    </section>
+
+    <section class="stats">
+      <div class="stat">
+        <div class="num" id="scannedCount">0</div>
+        <div class="cap">Scanned</div>
+      </div>
+      <div class="divider"></div>
+      <div class="stat">
+        <div class="num" id="blockedCount">0</div>
+        <div class="cap">Matched</div>
+      </div>
+    </section>
+  </main>
+
+  <main class="card">
+    <div class="label">Deep Media Analysis</div>
+    <button id="btnAnalyzeNow" class="btn">
+      <span class="btnIcon">✦</span>
+      Analyze This Page Now
+    </button>
+    <div id="analyzeMsg" class="hint">
+      Works even if Real-Time Protection is OFF. Sends a screenshot + page metadata to your backend.
+    </div>
+  </main>
+
+  <footer class="footer">
+    <a id="openDashboard" href="#">View Full Dashboard →</a>
+    <span class="ver">v0.2.1</span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+
+</html>

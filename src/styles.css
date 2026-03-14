@@ -1,0 +1,366 @@
+/* @tailwind base;
+@tailwind components;
+@tailwind utilities; */
+
+/* Optional: slightly nicer default font rendering */
+/* html, body {
+  height: 100%;
+} */
+
+/* src/styles.css */
+
+/* ---------- Base ---------- */
+:root {
+  --bg: #ffffff;
+  --text: #0f172a;            /* slate-900 */
+  --muted: #64748b;           /* slate-500 */
+  --muted-2: #94a3b8;         /* slate-400 */
+  --border: #e2e8f0;          /* slate-200 */
+  --primary: #2D56FF;
+  --navy: #0B1B55;
+  --shadow: 0 20px 25px -5px rgba(0,0,0,0.12), 0 10px 10px -5px rgba(0,0,0,0.08);
+}
+
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ---------- Layout ---------- */
+.authRoot {
+  min-height: 100vh;
+  width: 100%;
+  background: var(--bg);
+}
+
+.authGrid {
+  min-height: 100vh;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 1024px) {
+  .authGrid { grid-template-columns: 1fr 1fr; }
+}
+
+.leftPanel {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  padding: 40px 24px;
+}
+
+.leftInner {
+  width: 100%;
+  max-width: 420px;
+}
+
+.backLinkWrap {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  font-size: 14px;
+}
+
+.backLink {
+  text-decoration: none;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.backLink:hover { color: #334155; } /* slate-700 */
+
+/* ---------- Titles ---------- */
+.authTitle {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+
+.authSubtitle {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+/* ---------- Right panel (only desktop) ---------- */
+.rightPanel {
+  display: none;
+  position: relative;
+  overflow: hidden;
+  background: var(--navy);
+}
+
+@media (min-width: 1024px) {
+  .rightPanel { display: block; }
+}
+
+.gridOverlay {
+  position: absolute;
+  inset: 0;
+  opacity: 0.20;
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,0.10) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.10) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+.squares {
+  position: absolute;
+  right: 0;
+  top: 35%;
+  width: 256px;
+  height: 256px;
+  opacity: 0.20;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  padding: 0 8px 0 0;
+}
+
+.square {
+  border-radius: 3px;
+  background: rgba(255,255,255,0.10);
+}
+
+.centerBadgeWrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.centerBadge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.rightText {
+  text-align: center;
+}
+
+.rightTextTop {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.90);
+}
+
+.rightTextBottom {
+  margin: 4px 0 0;
+  font-size: 14px;
+  color: rgba(255,255,255,0.70);
+}
+
+.fab {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 999px;
+  background: var(--primary);
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 12px 20px rgba(0,0,0,0.25);
+}
+
+.fab:hover { filter: brightness(1.05); }
+
+/* ---------- Form blocks ---------- */
+.formSpace { margin-top: 24px; }
+
+.socialGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.socialBtn {
+  height: 40px;
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155; /* slate-700 */
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.socialBtn:hover { background: #f8fafc; } /* slate-50 */
+
+.divider {
+  margin: 24px 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.dividerLine {
+  height: 1px;
+  background: var(--border);
+  flex: 1;
+}
+
+.dividerText {
+  font-size: 12px;
+  color: var(--muted-2);
+}
+
+/* ---------- Inputs ---------- */
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.input {
+  margin-top: 6px;
+  width: 100%;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 12px;
+  font-size: 13px;
+  outline: none;
+}
+
+.input:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(45, 86, 255, 0.18);
+}
+
+.passwordWrap {
+  position: relative;
+  margin-top: 6px;
+}
+
+.passwordInput {
+  width: 100%;
+  height: 40px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0 40px 0 12px;
+  font-size: 13px;
+  outline: none;
+}
+
+.passwordInput:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 4px rgba(45, 86, 255, 0.18);
+}
+
+.eyeBtn {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  border: none;
+  background: transparent;
+  color: var(--muted-2);
+  cursor: pointer;
+}
+
+.eyeBtn:hover { color: var(--muted); }
+
+/* ---------- Rows ---------- */
+.rowBetween {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.checkboxRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.checkboxRow input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
+.link {
+  font-size: 13px;
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.link:hover { text-decoration: underline; }
+
+/* ---------- Buttons ---------- */
+.primaryBtn {
+  margin-top: 8px;
+  height: 40px;
+  width: 100%;
+  border: none;
+  border-radius: 6px;
+  background: var(--primary);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 12px rgba(45, 86, 255, 0.18);
+}
+
+.primaryBtn:hover { filter: brightness(1.05); }
+
+/* ---------- Small text ---------- */
+.bottomText {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+/* ---------- Sign up grid ---------- */
+.nameGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.termsRow {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.termsRow input {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--primary);
+}
+

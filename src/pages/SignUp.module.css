@@ -1,0 +1,40 @@
+.nameGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.termsRow {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.termsRow input {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
+  accent-color: var(--primary);
+}
+
+.inlineLink {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  color: #2563eb;        /* same blue link vibe */
+  text-decoration: none; /* or underline if you want */
+  cursor: pointer;
+  font: inherit;         /* same font as text */
+}
+
+.inlineLink:hover {
+  text-decoration: underline;
+}
+
+.inlineLink:focus {
+  outline: none;
+  text-decoration: underline;
+}

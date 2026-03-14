@@ -1,0 +1,253 @@
+:root {
+  --bg: #070b14;
+  --card: #0c1222;
+  --text: #e6eefc;
+  --muted: #94a3b8;
+  --accent: #1f8bff;
+  --green: #16f07a;
+  --border: rgba(255, 255, 255, .08);
+  --shadow: 0 10px 30px rgba(0, 0, 0, .35);
+}
+
+* {
+  box-sizing: border-box
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  width: 340px;
+  padding: 12px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 2px 10px 2px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px
+}
+
+.brand .logo {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, .08);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  box-shadow: var(--shadow);
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 12px rgba(22, 240, 122, .5)
+}
+
+.iconBtn {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .04);
+  color: var(--text);
+  border-radius: 10px;
+  padding: 6px 8px;
+  cursor: pointer;
+}
+
+.card {
+  background: linear-gradient(180deg, rgba(255, 255, 255, .03), rgba(255, 255, 255, .01));
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 14px;
+  margin-bottom: 12px;
+  box-shadow: var(--shadow);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between
+}
+
+.label {
+  color: var(--muted);
+  font-size: 12px;
+  margin-bottom: 8px
+}
+
+.center {
+  text-align: center;
+  padding: 8px 0 2px 0
+}
+
+.shield {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 64px;
+}
+
+.shieldGlow {
+  position: absolute;
+  width: 64px;
+  height: 64px;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(22, 240, 122, .35), rgba(22, 240, 122, 0) 60%);
+  filter: blur(2px);
+}
+
+.shieldIcon {
+  font-size: 42px;
+  z-index: 1;
+  filter: drop-shadow(0 0 10px rgba(22, 240, 122, .25));
+}
+
+.title {
+  font-weight: 800;
+  margin-top: 6px
+}
+
+.sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px
+}
+
+.stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  margin-top: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.stat {
+  text-align: center;
+  min-width: 120px
+}
+
+.num {
+  font-size: 26px;
+  font-weight: 900;
+  letter-spacing: .2px;
+}
+
+.cap {
+  color: var(--muted);
+  font-size: 12px
+}
+
+.divider {
+  width: 1px;
+  height: 38px;
+  background: var(--border)
+}
+
+.btn {
+  width: 100%;
+  background: linear-gradient(90deg, #1976ff, #22c1ff);
+  border: none;
+  color: white;
+  padding: 10px 12px;
+  border-radius: 14px;
+  font-weight: 800;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.btnIcon {
+  font-weight: 900
+}
+
+.hint {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  min-height: 18px
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 4px 0 4px;
+}
+
+.footer a {
+  color: #7cb7ff;
+  text-decoration: none;
+  font-size: 12px
+}
+
+.ver {
+  color: var(--muted);
+  font-size: 12px
+}
+
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 46px;
+  height: 26px
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(255, 255, 255, .12);
+  transition: .2s;
+  border-radius: 26px;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 20px;
+  width: 20px;
+  left: 3px;
+  bottom: 3px;
+  background: white;
+  transition: .2s;
+  border-radius: 50%;
+}
+
+input:checked+.slider {
+  background: rgba(22, 240, 122, .35)
+}
+
+input:checked+.slider:before {
+  transform: translateX(20px)
+}

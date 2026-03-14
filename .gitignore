@@ -1,0 +1,25 @@
+# --- Python Environment ---
+venv/
+.env
+__pycache__/
+*.pyc
+*.pth
+# Exclude pre-trained models (too large for GitHub)
+checkpoints/*.pth
+
+# --- Node/Extension (JS/JSX) ---
+node_modules/
+dist/
+build/
+.DS_Store
+
+# --- Project Specific Data ---
+# This ensures you don't upload thousands of face crops or raw frames
+backend/uploads/
+*_faces/
+*_raw/
+*_seq/
+
+# --- IDEs ---
+.vscode/
+.idea/

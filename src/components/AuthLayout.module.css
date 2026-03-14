@@ -1,0 +1,156 @@
+.root {
+  min-height: 100vh;
+  width: 100%;
+  background: var(--bg);
+}
+
+.grid {
+  min-height: 100vh;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 1fr;
+}
+
+@media (min-width: 1024px) {
+  .grid { grid-template-columns: 1fr 1fr; }
+}
+
+.leftPanel {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #fff;
+  padding: 40px 24px;
+}
+
+.leftInner {
+  width: 100%;
+  max-width: 420px;
+}
+
+.backLinkWrap {
+  position: absolute;
+  top: 24px;
+  left: 24px;
+  font-size: 14px;
+}
+
+.backLink {
+  text-decoration: none;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.backLink:hover { color: #334155; }
+
+.title {
+  margin: 0;
+  font-size: 30px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+
+.subtitle {
+  margin: 8px 0 0;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+.formSpace { margin-top: 24px; }
+
+/* Right Panel */
+.rightPanel {
+  display: none;
+  position: relative;
+  overflow: hidden;
+  background: var(--navy);
+}
+
+@media (min-width: 1024px) {
+  .rightPanel { display: block; }
+}
+
+.gridOverlay {
+  position: absolute;
+  inset: 0;
+  opacity: 0.20;
+  background-image:
+    linear-gradient(to right, rgba(255,255,255,0.10) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255,255,255,0.10) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+.squaresWrap {
+  position: absolute;
+  right: 0;
+  top: 35%;
+  width: 256px;
+  height: 256px;
+  opacity: 0.20;
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 8px;
+  padding-right: 8px;
+}
+
+.square {
+  border-radius: 3px;
+  background: rgba(255,255,255,0.10);
+}
+
+.centerBadgeWrap {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 32px;
+}
+
+.centerBadge {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+.logoCard {
+  background: rgba(255,255,255,0.90);
+  border-radius: 16px;
+  padding: 24px;
+  box-shadow: var(--shadow-lg);
+}
+
+.rightText { text-align: center; }
+
+.rightTop {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.90);
+}
+
+.rightBottom {
+  margin: 4px 0 0;
+  font-size: 14px;
+  color: rgba(255,255,255,0.70);
+}
+
+.fab {
+  position: absolute;
+  bottom: 24px;
+  right: 24px;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 999px;
+  background: var(--primary);
+  color: #fff;
+  cursor: pointer;
+  box-shadow: 0 12px 20px rgba(0,0,0,0.25);
+}
+
+.fab:hover { filter: brightness(1.05); }

@@ -1,0 +1,217 @@
+.settingsGrid,
+.configGrid {
+  display: grid;
+  grid-template-columns: 1.15fr 1fr;
+  gap: 16px;
+}
+
+.configGrid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.settingPanel,
+.smallCard {
+  padding: 18px;
+}
+
+.toggleList {
+  display: grid;
+  gap: 12px;
+}
+
+.toggleRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.toggleRow strong,
+.smallCard strong,
+.sliderHeader strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.toggleRow p,
+.smallCard p,
+.appearanceNote,
+.hintBox {
+  color: var(--muted);
+  line-height: 1.65;
+  font-size: 0.9rem;
+}
+
+.switch {
+  width: 62px;
+  height: 34px;
+  padding: 4px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.switchActive {
+  background: var(--primary-soft);
+  border-color: var(--border-strong);
+}
+
+.knob {
+  display: block;
+  width: 24px;
+  height: 24px;
+  border-radius: 999px;
+  background: var(--muted);
+  transition: transform 180ms ease, background 180ms ease;
+}
+
+.knobActive {
+  transform: translateX(28px);
+  background: var(--text);
+}
+
+.sliderBlock {
+  margin-top: 18px;
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.sliderHeader,
+.auditRow,
+.inputRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+}
+
+.sliderHeader span {
+  color: var(--primary);
+  font-weight: 800;
+}
+
+.range {
+  width: 100%;
+  margin-top: 12px;
+}
+
+.sliderFoot {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.themeChooser {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.themeCard {
+  padding: 18px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.themeCardActive {
+  background: var(--primary-soft);
+  border-color: var(--border-strong);
+}
+
+.themeIcon,
+.smallIcon {
+  width: 18px;
+  height: 18px;
+}
+
+.themeCard strong {
+  display: block;
+  margin-top: 12px;
+  margin-bottom: 8px;
+}
+
+.themeCard span {
+  color: var(--muted);
+  line-height: 1.55;
+  font-size: 0.9rem;
+}
+
+.appearanceNote {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.formGroup label {
+  display: block;
+  margin-bottom: 10px;
+  color: var(--muted);
+}
+
+.inputRow input {
+  flex: 1;
+  min-height: 46px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  padding: 0 14px;
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  outline: 0;
+}
+
+.inputRow button {
+  min-width: 88px;
+  min-height: 46px;
+  border-radius: 14px;
+  border: 1px solid transparent;
+  background: var(--primary);
+  color: white;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.hintBox {
+  margin-top: 14px;
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.auditRows {
+  display: grid;
+  gap: 12px;
+}
+
+.auditRow {
+  padding: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.auditRow span {
+  color: var(--muted);
+}
+
+@media (max-width: 1100px) {
+  .settingsGrid,
+  .configGrid,
+  .themeChooser { grid-template-columns: 1fr; }
+}
