@@ -206,3 +206,14 @@ export function LockIcon(props) {
     </BaseIcon>
   );
 }
+
+
+export function LinkIcon(props) {
+  return (
+    <BaseIcon {...props}>
+      <path d="M10.5 13.5l3-3" />
+      <path d="M7.2 16.8l-1.4 1.4a3.5 3.5 0 1 1-5-5l3.2-3.2a3.5 3.5 0 0 1 5 0" />
+      <path d="M16.8 7.2l1.4-1.4a3.5 3.5 0 1 1 5 5L20 14a3.5 3.5 0 0 1-5 0" />
+    </BaseIcon>
+  );
+}

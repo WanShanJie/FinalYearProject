@@ -15,13 +15,14 @@ from starlette.middleware.sessions import SessionMiddleware
 from jose import jwt, JWTError
 
 from db import SessionLocal, engine, Base
-from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis
-from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn
-from auth import hash_password, verify_password, create_token
+from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ExtensionLinkRequest, LinkedExtension
+from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn
+from auth import hash_password, verify_password, create_token, create_extension_token
 from oauth_routes import router as oauth_router
 from password_reset import make_reset_token, hash_token, expires_at_dt
 from email_utils import send_reset_email, send_mfa_code, send_email_verification_code
 from typing import List, Optional
+from base64 import urlsafe_b64encode
 
 from opencv_pipeline import process_frames_for_sequence
 import os as _os
@@ -43,32 +44,77 @@ def get_db():
     finally:
         db.close()
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+def _decode_access_token(token: str) -> dict:
     from auth import SECRET_KEY, ALGORITHM
-    if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         user_id_str = payload.get("sub")
         if user_id_str is None:
             raise HTTPException(status_code=401, detail="Invalid token")
-        user_id = int(user_id_str)
+        payload["sub"] = int(user_id_str)
+        return payload
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    
+
+
+def _hash_extension_token(raw_token: str) -> str:
+    return _sha256_hex(f"extension:{raw_token}:{JWT_SECRET}")
+
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    payload = _decode_access_token(token)
+    user_id = payload["sub"]
+
+    if payload.get("type") == "extension":
+        linked_extension_id = payload.get("linked_extension_id")
+        if not linked_extension_id:
+            raise HTTPException(status_code=401, detail="Invalid extension token")
+
+        linked_extension = (
+            db.query(LinkedExtension)
+            .filter(
+                LinkedExtension.id == int(linked_extension_id),
+                LinkedExtension.user_id == user_id,
+                LinkedExtension.is_active == True,
+                LinkedExtension.revoked_at.is_(None),
+                LinkedExtension.token_hash == _hash_extension_token(token),
+            )
+            .first()
+        )
+        if not linked_extension:
+            raise HTTPException(status_code=401, detail="Extension token revoked or invalid")
+        linked_extension.last_seen_at = _utcnow()
+        db.commit()
+
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+
+def get_portal_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    payload = _decode_access_token(token)
+    if payload.get("type") == "extension":
+        raise HTTPException(status_code=403, detail="Portal session required")
+
+    user = db.query(User).filter(User.id == payload["sub"]).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
 def get_optional_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     if not token:
         return None
     try:
-        from auth import SECRET_KEY, ALGORITHM
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        user_id = int(payload.get("sub"))
-        return db.query(User).filter(User.id == user_id).first()
+        payload = _decode_access_token(token)
+        return db.query(User).filter(User.id == payload["sub"]).first()
     except Exception:
         return None
 
@@ -86,6 +132,8 @@ MFA_MAX_ATTEMPTS = int(os.getenv("MFA_MAX_ATTEMPTS", "5"))
 TRUST_DEVICE_DAYS = int(os.getenv("TRUST_DEVICE_DAYS", "30"))
 
 JWT_SECRET = os.getenv("JWT_SECRET_KEY", "1234567890abcdef")
+EXTENSION_LINK_TTL_MIN = int(os.getenv("EXTENSION_LINK_TTL_MIN", "5"))
+EXTENSION_TOKEN_EXPIRE_DAYS = int(os.getenv("EXTENSION_TOKEN_EXPIRE_DAYS", "30"))
 
 # ----- Helpers -----
 def _sha256_hex(value: str) -> str:
@@ -112,6 +160,41 @@ def _new_otp_code() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _pkce_challenge_for_verifier(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    return urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+
+def _serialize_analysis(analysis: MediaAnalysis) -> dict:
+    return {
+        "id": analysis.id,
+        "title": analysis.title or "Unknown Media",
+        "platform": analysis.platform,
+        "page_url": analysis.page_url,
+        "content_url": analysis.content_url,
+        "video_id": analysis.video_id,
+        "verdict": analysis.verdict,
+        "score": analysis.score,
+        "status": analysis.status,
+        "capture_mode": analysis.capture_mode,
+        "extension_version": analysis.extension_version,
+        "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
+        "meta": analysis.meta or {},
+    }
+
+
+def _serialize_linked_extension(device: LinkedExtension) -> dict:
+    return {
+        "id": device.id,
+        "device_name": device.device_name,
+        "extension_version": device.extension_version,
+        "last_seen_at": device.last_seen_at.isoformat() if device.last_seen_at else None,
+        "created_at": device.created_at.isoformat() if device.created_at else None,
+        "is_active": bool(device.is_active and device.revoked_at is None),
+        "revoked_at": device.revoked_at.isoformat() if device.revoked_at else None,
+    }
 
 def _issue_user_token(user: User) -> dict:
     token = create_token(user.id, user.email)
@@ -428,6 +511,212 @@ def forgot_password(data: ForgotPasswordIn, db: Session = Depends(get_db)):
     return generic_msg
 
 
+
+
+
+@app.post("/api/extension/link/request")
+def create_extension_link_request(data: ExtensionLinkRequestIn, db: Session = Depends(get_db)):
+    existing = db.query(ExtensionLinkRequest).filter(ExtensionLinkRequest.request_id == data.request_id).first()
+    now = _utcnow()
+
+    if existing and existing.status in {"pending", "approved"} and existing.expires_at > now:
+        return {
+            "ok": True,
+            "request_id": existing.request_id,
+            "status": existing.status,
+            "expires_at": existing.expires_at.isoformat(),
+        }
+
+    if existing:
+        existing.code_challenge = data.code_challenge
+        existing.device_name = data.device_name or "Chrome Extension"
+        existing.extension_version = data.extension_version
+        existing.user_id = None
+        existing.status = "pending"
+        existing.expires_at = now + timedelta(minutes=EXTENSION_LINK_TTL_MIN)
+        existing.approved_at = None
+        existing.redeemed_at = None
+        db.commit()
+        return {
+            "ok": True,
+            "request_id": existing.request_id,
+            "status": existing.status,
+            "expires_at": existing.expires_at.isoformat(),
+        }
+
+    req = ExtensionLinkRequest(
+        request_id=data.request_id,
+        code_challenge=data.code_challenge,
+        device_name=data.device_name or "Chrome Extension",
+        extension_version=data.extension_version,
+        status="pending",
+        expires_at=now + timedelta(minutes=EXTENSION_LINK_TTL_MIN),
+    )
+    db.add(req)
+    db.commit()
+    db.refresh(req)
+    return {
+        "ok": True,
+        "request_id": req.request_id,
+        "status": req.status,
+        "expires_at": req.expires_at.isoformat(),
+    }
+
+
+@app.get("/api/extension/link/request/{request_id}")
+def get_extension_link_request_status(request_id: str, db: Session = Depends(get_db)):
+    req = db.query(ExtensionLinkRequest).filter(ExtensionLinkRequest.request_id == request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Link request not found")
+
+    if req.status in {"pending", "approved"} and req.expires_at <= _utcnow():
+        req.status = "expired"
+        db.commit()
+
+    return {
+        "ok": True,
+        "request_id": req.request_id,
+        "status": req.status,
+        "device_name": req.device_name,
+        "extension_version": req.extension_version,
+        "expires_at": req.expires_at.isoformat() if req.expires_at else None,
+        "approved": req.status == "approved",
+    }
+
+
+@app.post("/api/extension/link/approve")
+def approve_extension_link_request(
+    data: ExtensionLinkApproveIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_portal_user),
+):
+    req = db.query(ExtensionLinkRequest).filter(ExtensionLinkRequest.request_id == data.request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Link request not found")
+
+    now = _utcnow()
+    if req.expires_at <= now:
+        req.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Link request expired")
+
+    if req.status == "redeemed":
+        raise HTTPException(status_code=400, detail="Link request already used")
+
+    req.user_id = current_user.id
+    req.status = "approved"
+    req.approved_at = now
+    db.commit()
+
+    return {
+        "ok": True,
+        "status": req.status,
+        "device_name": req.device_name,
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "first_name": current_user.first_name,
+            "last_name": current_user.last_name,
+        },
+    }
+
+
+@app.post("/api/extension/link/redeem")
+def redeem_extension_link_request(data: ExtensionLinkRedeemIn, db: Session = Depends(get_db)):
+    req = db.query(ExtensionLinkRequest).filter(ExtensionLinkRequest.request_id == data.request_id).first()
+    if not req:
+        raise HTTPException(status_code=404, detail="Link request not found")
+
+    now = _utcnow()
+    if req.expires_at <= now:
+        req.status = "expired"
+        db.commit()
+        raise HTTPException(status_code=400, detail="Link request expired")
+
+    if req.status != "approved" or not req.user_id:
+        raise HTTPException(status_code=400, detail="Link request not approved yet")
+
+    expected_challenge = _pkce_challenge_for_verifier(data.code_verifier)
+    if not hmac.compare_digest(expected_challenge, req.code_challenge):
+        raise HTTPException(status_code=400, detail="Invalid code verifier")
+
+    user = db.query(User).filter(User.id == req.user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    device = LinkedExtension(
+        user_id=user.id,
+        link_request_id=req.id,
+        device_name=req.device_name or "Chrome Extension",
+        extension_version=req.extension_version,
+        token_hash="pending",
+        last_seen_at=now,
+        is_active=True,
+    )
+    db.add(device)
+    db.flush()
+
+    token = create_extension_token(
+        user.id,
+        user.email,
+        device.id,
+        scopes=["analysis:create", "analysis:read:self"],
+        expires_days=EXTENSION_TOKEN_EXPIRE_DAYS,
+    )
+    device.token_hash = _hash_extension_token(token)
+
+    req.status = "redeemed"
+    req.redeemed_at = now
+
+    db.commit()
+    db.refresh(device)
+
+    return {
+        "ok": True,
+        "status": "linked",
+        "extension_token": token,
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name,
+        },
+        "device": _serialize_linked_extension(device),
+    }
+
+
+@app.get("/api/extension/devices")
+def list_extension_devices(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_portal_user),
+):
+    devices = (
+        db.query(LinkedExtension)
+        .filter(LinkedExtension.user_id == current_user.id)
+        .order_by(LinkedExtension.created_at.desc())
+        .all()
+    )
+    return {"ok": True, "data": [_serialize_linked_extension(d) for d in devices]}
+
+
+@app.post("/api/extension/devices/{device_id}/revoke")
+def revoke_extension_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_portal_user),
+):
+    device = (
+        db.query(LinkedExtension)
+        .filter(LinkedExtension.id == device_id, LinkedExtension.user_id == current_user.id)
+        .first()
+    )
+    if not device:
+        raise HTTPException(status_code=404, detail="Linked extension not found")
+
+    device.is_active = False
+    device.revoked_at = _utcnow()
+    db.commit()
+    return {"ok": True, "message": "Extension revoked"}
 
 
 def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_result: dict) -> dict:
@@ -754,8 +1043,19 @@ async def capture_analysis(
         "status": analysis.status,
     }
 
+@app.get("/api/analysis")
+def list_user_analyses(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    analyses = (
+        db.query(MediaAnalysis)
+        .filter(MediaAnalysis.user_id == current_user.id)
+        .order_by(MediaAnalysis.created_at.desc())
+        .all()
+    )
+    return {"ok": True, "data": [_serialize_analysis(a) for a in analyses]}
+
+
 @app.get("/api/analysis/{analysis_id}")
-def get_user_analyses(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_user_analysis(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     analysis = (
         db.query(MediaAnalysis)
         .filter(
@@ -766,22 +1066,8 @@ def get_user_analyses(db: Session = Depends(get_db), current_user: User = Depend
     )
     if not analysis:
         raise HTTPException(status_code=404, detail="Analysis not found")
-    return {"ok": True, "data": serialize_analysis(analysis)}
+    return {"ok": True, "data": _serialize_analysis(analysis)}
 
-    results = []
-    for a in analyses:
-        results.append({
-            "id": a.id,
-            "title": a.title or "Unknown Media",
-            "platform": a.platform,
-            "page_url": a.page_url,
-            "verdict": a.verdict,
-            "score": a.score,
-            "status": a.status,
-            "created_at": a.created_at.isoformat() if a.created_at else None,
-            "meta": a.meta
-        })
-    return {"ok": True, "data": results}
 
 @app.get("/api/analysis/stats")
 def get_user_analysis_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

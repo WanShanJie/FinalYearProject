@@ -1,0 +1,110 @@
+.connectGrid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(300px, 0.9fr);
+  gap: 24px;
+}
+
+.mainPanel,
+.sidePanel {
+  min-height: 320px;
+}
+
+.summaryCard {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  background: var(--surface);
+}
+
+.summaryRow {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  color: var(--muted);
+}
+
+.summaryRow strong {
+  color: var(--text);
+  text-align: right;
+}
+
+.actionArea {
+  margin-top: 20px;
+  display: grid;
+  gap: 12px;
+}
+
+.approveButton {
+  border: none;
+  border-radius: 16px;
+  padding: 14px 18px;
+  font-weight: 800;
+  cursor: pointer;
+  color: white;
+  background: linear-gradient(135deg, var(--primary), #38bdf8);
+  box-shadow: var(--shadow);
+}
+
+.approveButton:disabled {
+  opacity: 0.7;
+  cursor: wait;
+}
+
+.helperText,
+.loadingBox,
+.errorBox,
+.successBox p {
+  color: var(--muted);
+}
+
+.loadingBox,
+.errorBox,
+.successBox {
+  margin-top: 20px;
+  padding: 18px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.errorBox {
+  border-color: rgba(239, 68, 68, 0.35);
+  color: var(--danger);
+}
+
+.successBox {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  border-color: rgba(34, 197, 94, 0.28);
+  background: rgba(34, 197, 94, 0.08);
+}
+
+.stepList {
+  display: grid;
+  gap: 14px;
+}
+
+.stepItem {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--surface);
+}
+
+.inlineIcon {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+@media (max-width: 1080px) {
+  .connectGrid {
+    grid-template-columns: 1fr;
+  }
+}

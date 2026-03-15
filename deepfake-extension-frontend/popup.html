@@ -12,6 +12,10 @@
   <header class="topbar">
     <div class="brand">
       <div class="logo">A²U</div>
+      <div>
+        <strong>Deepfake Verification</strong>
+        <div class="miniText">Context-aware portal protection</div>
+      </div>
     </div>
     <div class="status">
       <span id="connDot" class="dot"></span>
@@ -52,13 +56,28 @@
   </main>
 
   <main class="card">
+    <div class="sectionTop">
+      <div>
+        <div class="label">Portal Connection</div>
+        <div id="linkStatusBadge" class="statusBadge statusIdle">Not connected</div>
+      </div>
+      <button id="btnConnectPortal" class="secondaryBtn">Connect to Portal</button>
+    </div>
+    <div id="connectedUser" class="hint">Link the extension once so all captures are stored under the correct signed-in
+      portal account.</div>
+    <div class="linkActions">
+      <button id="btnDisconnectPortal" class="ghostBtn" type="button">Disconnect</button>
+    </div>
+  </main>
+
+  <main class="card">
     <div class="label">Deep Media Analysis</div>
     <button id="btnAnalyzeNow" class="btn">
       <span class="btnIcon">✦</span>
       Analyze This Page Now
     </button>
     <div id="analyzeMsg" class="hint">
-      Works even if Real-Time Protection is OFF. Sends a screenshot + page metadata to your backend.
+      Works even if Real-Time Protection is OFF. Sends captured frames + page metadata to your backend.
     </div>
   </main>
 

@@ -10,6 +10,7 @@ import VerifyEmail from "./pages/VerifyEmail";
 import MediaAnalysis from "./pages/MediaAnalysis";
 import BlocklistManager from "./pages/BlocklistManager";
 import Settings from "./pages/Settings";
+import ExtensionConnect from "./pages/ExtensionConnect";
 import SystemLayout from "./components/system/SystemLayout";
 
 function RequireAuth({ children }) {
@@ -50,6 +51,7 @@ export default function App() {
         <Route path="/media-analysis" element={<MediaAnalysis />} />
         <Route path="/blocklist-manager" element={<BlocklistManager />} />
         <Route path="/settings" element={<Settings />} />
+        <Route path="/extension/connect" element={<ExtensionConnect />} />
       </Route>
 
       {/* Default */}

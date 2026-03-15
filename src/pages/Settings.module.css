@@ -211,7 +211,123 @@
 }
 
 @media (max-width: 1100px) {
+
   .settingsGrid,
   .configGrid,
-  .themeChooser { grid-template-columns: 1fr; }
+  .themeChooser {
+    grid-template-columns: 1fr;
+  }
+}
+
+.deviceGrid {
+  display: grid;
+  grid-template-columns: 1.2fr 0.8fr;
+  gap: 16px;
+}
+
+.extensionBanner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 14px;
+  margin-top: 14px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.extensionBanner strong,
+.deviceCard strong {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.extensionBanner p,
+.deviceCard p,
+.emptyBox,
+.errorBox {
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.deviceList {
+  margin-top: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.deviceCard {
+  display: flex;
+  justify-content: space-between;
+  gap: 20px;
+  align-items: flex-start;
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.deviceActions {
+  display: grid;
+  gap: 10px;
+  justify-items: end;
+}
+
+.deviceActive,
+.deviceRevoked {
+  padding: 8px 12px;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  border: 1px solid var(--border);
+}
+
+.deviceActive {
+  color: var(--success);
+  background: var(--success-soft);
+}
+
+.deviceRevoked {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.revokeButton {
+  min-width: 90px;
+  min-height: 40px;
+  border-radius: 14px;
+  border: 1px solid rgba(239, 68, 68, 0.32);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.emptyBox,
+.errorBox {
+  margin-top: 16px;
+  padding: 16px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+}
+
+.errorBox {
+  color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.32);
+}
+
+@media (max-width: 1100px) {
+  .deviceGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .deviceCard {
+    flex-direction: column;
+  }
+
+  .deviceActions {
+    width: 100%;
+    justify-items: stretch;
+  }
 }

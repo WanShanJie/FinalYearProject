@@ -1,4 +1,5 @@
 from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Float, Text, TIMESTAMP, text, ForeignKey, DateTime, JSON
+from sqlalchemy.dialects.mysql import BIGINT
 from db import Base
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
@@ -6,7 +7,7 @@ from sqlalchemy.orm import relationship
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(BigInteger, primary_key=True, index=True)
+    id = Column(BIGINT(unsigned=True), primary_key=True, index=True)
     first_name = Column(String(80), nullable=True)
     last_name = Column(String(80), nullable=True)
     email = Column(String(190), unique=True, index=True, nullable=False)
@@ -88,28 +89,24 @@ class MfaChallenge(Base):
 class MediaAnalysis(Base):
     __tablename__ = "media_analysis"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True, index=True)
-
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False)
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True, index=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id"), nullable=False)
 
     platform = Column(String(50))
     page_url = Column(Text)
     video_id = Column(String(255))
     title = Column(Text)
 
-    # --- extension / capture metadata ---
     content_url = Column(Text, nullable=True)
-    capture_mode = Column(String(30), nullable=True)  # single_screenshot | multi_frame | video_upload
+    capture_mode = Column(String(30), nullable=True)
     extension_version = Column(String(30), nullable=True)
     user_agent = Column(Text, nullable=True)
     viewport_w = Column(Integer, nullable=True)
     viewport_h = Column(Integer, nullable=True)
 
-    # timestamps (client + playback)
     captured_at_client = Column(DateTime(timezone=True), nullable=True)
     video_ts_ms = Column(Integer, nullable=True)
 
-    # multi-frame settings
     frame_count = Column(Integer, nullable=True)
     frame_interval_ms = Column(Integer, nullable=True)
 
@@ -120,4 +117,37 @@ class MediaAnalysis(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     status = Column(String(30), default="PENDING")
+    user = relationship("User")
+
+
+class ExtensionLinkRequest(Base):
+    __tablename__ = "extension_link_requests"
+
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    request_id = Column(String(128), nullable=False, unique=True, index=True)
+    code_challenge = Column(String(255), nullable=False)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id"), nullable=True, index=True)
+    device_name = Column(String(255), nullable=False, server_default=text("'Chrome Extension'"))
+    extension_version = Column(String(50), nullable=True)
+    status = Column(String(30), nullable=False, server_default=text("'pending'"))
+    expires_at = Column(DateTime, nullable=False)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    approved_at = Column(DateTime, nullable=True)
+    redeemed_at = Column(DateTime, nullable=True)
+
+
+class LinkedExtension(Base):
+    __tablename__ = "linked_extensions"
+
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id"), nullable=False, index=True)
+    link_request_id = Column(BIGINT(unsigned=True), ForeignKey("extension_link_requests.id"), nullable=True)
+    device_name = Column(String(255), nullable=False)
+    extension_version = Column(String(50), nullable=True)
+    token_hash = Column(String(255), nullable=False, index=True)
+    last_seen_at = Column(DateTime, nullable=True)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    revoked_at = Column(DateTime, nullable=True)
+    is_active = Column(Boolean, nullable=False, server_default=text("1"))
+
     user = relationship("User")

@@ -5,12 +5,14 @@
   --muted: #94a3b8;
   --accent: #1f8bff;
   --green: #16f07a;
+  --amber: #f59e0b;
+  --danger: #ef4444;
   --border: rgba(255, 255, 255, .08);
   --shadow: 0 10px 30px rgba(0, 0, 0, .35);
 }
 
 * {
-  box-sizing: border-box
+  box-sizing: border-box;
 }
 
 body {
@@ -18,7 +20,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-  width: 340px;
+  width: 360px;
   padding: 12px;
 }
 
@@ -32,10 +34,10 @@ body {
 .brand {
   display: flex;
   align-items: center;
-  gap: 10px
+  gap: 10px;
 }
 
-.brand .logo {
+.logo {
   width: 34px;
   height: 34px;
   border-radius: 10px;
@@ -47,20 +49,36 @@ body {
   box-shadow: var(--shadow);
 }
 
+.miniText {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
 .status {
   display: flex;
   align-items: center;
   gap: 8px;
   color: var(--muted);
-  font-size: 12px
+  font-size: 12px;
 }
 
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  background: var(--amber);
+  box-shadow: 0 0 12px rgba(245, 158, 11, .5);
+}
+
+.dot.connected {
   background: var(--green);
-  box-shadow: 0 0 12px rgba(22, 240, 122, .5)
+  box-shadow: 0 0 12px rgba(22, 240, 122, .5);
+}
+
+.dot.error {
+  background: var(--danger);
+  box-shadow: 0 0 12px rgba(239, 68, 68, .5);
 }
 
 .iconBtn {
@@ -81,21 +99,23 @@ body {
   box-shadow: var(--shadow);
 }
 
-.row {
+.row,
+.sectionTop {
   display: flex;
   align-items: center;
-  justify-content: space-between
+  justify-content: space-between;
+  gap: 10px;
 }
 
 .label {
   color: var(--muted);
   font-size: 12px;
-  margin-bottom: 8px
+  margin-bottom: 8px;
 }
 
 .center {
   text-align: center;
-  padding: 8px 0 2px 0
+  padding: 8px 0 2px 0;
 }
 
 .shield {
@@ -123,13 +143,15 @@ body {
 
 .title {
   font-weight: 800;
-  margin-top: 6px
+  margin-top: 6px;
 }
 
-.sub {
+.sub,
+.hint {
   color: var(--muted);
   font-size: 12px;
-  margin-top: 4px
+  margin-top: 4px;
+  line-height: 1.5;
 }
 
 .stats {
@@ -143,7 +165,7 @@ body {
 
 .stat {
   text-align: center;
-  min-width: 120px
+  min-width: 120px;
 }
 
 .num {
@@ -154,13 +176,21 @@ body {
 
 .cap {
   color: var(--muted);
-  font-size: 12px
+  font-size: 12px;
 }
 
 .divider {
   width: 1px;
   height: 38px;
-  background: var(--border)
+  background: var(--border);
+}
+
+.btn,
+.secondaryBtn,
+.ghostBtn {
+  border-radius: 14px;
+  cursor: pointer;
+  font-weight: 800;
 }
 
 .btn {
@@ -169,24 +199,37 @@ body {
   border: none;
   color: white;
   padding: 10px 12px;
-  border-radius: 14px;
-  font-weight: 800;
-  cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   gap: 8px;
 }
 
-.btnIcon {
-  font-weight: 900
+.secondaryBtn {
+  border: 1px solid rgba(34, 193, 255, .35);
+  background: rgba(34, 193, 255, .12);
+  color: var(--text);
+  padding: 10px 12px;
+  min-width: 132px;
 }
 
-.hint {
-  margin-top: 8px;
+.ghostBtn {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .04);
   color: var(--muted);
-  font-size: 12px;
-  min-height: 18px
+  padding: 9px 12px;
+  width: 100%;
+}
+
+.btn:disabled,
+.secondaryBtn:disabled,
+.ghostBtn:disabled {
+  opacity: .6;
+  cursor: wait;
+}
+
+.btnIcon {
+  font-weight: 900;
 }
 
 .footer {
@@ -199,25 +242,25 @@ body {
 .footer a {
   color: #7cb7ff;
   text-decoration: none;
-  font-size: 12px
+  font-size: 12px;
 }
 
 .ver {
   color: var(--muted);
-  font-size: 12px
+  font-size: 12px;
 }
 
 .switch {
   position: relative;
   display: inline-block;
   width: 46px;
-  height: 26px
+  height: 26px;
 }
 
 .switch input {
   opacity: 0;
   width: 0;
-  height: 0
+  height: 0;
 }
 
 .slider {
@@ -245,9 +288,47 @@ body {
 }
 
 input:checked+.slider {
-  background: rgba(22, 240, 122, .35)
+  background: rgba(22, 240, 122, .35);
 }
 
 input:checked+.slider:before {
-  transform: translateX(20px)
+  transform: translateX(20px);
+}
+
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  border: 1px solid var(--border);
+}
+
+.statusIdle {
+  background: rgba(255, 255, 255, .04);
+  color: var(--muted);
+}
+
+.statusPending {
+  background: rgba(245, 158, 11, .16);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, .26);
+}
+
+.statusConnected {
+  background: rgba(22, 240, 122, .12);
+  color: #8effc2;
+  border-color: rgba(22, 240, 122, .22);
+}
+
+.statusError {
+  background: rgba(239, 68, 68, .14);
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, .25);
+}
+
+.linkActions {
+  margin-top: 10px;
 }

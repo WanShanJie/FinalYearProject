@@ -39,3 +39,18 @@ class MfaVerifyIn(BaseModel):
     code: str = Field(min_length=6, max_length=6)
     device_id: str | None = None
     trust_device: bool | None = False
+
+class ExtensionLinkRequestIn(BaseModel):
+    request_id: str = Field(min_length=8, max_length=128)
+    code_challenge: str = Field(min_length=16, max_length=255)
+    device_name: str | None = Field(default="Chrome Extension", max_length=255)
+    extension_version: str | None = Field(default=None, max_length=50)
+
+
+class ExtensionLinkApproveIn(BaseModel):
+    request_id: str = Field(min_length=8, max_length=128)
+
+
+class ExtensionLinkRedeemIn(BaseModel):
+    request_id: str = Field(min_length=8, max_length=128)
+    code_verifier: str = Field(min_length=32, max_length=255)

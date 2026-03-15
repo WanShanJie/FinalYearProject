@@ -4,7 +4,7 @@
   "version": "0.2.1",
   "description": "Realtime fingerprint monitoring (local) + Analyze button that captures screen and sends to backend for deepfake analysis.",
   "action": {
-    "default_title": "Deepfake Verification",
+    "default_title": "Context-Aware Deepfake Verification",
     "default_popup": "popup.html"
   },
   "permissions": [
