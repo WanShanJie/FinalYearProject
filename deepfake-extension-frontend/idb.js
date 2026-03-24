@@ -70,6 +70,29 @@ async function idbHas(hash) {
   });
 }
 
+/** Get full entry object by fingerprint hash (returns null if not found) */
+async function idbGetEntry(hash) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).get(hash);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/** Get full entry object by video_id (returns null if not found) */
+async function idbGetByVideoId(videoId) {
+  if (!videoId) return null;
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).index("by_video_id").get(videoId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
 /** Check if a video_id is in the blocklist */
 async function idbHasVideoId(videoId) {
   if (!videoId) return false;
@@ -135,10 +158,13 @@ async function idbClear() {
 }
 
 self.DeepfakeIDB = {
+  _openDB: openDB,
   idbPut,
   idbPutEntry,
   idbHas,
+  idbGetEntry,
   idbHasVideoId,
+  idbGetByVideoId,
   idbBulkSync,
   idbGetLastSyncedAt,
   idbClear,

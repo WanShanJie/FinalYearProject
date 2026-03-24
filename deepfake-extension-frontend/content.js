@@ -4,10 +4,13 @@
 
 let monitoringEnabled = false;
 let observerStarted = false;
+let currentUrl = location.href;
+window._blockedEntry = null;
 
 async function loadMonitoringFlag() {
   const st = await chrome.storage.local.get(["monitoringEnabled"]);
   monitoringEnabled = st.monitoringEnabled === true;
+  console.log(`[BlocklistGuard] Monitoring enabled: ${monitoringEnabled}`);
   // Run video_id check immediately on load, regardless of monitoring state
   checkVideoIdOnPage().catch(() => { });
 }
@@ -36,58 +39,230 @@ function markMatched(el) {
   el.style.outlineOffset = "2px";
 }
 
-function blockElement(el, entry) {
-  if (el.dataset.deepfakeBlocked === "1") return;
-  el.dataset.deepfakeBlocked = "1";
+/**
+ * Clears old blocking overlays and state flags. Crucial for SPA navigations 
+ * where YouTube recycles the same <video> node for a new video.
+ */
+function unblockAllMedia() {
+  document.querySelectorAll("[data-deepfake-blocked]").forEach(el => {
+    delete el.dataset.deepfakeBlocked;
+    el._deepfakeBlocked = false;
+  });
+  document.querySelectorAll("[data-deepfake-overlay]").forEach(el => el.remove());
+}
 
-  // Wrap element in a relative container if not already
-  const parent = el.parentElement;
-  if (!parent) return;
+/**
+ * Stops a video element from playing — and keeps it stopped.
+ * Uses YouTube's internal API if available, plus HTML5 video aggressive pausing.
+ */
+function enforceVideoPause(video) {
+  if (video._deepfakeBlocked) return;
+  video._deepfakeBlocked = true;
 
-  const wrapper = document.createElement("div");
-  wrapper.style.cssText = "position:relative;display:inline-block;width:100%;";
-  parent.insertBefore(wrapper, el);
-  wrapper.appendChild(el);
+  const kill = () => {
+    try {
+      // 1. YouTube specific internal API override
+      const ytPlayer = document.getElementById("movie_player");
+      if (ytPlayer && typeof ytPlayer.pauseVideo === "function") {
+        ytPlayer.pauseVideo();
+      }
+      
+      // 2. Standard HTML5 aggression
+      video.pause();
+      video.muted = true;
+      video.volume = 0;
+    } catch(_) {}
+  };
+  
+  kill(); // immediate
+  video.addEventListener("play",    (e) => { e.preventDefault(); e.stopImmediatePropagation(); kill(); }, { capture: true });
+  video.addEventListener("playing", (e) => { e.preventDefault(); e.stopImmediatePropagation(); kill(); }, { capture: true });
 
-  // Build overlay
+  // Keep enforcing aggressively during startup
+  let retryCount = 0;
+  const iv = setInterval(() => {
+    kill();
+    // Clear interval exactly when blocked state is lifted, or after 15 seconds
+    if (!video._deepfakeBlocked || ++retryCount >= 30) {
+      clearInterval(iv);
+    }
+  }, 500);
+}
+
+/**
+ * Build the overlay card DOM element.
+ */
+function buildOverlay(entry, { compact = false, borderRadius = "8px" } = {}) {
   const overlay = document.createElement("div");
+  overlay.dataset.deepfakeOverlay = "1";
+  
+  // High-z-index, full width/height strict containment
   overlay.style.cssText = [
-    "position:absolute",
-    "inset:0",
-    "background:rgba(15,15,20,0.92)",
-    "display:flex",
-    "flex-direction:column",
-    "align-items:center",
-    "justify-content:center",
-    "gap:8px",
-    "z-index:9999",
-    "border-radius:8px",
-    "pointer-events:auto",
-    "cursor:default",
+    "position: absolute !important",
+    "top: 0 !important",
+    "left: 0 !important",
+    "width: 100% !important",
+    "height: 100% !important",
+    // Deep dark blur
+    "background: rgba(15,15,20,0.92) !important",
+    "backdrop-filter: blur(12px) !important",
+    "-webkit-backdrop-filter: blur(12px) !important",
+    "display: flex !important",
+    "flex-direction: column !important",
+    "align-items: center !important",
+    "justify-content: center !important",
+    "gap: " + (compact ? "4px" : "12px") + " !important",
+    "z-index: 2147483647 !important", // Max possible
+    "border-radius: " + borderRadius + " !important",
+    "pointer-events: auto !important",
+    "cursor: not-allowed !important",
+    "box-shadow: inset 0 0 0 " + (compact ? "2px" : "3px") + " #ef4444 !important",
+    "overflow: hidden !important",
+    "text-align: center !important",
+    "padding: " + (compact ? "12px" : "32px") + " !important",
+    "box-sizing: border-box !important",
+    "margin: 0 !important"
   ].join(";");
 
-  const icon = document.createElement("div");
-  icon.textContent = "\uD83D\uDEAB"; // 🚫
-  icon.style.cssText = "font-size:2rem;";
+  // Prevent ANY click from passing through this overlay to YouTube
+  overlay.addEventListener("click", e => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }, { capture: true });
 
-  const title = document.createElement("div");
-  title.textContent = "Blocked: Suspected Deepfake";
-  title.style.cssText = "color:#ef4444;font-weight:700;font-size:1rem;text-align:center;";
+  if (!compact) {
+    const icon = document.createElement("div");
+    icon.textContent = "🚫";
+    icon.style.cssText = "font-size:3.5rem !important; line-height:1 !important; margin-bottom:8px !important; pointer-events:none !important;";
+    overlay.appendChild(icon);
+  }
 
-  const sub = document.createElement("div");
-  sub.textContent = entry?.platform
-    ? `Platform: ${entry.platform} · Risk: ${entry.risk_score ?? "High"}%`
-    : "This media was blocked by Real-Time Protection";
-  sub.style.cssText = "color:#aaa;font-size:0.8rem;text-align:center;max-width:260px;";
+  const heading = document.createElement("div");
+  heading.textContent = compact ? "Blocked" : "Blocked: Suspected Deepfake";
+  heading.style.cssText = `color: #ef4444 !important; font-weight: 800 !important; font-size: ${compact ? "1rem" : "1.4rem"} !important; letter-spacing: 0.02em !important; font-family: system-ui, sans-serif !important; pointer-events:none !important; text-transform: uppercase !important;`;
+  overlay.appendChild(heading);
 
-  const link = document.createElement("a");
-  link.textContent = "View details in portal →";
-  link.href = "http://localhost:5173/settings";
-  link.target = "_blank";
-  link.style.cssText = "color:#60a5fa;font-size:0.78rem;margin-top:4px;";
+  if (compact) {
+    const sub = document.createElement("div");
+    sub.textContent = "Suspected Deepfake";
+    sub.style.cssText = "color: #f87171 !important; font-size: 0.8rem !important; font-family: system-ui, sans-serif !important; font-weight: 600 !important; margin-top: 2px !important; pointer-events:none !important;";
+    overlay.appendChild(sub);
+  }
 
-  overlay.append(icon, title, sub, link);
-  wrapper.appendChild(overlay);
+  if (entry?.title && !compact) {
+    const titleEl = document.createElement("div");
+    titleEl.textContent = `"${entry.title.slice(0, 80)}${entry.title.length > 80 ? "…" : ""}"`;
+    titleEl.style.cssText = "color: #d4d4d8 !important; font-size: 1.05rem !important; max-width: 400px !important; line-height: 1.5 !important; font-family: system-ui, sans-serif !important; font-style: italic !important; margin: 4px 0 !important; pointer-events:none !important;";
+    overlay.appendChild(titleEl);
+  }
+
+  const meta = document.createElement("div");
+  const metaParts = [];
+  if (entry?.platform && !compact) metaParts.push(`Platform: ${entry.platform}`);
+  if (entry?.risk_score != null) metaParts.push(`Risk: ${entry.risk_score}%`);
+  if (metaParts.length) {
+    meta.textContent = metaParts.join(" · ");
+    meta.style.cssText = `color: #a1a1aa !important; font-size: ${compact ? "0.8" : "0.95"}rem !important; font-family: system-ui, sans-serif !important; font-weight: 500 !important; pointer-events:none !important;`;
+    overlay.appendChild(meta);
+  }
+
+  if (!compact) {
+    const link = document.createElement("a");
+    link.textContent = "View details in active portal →";
+    link.href = "http://localhost:5173/media-analysis";
+    link.target = "_blank";
+    link.style.cssText = "color: #60a5fa !important; font-size: 0.95rem !important; margin-top: 12px !important; text-decoration: none !important; font-weight: 600 !important; font-family: system-ui, sans-serif !important; cursor: pointer !important; padding: 8px 16px !important; background: rgba(37,99,235,0.1) !important; border-radius: 6px !important; border: 1px solid rgba(59,130,246,0.3) !important;";
+    
+    // Explicit pointer events so it CAN be clicked
+    link.style.pointerEvents = "auto";
+    
+    link.onmouseover  = () => link.style.background = "rgba(37,99,235,0.2)";
+    link.onmouseleave = () => link.style.background = "rgba(37,99,235,0.1)";
+    link.addEventListener("click", e => e.stopPropagation()); // don't trigger the blocker's stopImmediatePropagation
+    overlay.appendChild(link);
+  }
+
+  return overlay;
+}
+
+/**
+ * Block the main YouTube watch-page video player.
+ */
+function blockWatchPageVideo(video, entry) {
+  enforceVideoPause(video);
+
+  const playerContainer =
+    document.getElementById("movie_player") ||
+    document.querySelector(".html5-video-player") ||
+    video.parentElement;
+
+  if (!playerContainer) return;
+  if (playerContainer.dataset.deepfakeBlocked === "1") return;
+  playerContainer.dataset.deepfakeBlocked = "1";
+
+  // Force relative positioning so the 100% absolute overlay doesn't escape out to the body
+  if (window.getComputedStyle(playerContainer).position === "static") {
+    playerContainer.style.setProperty("position", "relative", "important");
+  }
+
+  const br = window.getComputedStyle(playerContainer).borderRadius || "0px";
+  const overlay = buildOverlay(entry, { compact: false, borderRadius: br });
+  playerContainer.appendChild(overlay);
+
+  // Kill clicks at the container level to completely disable player controls
+  playerContainer.addEventListener("click", e => {
+    if (!e.target.closest("a")) { // allow the portal link
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+    }
+  }, { capture: true });
+}
+
+/**
+ * Generic blockElement for thumbnails/cards.
+ */
+function blockElement(el, entry) {
+  const elKey = el.dataset.deepfakeBlocked;
+  if (elKey === "1") return;
+  el.dataset.deepfakeBlocked = "1";
+
+  const isVideo = el.tagName === "VIDEO";
+
+  if (isVideo) {
+    enforceVideoPause(el);
+    blockWatchPageVideo(el, entry);
+    return; 
+  }
+
+  // ── Structural card (e.g. ytd-rich-item-renderer) ───────────────────────
+  if (window.getComputedStyle(el).position === "static") {
+    el.style.setProperty("position", "relative", "important");
+  }
+  
+  // Guarantee a minimum dimensions so flex centering never collapses 
+  // (YouTube often uses strictly calculated inner heights)
+  const rect = el.getBoundingClientRect();
+  if (rect.height < 100) el.style.setProperty("min-height", "180px", "important");
+
+  // Prevent interactions
+  el.style.setProperty("pointer-events", "none", "important");
+  el.style.setProperty("user-select", "none", "important");
+
+  // Intercept any deep clicks (e.g. YouTube's invisible click-targets)
+  el.addEventListener("click", e => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+  }, { capture: true });
+
+  const cs = window.getComputedStyle(el);
+  const elBR = cs.borderRadius || "12px";
+  
+  // Append a heavy blur overlay over the entire card
+  const overlay = buildOverlay(entry, { compact: true, borderRadius: elBR });
+  el.appendChild(overlay);
 }
 
 function drawToCanvasFromImg(img) {
@@ -167,11 +342,18 @@ async function fingerprintElement(el) {
 }
 
 async function processMedia(el) {
+  // If the whole page/video_id is actively blocked, block this element immediately
+  if (window._blockedEntry) {
+    blockElement(el, window._blockedEntry);
+    return;
+  }
+
   if (!monitoringEnabled) return;
   try {
     const hash = await fingerprintElement(el);
     if (!hash) return;
 
+    console.log(`[BlocklistGuard] aHash generated for <${el.tagName}>: ${hash}`);
     await bumpCounter("scanned", 1);
 
     const entry = await getBlocklistEntry(hash);
@@ -181,53 +363,134 @@ async function processMedia(el) {
     }
 
     chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
-  } catch {
-    // canvas/CORS issues; skip
+  } catch(err) {
+    // canvas/CORS issues; skip silently
+    console.debug("[BlocklistGuard] processMedia skip:", err?.message);
   }
 }
 
 async function getBlocklistEntry(hash) {
   try {
-    const matched = await self.DeepfakeIDB.idbHas(hash);
-    if (!matched) return null;
-    // Return a basic entry so the overlay can show info
-    return { risk_score: 70 };
-  } catch {
+    const res = await new Promise(r => {
+      chrome.runtime.sendMessage({ type: "CHECK_FINGERPRINT_BLOCKLIST", hash }, r);
+    });
+    if (!res?.ok || !res?.entry) return null;
+    const { entry } = res;
+    console.log(`[BlocklistGuard] ✅ SW match for hash: ${hash} → ${entry.title || entry.video_id || "??"}`);
+    return entry;
+  } catch (err) {
+    console.warn("[BlocklistGuard] getBlocklistEntry SW query error:", err);
     return null;
   }
 }
 
 async function checkVideoIdOnPage() {
-  // Quickly check if the current page's video_id is in the blocklist
-  // This works before media is even loaded — URL-based early block
+  // URL-based early block — runs before media loads.
   try {
     const url = location.href;
     let videoId = null;
     const ytShorts = url.match(/\/shorts\/([^/?]+)/);
     if (ytShorts) videoId = ytShorts[1];
     else {
-      const qs = new URL(url).searchParams.get("v");
-      if (qs) videoId = qs;
+      try { videoId = new URL(url).searchParams.get("v"); } catch(_) {}
     }
-    if (!videoId) return;
+    if (!videoId) {
+      console.log("[BlocklistGuard] No video_id found in current URL, skipping early block.");
+      return;
+    }
 
-    const matched = await self.DeepfakeIDB.idbHasVideoId(videoId);
-    if (matched) {
-      // Find all video elements and block them immediately
+    console.log(`[BlocklistGuard] Asking SW to check video_id: ${videoId}`);
+    const res = await new Promise(r => {
+      chrome.runtime.sendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId }, r);
+    });
+
+    if (res?.ok && res?.entry) {
+      const { entry } = res;
+      console.log(`[BlocklistGuard] 🚫 video_id "${videoId}" is BLOCKED by SW. Title: "${entry.title || '?'}". Applying overlay.`);
+      window._blockedEntry = entry; 
       document.querySelectorAll("video").forEach(v => {
-        blockElement(v, { risk_score: 70, platform: "youtube" });
+        blockElement(v, entry);
       });
       await bumpCounter("blocked", 1);
       chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
+    } else {
+      console.log(`[BlocklistGuard] SW says video_id "${videoId}" is CLEAN.`);
+      window._blockedEntry = null; 
     }
-  } catch { }
+  } catch(err) {
+    console.warn("[BlocklistGuard] checkVideoIdOnPage SW query error:", err);
+  }
+} // End of checkVideoIdOnPage
+
+async function scanYouTubeCards(root = document) {
+  if (!location.hostname.includes("youtube.com")) return;
+
+  const selectors = [
+    "ytd-rich-item-renderer",
+    "ytd-video-renderer",
+    "ytd-grid-video-renderer",
+    "ytd-compact-video-renderer",
+    "ytd-reel-item-renderer"
+  ];
+
+  const cards = root.querySelectorAll(selectors.map(s => `${s}:not([data-deepfake-card-checked])`).join(", "));
+  
+  for (const card of cards) {
+    card.dataset.deepfakeCardChecked = "1";
+    
+    // Find the link
+    const link = card.querySelector('a#thumbnail[href*="/watch?v="], a#thumbnail[href*="/shorts/"], a.ytd-thumbnail[href*="/watch?v="], a.ytd-thumbnail[href*="/shorts/"]');
+    if (!link) continue;
+
+    const href = link.getAttribute("href");
+    let videoId = null;
+    const ytShorts = href.match(/\/shorts\/([^/?]+)/);
+    if (ytShorts) videoId = ytShorts[1];
+    else {
+      try {
+        const u = new URL(href, "https://youtube.com");
+        videoId = u.searchParams.get("v");
+      } catch(_) {}
+    }
+
+    if (!videoId) continue;
+
+    chrome.runtime.sendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId }, res => {
+      if (res?.ok && res?.entry) {
+        console.log(`[BlocklistGuard] 🚫 Preview Card "${videoId}" confirmed by SW. Blocking card.`);
+        blockElement(card, res.entry);
+        bumpCounter("blocked", 1).catch(()=>{});
+      }
+    });
+  }
 }
 
 function scanExisting() {
   document.querySelectorAll("img, video").forEach(processMedia);
+  scanYouTubeCards();
 }
 
 const mo = new MutationObserver((mutations) => {
+  // Check for SPA navigation changes dynamically
+  if (location.href !== currentUrl) {
+    currentUrl = location.href;
+    console.log("[BlocklistGuard] URL changed (SPA navigation detected), rechecking context.");
+    window._blockedEntry = null; // reset state defensively
+    unblockAllMedia(); // Erase old overlays and dataset locks so recycled elements can be evaluated natively
+    checkVideoIdOnPage().catch(() => {});
+  }
+
+  // Use active global block immediately, skip checking monitoringEnabled as explicit blocks override disable
+  if (window._blockedEntry) {
+    document.querySelectorAll("video").forEach(v => blockElement(v, window._blockedEntry));
+    // Continue scanning for cards because sidebar cards have DIFFERENT video_ids
+  }
+
+  // Scan for cards on mutation regardless of monitoringEnabled if blocklist is working
+  if (location.hostname.includes("youtube.com")) {
+    scanYouTubeCards();
+  }
+
   if (!monitoringEnabled) return;
   for (const m of mutations) {
     for (const n of m.addedNodes) {
@@ -237,6 +500,14 @@ const mo = new MutationObserver((mutations) => {
     }
   }
 });
+
+// Defense in depth for slow-loading SPA players
+window.addEventListener("load", () => {
+  console.log("[BlocklistGuard] load event fired, running final check...");
+  checkVideoIdOnPage().catch(() => {});
+});
+setTimeout(() => checkVideoIdOnPage().catch(() => {}), 1500);
+setTimeout(() => checkVideoIdOnPage().catch(() => {}), 3500);
 
 function getPlatform() {
   const h = location.hostname;

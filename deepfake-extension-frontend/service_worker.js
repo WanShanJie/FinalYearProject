@@ -5,10 +5,16 @@
 // 2) If DOM extraction is blank on protected players, use tabCapture through an offscreen document.
 // 3) Never change currentTime or pause the player.
 
+// Load IndexedDB helper — must be importScripts in a non-module service worker
+try {
+  importScripts("idb.js");
+  console.log("[SW] idb.js loaded:", !!self.DeepfakeIDB, Object.keys(self.DeepfakeIDB || {}));
+} catch (e) {
+  console.error("[SW] idb.js load failed:", e);
+}
 const API_BASE = "http://127.0.0.1:8000";
 const FRONTEND_BASE = "http://localhost:5173";
 const PORTAL_ANALYSIS_URL = `${FRONTEND_BASE}/media-analysis`;
-
 
 const FRAME_COUNT = 48;
 const CAPTURE_INTERVAL_MS = 100;
@@ -29,7 +35,7 @@ chrome.runtime.onInstalled.addListener(async () => {
     extensionLinkError: st.extensionLinkError ?? "",
   });
   // Sync blocklist on install/update
-  syncBlocklist().catch(() => {});
+  syncBlocklist().catch(() => { });
   // Schedule periodic 30-min sync
   chrome.alarms.create("blocklist_sync", { periodInMinutes: 30 });
 });
@@ -266,43 +272,66 @@ async function handleCaptureSuccess(out, meta) {
   } catch { }
   // Keep local blocklist in sync after every successful high-risk scan
   if (["FAKE", "SUSPICIOUS"].includes(String(out?.verdict || "").toUpperCase())) {
-    syncBlocklist().catch(() => {});
+    syncBlocklist().catch(() => { });
   }
 }
 
 // ─── Blocklist Sync ───────────────────────────────────────────────────────────
-import('./idb.js').catch(() => {}); // ensure idb.js is loaded in sw context
+// idb.js is loaded via importScripts() at the top of this file.
 
 async function syncBlocklist() {
   const { extensionToken } = await chrome.storage.local.get(["extensionToken"]);
-  if (!extensionToken) return; // Not linked, skip
+  if (!extensionToken) {
+    console.log("[Blocklist] Skipping sync — extension not linked.");
+    return;
+  }
+
+  if (!self.DeepfakeIDB) {
+    console.error("[Blocklist] DeepfakeIDB is not defined — idb.js failed to load.");
+    return;
+  }
 
   try {
+    console.log("[Blocklist] Fetching active blocklist from backend...");
     const res = await fetch(`${API_BASE}/api/blocklist/sync`, {
-      headers: { Authorization: `Bearer ${extensionToken}` }
+      headers: { Authorization: `Bearer ${extensionToken}` },
     });
-    if (!res.ok) return;
+    if (!res.ok) {
+      console.warn(`[Blocklist] Sync request failed: HTTP ${res.status}`);
+      return;
+    }
     const json = await res.json();
-    if (!json.ok || !Array.isArray(json.entries)) return;
+    if (!json.ok || !Array.isArray(json.entries)) {
+      console.warn("[Blocklist] Sync response malformed:", json);
+      return;
+    }
 
-    await self.DeepfakeIDB.idbBulkSync(json.entries);
-    await chrome.storage.local.set({ blocklistCount: json.entries.length, blocklistSyncedAt: Date.now() });
-    console.log(`[Blocklist] Synced ${json.entries.length} entries.`);
+    const count = await self.DeepfakeIDB.idbBulkSync(json.entries);
+    await chrome.storage.local.set({
+      blocklistCount: json.entries.length,
+      blocklistSyncedAt: Date.now(),
+    });
+    console.log(`[Blocklist] ✅ Synced ${count} entries into IndexedDB.`);
+    if (json.entries.length > 0) {
+      console.log("[Blocklist] Sample entry:", JSON.stringify(json.entries[0]));
+    }
 
     // Notify open content scripts to re-check their pages
-    const tabs = await chrome.tabs.query({ url: ["*://*.youtube.com/*", "*://*.tiktok.com/*", "*://*.facebook.com/*"] });
+    const tabs = await chrome.tabs.query({
+      url: ["*://*.youtube.com/*", "*://*.tiktok.com/*", "*://*.facebook.com/*"],
+    });
     for (const tab of tabs) {
-      chrome.tabs.sendMessage(tab.id, { type: "BLOCKLIST_UPDATED" }).catch(() => {});
+      chrome.tabs.sendMessage(tab.id, { type: "BLOCKLIST_UPDATED" }).catch(() => { });
     }
   } catch (err) {
-    console.warn("[Blocklist] Sync failed:", err);
+    console.warn("[Blocklist] Sync exception:", err);
   }
 }
 
 // Periodic alarm handler
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "blocklist_sync") {
-    syncBlocklist().catch(() => {});
+    syncBlocklist().catch(() => { });
   }
 });
 
@@ -316,6 +345,36 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       } catch { }
       sendResponse({ ok: true });
     })().catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+    return true;
+  }
+
+  if (msg?.type === "CHECK_VIDEO_ID_BLOCKLIST") {
+    (async () => {
+      try {
+        if (!self.DeepfakeIDB) throw new Error("IDB not loaded in SW");
+        const entry = await self.DeepfakeIDB.idbGetByVideoId(msg.videoId);
+        console.log(`[SW] Blocklist check for videoId "${msg.videoId}":`, entry ? "MATCH" : "CLEAN");
+        sendResponse({ ok: true, entry });
+      } catch (err) {
+        console.error("[SW] Video check error:", err);
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
+  if (msg?.type === "CHECK_FINGERPRINT_BLOCKLIST") {
+    (async () => {
+      try {
+        if (!self.DeepfakeIDB) throw new Error("IDB not loaded in SW");
+        const entry = await self.DeepfakeIDB.idbGetEntry(msg.hash);
+        console.log(`[SW] Blocklist check for hash "${msg.hash}":`, entry ? "MATCH" : "CLEAN");
+        sendResponse({ ok: true, entry });
+      } catch (err) {
+        console.error("[SW] Hash check error:", err);
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
     return true;
   }
 
