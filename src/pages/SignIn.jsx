@@ -54,9 +54,9 @@ export default function SignIn() {
     window.location.href = `${BACKEND}/api/oauth/google/login`;
   }
 
-  function loginWithX() {
-    window.location.href = `${BACKEND}/api/oauth/x/login`;
-  }
+  // function loginWithX() {
+  //   window.location.href = `${BACKEND}/api/oauth/x/login`;
+  // }
 
 
   return (
@@ -67,9 +67,9 @@ export default function SignIn() {
         <button type="button" className={form.socialBtn} onClick={loginWithGoogle}>
           <GoogleIcon /> Sign in with Google
         </button>
-        <button type="button" className={form.socialBtn} onClick={loginWithX}>
+        {/* <button type="button" className={form.socialBtn} onClick={loginWithX}>
           <XIcon /> Sign in with X
-        </button>
+        </button> */}
       </div>
 
       <div className={form.divider}>
@@ -137,13 +137,13 @@ function GoogleIcon() {
   );
 }
 
-function XIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M18.9 2H22l-6.8 7.8L23 22h-6.8l-5.3-6.9L4.8 22H2l7.4-8.5L1 2h6.9l4.8 6.3L18.9 2zm-1.2 18h1.7L7.9 3.9H6.1L17.7 20z" />
-    </svg>
-  );
-}
+// function XIcon() {
+//   return (
+//     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+//       <path d="M18.9 2H22l-6.8 7.8L23 22h-6.8l-5.3-6.9L4.8 22H2l7.4-8.5L1 2h6.9l4.8 6.3L18.9 2zm-1.2 18h1.7L7.9 3.9H6.1L17.7 20z" />
+//     </svg>
+//   );
+// }
 
 function getErrorMessage(err) {
   // If backend returns {detail: "..."}

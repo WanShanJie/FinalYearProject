@@ -8,6 +8,8 @@ let observerStarted = false;
 async function loadMonitoringFlag() {
   const st = await chrome.storage.local.get(["monitoringEnabled"]);
   monitoringEnabled = st.monitoringEnabled === true;
+  // Run video_id check immediately on load, regardless of monitoring state
+  checkVideoIdOnPage().catch(() => { });
 }
 
 function startObserver() {
@@ -32,6 +34,60 @@ function markMatched(el) {
   el.dataset.deepfakeMatched = "1";
   el.style.outline = "2px solid rgba(22,240,122,.6)";
   el.style.outlineOffset = "2px";
+}
+
+function blockElement(el, entry) {
+  if (el.dataset.deepfakeBlocked === "1") return;
+  el.dataset.deepfakeBlocked = "1";
+
+  // Wrap element in a relative container if not already
+  const parent = el.parentElement;
+  if (!parent) return;
+
+  const wrapper = document.createElement("div");
+  wrapper.style.cssText = "position:relative;display:inline-block;width:100%;";
+  parent.insertBefore(wrapper, el);
+  wrapper.appendChild(el);
+
+  // Build overlay
+  const overlay = document.createElement("div");
+  overlay.style.cssText = [
+    "position:absolute",
+    "inset:0",
+    "background:rgba(15,15,20,0.92)",
+    "display:flex",
+    "flex-direction:column",
+    "align-items:center",
+    "justify-content:center",
+    "gap:8px",
+    "z-index:9999",
+    "border-radius:8px",
+    "pointer-events:auto",
+    "cursor:default",
+  ].join(";");
+
+  const icon = document.createElement("div");
+  icon.textContent = "\uD83D\uDEAB"; // 🚫
+  icon.style.cssText = "font-size:2rem;";
+
+  const title = document.createElement("div");
+  title.textContent = "Blocked: Suspected Deepfake";
+  title.style.cssText = "color:#ef4444;font-weight:700;font-size:1rem;text-align:center;";
+
+  const sub = document.createElement("div");
+  sub.textContent = entry?.platform
+    ? `Platform: ${entry.platform} · Risk: ${entry.risk_score ?? "High"}%`
+    : "This media was blocked by Real-Time Protection";
+  sub.style.cssText = "color:#aaa;font-size:0.8rem;text-align:center;max-width:260px;";
+
+  const link = document.createElement("a");
+  link.textContent = "View details in portal →";
+  link.href = "http://localhost:5173/settings";
+  link.target = "_blank";
+  link.style.cssText = "color:#60a5fa;font-size:0.78rem;margin-top:4px;";
+
+  overlay.append(icon, title, sub, link);
+  wrapper.appendChild(overlay);
 }
 
 function drawToCanvasFromImg(img) {
@@ -118,9 +174,9 @@ async function processMedia(el) {
 
     await bumpCounter("scanned", 1);
 
-    const matched = await self.DeepfakeIDB.idbHas(hash);
-    if (matched) {
-      markMatched(el);
+    const entry = await getBlocklistEntry(hash);
+    if (entry) {
+      blockElement(el, entry);
       await bumpCounter("blocked", 1);
     }
 
@@ -128,6 +184,43 @@ async function processMedia(el) {
   } catch {
     // canvas/CORS issues; skip
   }
+}
+
+async function getBlocklistEntry(hash) {
+  try {
+    const matched = await self.DeepfakeIDB.idbHas(hash);
+    if (!matched) return null;
+    // Return a basic entry so the overlay can show info
+    return { risk_score: 70 };
+  } catch {
+    return null;
+  }
+}
+
+async function checkVideoIdOnPage() {
+  // Quickly check if the current page's video_id is in the blocklist
+  // This works before media is even loaded — URL-based early block
+  try {
+    const url = location.href;
+    let videoId = null;
+    const ytShorts = url.match(/\/shorts\/([^/?]+)/);
+    if (ytShorts) videoId = ytShorts[1];
+    else {
+      const qs = new URL(url).searchParams.get("v");
+      if (qs) videoId = qs;
+    }
+    if (!videoId) return;
+
+    const matched = await self.DeepfakeIDB.idbHasVideoId(videoId);
+    if (matched) {
+      // Find all video elements and block them immediately
+      document.querySelectorAll("video").forEach(v => {
+        blockElement(v, { risk_score: 70, platform: "youtube" });
+      });
+      await bumpCounter("blocked", 1);
+      chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
+    }
+  } catch { }
 }
 
 function scanExisting() {
@@ -679,6 +772,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           viewport: { w: window.innerWidth, h: window.innerHeight }
         }
       });
+      return;
+    }
+
+    if (msg?.type === "BLOCKLIST_UPDATED") {
+      // Service worker synced a new blocklist — re-check this page immediately
+      checkVideoIdOnPage().catch(() => { });
+      scanExisting();
+      sendResponse({ ok: true });
       return;
     }
   })();

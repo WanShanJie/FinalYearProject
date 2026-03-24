@@ -1,15 +1,47 @@
 import React from "react";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./Dashboard.module.css";
-import { activityTimeline, dashboardKpis, liveFeed, trendBars } from "../data/systemMockData";
-import { AlertIcon, CheckIcon, DatabaseIcon, EyeIcon, ImageIcon, SearchIcon, ShieldIcon, VideoIcon, SyncIcon } from "../components/system/SystemIcons";
+import { trendBars } from "../data/systemMockData";
+import { AlertIcon, CheckIcon, DatabaseIcon, EyeIcon, ImageIcon, SearchIcon, ShieldIcon, VideoIcon } from "../components/system/SystemIcons";
 import { useNavigate } from "react-router-dom";
+
+// ─── Shared Risk Logic (Internal Mirror) ───────────────────────────────────
+function getDashboardMetrics(verdict, score) {
+  const v = (verdict || "").toUpperCase();
+  const raw = score ?? 0;
+  let riskScore = Math.round(raw * 100);
+
+  // 1. Map to consistent labels & tones
+  let displayLabel = "Processed";
+  let tone = "blue";
+  let isThreat = false;
+
+  if (v === "FAKE") {
+    displayLabel = "Threat";
+    tone = "red";
+    isThreat = true;
+    riskScore = Math.max(riskScore, 70);
+  } else if (v === "REAL") {
+    displayLabel = "Verified";
+    tone = "green";
+    isThreat = false;
+    riskScore = Math.min(riskScore, 29);
+  } else if (v === "SUSPICIOUS" || (riskScore >= 30 && riskScore <= 69)) {
+    displayLabel = "Suspicious";
+    tone = "amber";
+    isThreat = true;
+    if (v === "SUSPICIOUS") riskScore = Math.max(riskScore, 50);
+  }
+
+  return { riskScore, displayLabel, tone, isThreat };
+}
 
 const toneMap = {
   blue: layout.badgeBlue,
   red: layout.badgeRed,
   amber: layout.badgeAmber,
   cyan: layout.badgeCyan,
+  green: layout.badgeGreen
 };
 
 export default function Dashboard() {
@@ -18,7 +50,7 @@ export default function Dashboard() {
     totalScans: 0,
     threatsBlocked: 0,
     trustedMedia: 0,
-    activeFingerprints: 3500 // placeholder for global DB
+    activeFingerprints: 3500 
   });
   const [activity, setActivity] = React.useState([]);
   const [loading, setLoading] = React.useState(true);
@@ -50,7 +82,7 @@ export default function Dashboard() {
           setStats(prev => ({ ...prev, ...statsData.stats }));
         }
         if (activityData.ok && activityData.data) {
-          setActivity(activityData.data.slice(0, 5)); // show only recent 5
+          setActivity(activityData.data.slice(0, 5));
         }
       } catch (err) {
         console.error("Dashboard fetch error:", err);
@@ -59,21 +91,22 @@ export default function Dashboard() {
       }
     }
     fetchData();
-  }, []);
+  }, [navigate]);
 
   const kpis = [
     { title: "Total Media Analyzed", value: stats.totalScans, tone: "blue" },
     { title: "Deepfakes Detected", value: stats.threatsBlocked, tone: "red" },
-    { title: "Auto-Blocked", value: stats.threatsBlocked, tone: "amber" }, // assuming auto-block matches threats for now
+    { title: "Auto-Blocked", value: stats.threatsBlocked, tone: "amber" },
     { title: "Active Fingerprints", value: stats.activeFingerprints.toLocaleString(), sub: "Global DB", tone: "cyan" },
   ];
+
   return (
     <div className={layout.page}>
       <section className={`${layout.heroPanel} ${layout.pageHeading}`}>
         <div>
           <div className={layout.pageTitle}>Dashboard</div>
           <p className={layout.pageSub}>
-            Central overview of detection activity, live media intake, and recent moderation actions. The layout now matches the system shell, so header and sidebar stay fixed when users navigate.
+            Central overview of detection activity. Labels and risk levels are now synchronized across the system.
           </p>
         </div>
         <div className={layout.pill}>
@@ -87,7 +120,7 @@ export default function Dashboard() {
           <article key={item.title} className={`${layout.kpiCard} ${styles.kpiCard} ${styles[`tone_${item.tone}`]}`}>
             <div className={styles.kpiTopRow}>
               <span className={styles.kpiLabel}>{item.title}</span>
-              <span className={`${layout.badge} ${toneMap[item.tone]}`}>{item.tone.toUpperCase()}</span>
+              <span className={`${layout.badge} ${toneMap[item.tone]}`}>{item.tone === "red" ? "THREAT" : item.tone.toUpperCase()}</span>
             </div>
             <div className={styles.kpiValue}>{item.value}</div>
             {item.sub ? <div className={styles.kpiSub}>{item.sub}</div> : null}
@@ -101,28 +134,28 @@ export default function Dashboard() {
           <div className={layout.panelHeader}>
             <div>
               <div className={layout.panelTitle}>Live Capture Feed</div>
-              <div className={layout.panelSub}>Recent media entering the verification pipeline</div>
+              <div className={layout.panelSub}>Latest media entering the pipeline</div>
             </div>
             <span className={`${layout.badge} ${layout.badgeBlue}`}>Realtime</span>
           </div>
 
           <div className={styles.feedGrid}>
             {loading ? (
-               <div style={{padding: 20}}>Loading...</div>
+                <div style={{padding: 20}}>Loading...</div>
             ) : activity.length === 0 ? (
-               <div style={{padding: 20, opacity: 0.6}}>No recent activity found.</div>
+                <div style={{padding: 20, opacity: 0.6}}>No recent activity found.</div>
             ) : (
               activity.map((item) => {
-                const isFake = item.verdict === "FAKE" || item.verdict === "SUSPICIOUS";
-                const state = isFake ? "threat" : "clean";
+                const { isThreat } = getDashboardMetrics(item.verdict, item.score);
+                const state = isThreat ? "threat" : "clean";
                 return (
                   <div key={item.id} className={`${styles.feedTile} ${styles[`state_${state}`]}`}>
                     <div className={styles.feedMediaIcon}>
                       {item.meta?.media_type === "video" ? <VideoIcon className={styles.tileIcon} /> : <ImageIcon className={styles.tileIcon} />}
                     </div>
                     <div className={styles.feedMeta}>
-                      <span>{item.platform || "Unknown"}</span>
-                      <strong>{isFake ? "Threat flagged" : "Clean"}</strong>
+                      <span>{item.platform || "Web"}</span>
+                      <strong>{isThreat ? "Attention Required" : "Validated"}</strong>
                     </div>
                   </div>
                 );
@@ -135,11 +168,10 @@ export default function Dashboard() {
           <div className={layout.panelHeader}>
             <div>
               <div className={layout.panelTitle}>Detection Trends</div>
-              <div className={layout.panelSub}>Detections across the last 24 hours</div>
+              <div className={layout.panelSub}>Activity across last 24 hours</div>
             </div>
             <span className={`${layout.badge} ${layout.badgeCyan}`}>24h</span>
           </div>
-
           <div className={styles.chartWrap}>
             <div className={styles.chartArea}>
               {trendBars.map((value, index) => (
@@ -156,68 +188,28 @@ export default function Dashboard() {
         </article>
       </section>
 
+      {/* Snapshot Cards */}
       <section className={layout.grid2}>
         <article className={layout.panel}>
           <div className={layout.panelHeader}>
             <div>
-              <div className={layout.panelTitle}>Threat Exposure Snapshot</div>
-              <div className={layout.panelSub}>How current detections break down by category</div>
+              <div className={layout.panelTitle}>Threat Snapshot</div>
+              <div className={layout.panelSub}>State of recently scanned media</div>
             </div>
           </div>
-
           <div className={styles.metricGrid}>
             <div className={layout.metricCard + " " + styles.metricCard}>
               <AlertIcon className={`${styles.metricIcon} ${layout.toneRed}`} />
               <div>
                 <strong>High Risk</strong>
-                <span>12 media items require immediate action</span>
+                <span>Action recommended for identified threats</span>
               </div>
             </div>
             <div className={layout.metricCard + " " + styles.metricCard}>
               <EyeIcon className={`${styles.metricIcon} ${layout.toneAmber}`} />
               <div>
-                <strong>Analyst Queue</strong>
-                <span>7 items pending manual review</span>
-              </div>
-            </div>
-            <div className={layout.metricCard + " " + styles.metricCard}>
-              <CheckIcon className={`${styles.metricIcon} ${layout.toneGreen}`} />
-              <div>
-                <strong>Trusted Media</strong>
-                <span>128 items cleared automatically today</span>
-              </div>
-            </div>
-            <div className={layout.metricCard + " " + styles.metricCard}>
-              <DatabaseIcon className={`${styles.metricIcon} ${layout.toneCyan}`} />
-              <div>
-                <strong>Fingerprint DB</strong>
-                <span>3,500 active entries in synchronized storage</span>
-              </div>
-            </div>
-          </div>
-        </article>
-
-        <article className={layout.panel}>
-          <div className={layout.panelHeader}>
-            <div>
-              <div className={layout.panelTitle}>Review Focus</div>
-              <div className={layout.panelSub}>Priority guidance for moderation team</div>
-            </div>
-          </div>
-
-          <div className={styles.focusStack}>
-            <div className={styles.focusCard}>
-              <SearchIcon className={`${styles.metricIcon} ${layout.toneBlue}`} />
-              <div>
-                <strong>Watch manipulated speech clips</strong>
-                <p>Face synthesis artifacts are rising in short-form political video uploads.</p>
-              </div>
-            </div>
-            <div className={styles.focusCard}>
-              <ShieldIcon className={`${styles.metricIcon} ${layout.toneCyan}`} />
-              <div>
-                <strong>Global policies synchronized</strong>
-                <p>Community threat database is aligned with local blocklist rules and settings.</p>
+                <strong>Review Queue</strong>
+                <span>Items pending confirmation</span>
               </div>
             </div>
           </div>
@@ -226,12 +218,8 @@ export default function Dashboard() {
 
       <section className={layout.panel}>
         <div className={layout.panelHeader}>
-          <div>
-            <div className={layout.panelTitle}>Activity Timeline</div>
-            <div className={layout.panelSub}>Recent actions across blocking, review, and verification</div>
-          </div>
+          <div className={layout.panelTitle}>Activity Timeline</div>
         </div>
-
         <div className={styles.timelineList}>
           {loading ? (
              <div style={{padding: 20}}>Loading...</div>
@@ -241,16 +229,14 @@ export default function Dashboard() {
             activity.map((item) => {
               const dateObj = new Date(item.created_at);
               const timeStr = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-              const isFake = item.verdict === "FAKE" || item.verdict === "SUSPICIOUS";
-              const tag = isFake ? "Threat" : (item.verdict === "REAL" ? "Verified" : "Processed");
-              const tone = isFake ? "red" : (item.verdict === "REAL" ? "green" : "blue");
-              const text = `${isFake ? "Detected threat" : "Processed media"}: ${item.title}`;
+              const { displayLabel, tone } = getDashboardMetrics(item.verdict, item.score);
+              const text = `${displayLabel}: ${item.title}`;
 
               return (
                 <div key={item.id} className={styles.timelineRow}>
                   <div className={styles.timelineTime}>{timeStr}</div>
                   <div className={styles.timelineText}>{text}</div>
-                  <span className={`${layout.badge} ${tone === "red" ? layout.badgeRed : tone === "green" ? layout.badgeGreen : tone === "amber" ? layout.badgeAmber : tone === "cyan" ? layout.badgeCyan : layout.badgeBlue}`}>{tag}</span>
+                  <span className={`${layout.badge} ${toneMap[tone]}`}>{displayLabel}</span>
                 </div>
               );
             })

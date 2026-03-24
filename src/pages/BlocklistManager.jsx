@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./BlocklistManager.module.css";
-import { blockControls, blocklistEntries, moderationRules, moderationWorkflow } from "../data/systemMockData";
+import { blockControls, moderationRules, moderationWorkflow } from "../data/systemMockData";
 import { AlertIcon, CheckIcon, LockIcon, ShieldIcon, SyncIcon } from "../components/system/SystemIcons";
 import { useNavigate } from "react-router-dom";
 
@@ -12,35 +12,32 @@ export default function BlocklistManager() {
   const [strictMode, setStrictMode] = useState(blockControls.strictMode);
   const [blockedItems, setBlockedItems] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
 
-  React.useEffect(() => {
-    async function fetchData() {
-      try {
-        const token = localStorage.getItem("token");
-        const res = await fetch("http://localhost:8000/api/analysis", {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        
-        if (res.status === 401) {
-          localStorage.removeItem("token");
-          localStorage.removeItem("user");
-          navigate("/signin", { replace: true });
-          return;
-        }
-
-        const json = await res.json();
-        if (json.ok) {
-          // Filter to show items that are FAKE or SUSPICIOUS (blocked by policy)
-          setBlockedItems(json.data.filter(i => i.verdict === "FAKE" || i.verdict === "SUSPICIOUS"));
-        }
-      } catch (err) {
-        console.error("Blocklist fetch error:", err);
-      } finally {
-        setLoading(false);
+  async function fetchBlocklist() {
+    setLoading(true);
+    try {
+      const token = localStorage.getItem("token");
+      const res = await fetch("http://localhost:8000/api/blocklist", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.status === 401) {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        navigate("/signin", { replace: true });
+        return;
       }
+      const json = await res.json();
+      if (json.ok) setBlockedItems(json.data);
+    } catch (err) {
+      console.error("Blocklist fetch error:", err);
+    } finally {
+      setLoading(false);
     }
-    fetchData();
-  }, []);
+  }
+
+  React.useEffect(() => { fetchBlocklist(); }, []);
 
   return (
     <div className={layout.page}>
@@ -146,27 +143,30 @@ export default function BlocklistManager() {
       <section className={layout.tableCard + " " + styles.tableSection}>
         <div className={layout.panelHeader}>
           <div>
-            <div className={layout.panelTitle}>Blocked Media Table</div>
-            <div className={layout.panelSub}>History of blocked content associated with your account</div>
+            <div className={layout.panelTitle}>Global Blocklist</div>
+            <div className={layout.panelSub}>{blockedItems.length} high-risk items automatically added via policy</div>
           </div>
           <span className={layout.pill}>Live protection</span>
         </div>
 
         <div className={styles.tableWrap}>
           {loading ? (
-            <div style={{padding: 40, textAlign: "center"}}>Loading blocked items...</div>
+            <div style={{padding: 40, textAlign: "center"}}>Loading blocklist...</div>
           ) : blockedItems.length === 0 ? (
-            <div style={{padding: 40, textAlign: "center", opacity: 0.6}}>No blocked items found.</div>
+            <div style={{padding: 40, textAlign: "center", opacity: 0.6}}>
+              No blocked items yet. High-risk deepfake detections will appear here automatically.
+            </div>
           ) : (
             <table className={styles.table}>
               <thead>
                 <tr>
-                  <th>Media</th>
-                  <th>Scan ID</th>
-                  <th>Source</th>
+                  <th>Title / Platform</th>
+                  <th>Fingerprint</th>
+                  <th>Risk Score</th>
+                  <th>Verdict</th>
+                  <th>Source Scan</th>
                   <th>Date Added</th>
-                  <th>Decision</th>
-                  <th>Workflow Note</th>
+                  <th>Status</th>
                 </tr>
               </thead>
               <tbody>
@@ -174,23 +174,33 @@ export default function BlocklistManager() {
                   <tr key={entry.id}>
                     <td>
                       <div className={styles.thumbCell}>
-                        <div className={styles.thumb}>{entry.meta?.media_type === "video" ? "V" : "I"}</div>
+                        <div className={styles.thumb}>{entry.platform?.[0]?.toUpperCase() || "?"}</div>
                         <div>
-                          <strong>{entry.title}</strong>
-                          <span>{entry.platform}</span>
+                          <strong>{entry.title || "Untitled"}</strong>
+                          <span>{entry.platform || "Unknown"}</span>
                         </div>
                       </div>
                     </td>
-                    <td className={styles.hashCell}>{entry.id}</td>
-                    <td>{entry.platform}</td>
-                    <td>{new Date(entry.created_at).toLocaleDateString()}</td>
+                    <td className={styles.hashCell} title={entry.fingerprint_hash}>
+                      {entry.fingerprint_hash?.slice(0, 12)}…
+                    </td>
                     <td>
-                      <span className={`${layout.badge} ${layout.badgeRed}`}>
-                        <AlertIcon className={styles.smallIcon} />
-                        Blocked
+                      <span className={`${layout.badge} ${entry.risk_score >= 70 ? layout.badgeRed : layout.badgeAmber}`}>
+                        {entry.risk_score}% · {entry.risk_level}
                       </span>
                     </td>
-                    <td>{entry.meta?.decision?.final_explanation || "Blocked by policy."}</td>
+                    <td>
+                      <span className={`${layout.badge} ${layout.badgeRed}`}>
+                        <AlertIcon className={styles.smallIcon} /> {entry.verdict}
+                      </span>
+                    </td>
+                    <td>{entry.analysis_id ? `#${entry.analysis_id}` : "—"}</td>
+                    <td>{entry.created_at ? new Date(entry.created_at).toLocaleDateString() : "—"}</td>
+                    <td>
+                      <span className={`${layout.badge} ${entry.status === "active" ? layout.badgeBlue : layout.badgeAmber}`}>
+                        {entry.status === "active" ? "Active" : entry.status}
+                      </span>
+                    </td>
                   </tr>
                 ))}
               </tbody>

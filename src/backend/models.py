@@ -24,8 +24,8 @@ class User(Base):
 class OAuthAccount(Base):
     __tablename__ = "oauth_accounts"
 
-    id = Column(BigInteger, primary_key=True, index=True)
-    user_id = Column(BigInteger, ForeignKey("users.id"), nullable=False, index=True)
+    id = Column(BIGINT(unsigned=True), primary_key=True, index=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id"), nullable=False, index=True)
     provider = Column(String(50), nullable=False)  # "google", "x", etc.
     provider_user_id = Column(String(255), nullable=False)
     email = Column(String(190), nullable=True)
@@ -34,8 +34,8 @@ class OAuthAccount(Base):
 class PasswordReset(Base):
     __tablename__ = "password_resets"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False)
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False)
 
     token_hash = Column(String(255), nullable=False)
     expires_at = Column(DateTime, nullable=False)
@@ -47,8 +47,8 @@ class PasswordReset(Base):
 class EmailVerification(Base):
     __tablename__ = "email_verifications"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False)
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False)
     token_hash = Column(String(255), nullable=False)
     expires_at = Column(DateTime, nullable=False)
     used_at = Column(DateTime, nullable=True)
@@ -58,8 +58,8 @@ class EmailVerification(Base):
 class TrustedDevice(Base):
     __tablename__ = "trusted_devices"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False, index=True)
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False, index=True)
 
     # Matches MySQL schema: device_hash CHAR(64), trusted_until DATETIME
     device_hash = Column(String(64), nullable=False, index=True)  # sha256 hex
@@ -72,15 +72,15 @@ class TrustedDevice(Base):
 class MfaChallenge(Base):
     __tablename__ = "mfa_challenges"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False, index=True)
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    user_id = Column(BIGINT(unsigned=True), ForeignKey("users.id", ondelete="CASCADE", onupdate="CASCADE"), nullable=False, index=True)
 
     # We never store the raw mfa_token or raw OTP.
     mfa_token_hash = Column(String(255), nullable=False, index=True)
     otp_hash = Column(String(255), nullable=False)
 
     expires_at = Column(DateTime, nullable=False)
-    attempts = Column(BigInteger, nullable=False, server_default=text("0"))
+    attempts = Column(Integer, nullable=False, server_default=text("0"))
     consumed_at = Column(DateTime, nullable=True)
 
     created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
@@ -151,3 +151,21 @@ class LinkedExtension(Base):
     is_active = Column(Boolean, nullable=False, server_default=text("1"))
 
     user = relationship("User")
+
+
+class GlobalBlocklist(Base):
+    __tablename__ = "global_blocklist"
+
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    fingerprint_hash = Column(String(128), nullable=False, unique=True, index=True)  # URL or media hash
+    source_url = Column(Text, nullable=True)
+    video_id = Column(String(255), nullable=True, index=True)
+    platform = Column(String(50), nullable=True)
+    title = Column(Text, nullable=True)
+    verdict = Column(String(30), nullable=False, server_default=text("'FAKE'"))
+    risk_score = Column(Integer, nullable=False, server_default=text("70"))
+    risk_level = Column(String(20), nullable=False, server_default=text("'High'"))
+    analysis_id = Column(BIGINT(unsigned=True), ForeignKey("media_analysis.id", ondelete="SET NULL"), nullable=True)
+    status = Column(String(20), nullable=False, server_default=text("'active'"))
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP, nullable=True, onupdate=func.now())

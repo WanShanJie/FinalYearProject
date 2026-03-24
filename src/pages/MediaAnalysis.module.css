@@ -104,6 +104,17 @@
   color: var(--muted);
 }
 
+.riskLabel {
+  font-size: 0.76rem;
+  color: var(--muted);
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+.riskLabel[data-tone="green"] { color: var(--success); }
+.riskLabel[data-tone="amber"] { color: var(--warning); }
+.riskLabel[data-tone="red"] { color: var(--danger); }
+
 .detailColumn {
   display: grid;
   gap: 16px;
@@ -134,7 +145,29 @@
   display: flex;
   align-items: center;
   gap: 16px;
+  flex-shrink: 0;
 }
+
+.verdictBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.riskLevelBadge {
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--muted);
+}
+
+.riskLevelBadge[data-tone="green"] { background: var(--success-soft); color: var(--success); border-color: transparent; }
+.riskLevelBadge[data-tone="amber"] { background: var(--warning-soft); color: var(--warning); border-color: transparent; }
+.riskLevelBadge[data-tone="red"] { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
 
 .confidenceRing {
   width: 96px;
@@ -165,6 +198,41 @@
   color: var(--muted);
 }
 
+.riskStrip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  margin-top: 16px;
+  border-radius: 18px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--border);
+}
+
+.riskStripItem {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 12px 14px;
+  background: var(--bg-elevated-2);
+}
+
+.riskStripItem span {
+  font-size: 0.74rem;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.riskStripItem strong {
+  font-size: 0.96rem;
+  font-weight: 800;
+}
+
+.riskStripItem strong[data-tone="green"] { color: var(--success); }
+.riskStripItem strong[data-tone="amber"] { color: var(--warning); }
+.riskStripItem strong[data-tone="red"] { color: var(--danger); }
+
 .previewArea {
   display: grid;
   grid-template-columns: 1fr 180px;
@@ -183,6 +251,21 @@
   place-items: center;
   color: var(--muted);
   gap: 10px;
+  overflow: hidden;
+}
+
+.previewImg {
+  width: 100%;
+  height: 100%;
+  max-height: 400px;
+  object-fit: contain;
+  border-radius: 20px;
+  background: black;
+}
+
+.loadingText {
+  font-size: 0.9rem;
+  color: var(--muted);
 }
 
 .previewIcon {
@@ -254,16 +337,35 @@
   color: var(--text);
 }
 
+.signalsBlock {
+  margin-top: 16px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  background: var(--bg-elevated-2);
+  border: 1px solid var(--border);
+}
+
+.signalsLabel {
+  font-size: 0.76rem;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 10px;
+}
+
 .reasonList {
   display: grid;
-  gap: 10px;
-  margin: 16px 0 0;
+  gap: 6px;
+  margin: 0;
   padding-left: 18px;
-  color: var(--muted);
+  color: var(--text);
 }
 
 .reasonList li {
+  font-size: 0.88rem;
   line-height: 1.6;
+  color: var(--muted);
 }
 
 .policyBox {

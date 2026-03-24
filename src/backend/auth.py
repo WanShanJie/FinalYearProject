@@ -6,9 +6,11 @@ from typing import Iterable
 
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "1234567890abcdef")
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise RuntimeError("JWT_SECRET_KEY is missing from .env. Secure communication cannot be established.")
 ALGORITHM = "HS256"
-TOKEN_EXPIRE_MIN = 60
+TOKEN_EXPIRE_MIN = 1440  # 24 hours
 
 def hash_password(password: str) -> str:
     return pwd_ctx.hash(password)

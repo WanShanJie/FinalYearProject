@@ -15,7 +15,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from jose import jwt, JWTError
 
 from db import SessionLocal, engine, Base
-from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ExtensionLinkRequest, LinkedExtension
+from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ExtensionLinkRequest, LinkedExtension, GlobalBlocklist
 from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn
 from auth import hash_password, verify_password, create_token, create_extension_token
 from oauth_routes import router as oauth_router
@@ -494,7 +494,7 @@ def forgot_password(data: ForgotPasswordIn, db: Session = Depends(get_db)):
     pr = PasswordReset(
         user_id=user.id,
         token_hash=hash_token(raw_token),
-        trusted_until=expires_at_dt(),
+        expires_at=expires_at_dt(),
         used_at=None,
     )
     db.add(pr)
@@ -717,6 +717,41 @@ def revoke_extension_device(
     device.revoked_at = _utcnow()
     db.commit()
     return {"ok": True, "message": "Extension revoked"}
+
+
+@app.post("/api/extension/devices/self/revoke")
+def revoke_current_extension_device(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db),
+):
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    payload = _decode_access_token(token)
+    if payload.get("type") != "extension":
+        raise HTTPException(status_code=403, detail="Extension token required")
+
+    linked_extension_id = payload.get("linked_extension_id")
+    user_id = payload.get("sub")
+    if not linked_extension_id:
+        raise HTTPException(status_code=401, detail="Invalid extension token")
+
+    device = (
+        db.query(LinkedExtension)
+        .filter(
+            LinkedExtension.id == int(linked_extension_id),
+            LinkedExtension.user_id == int(user_id),
+            LinkedExtension.token_hash == _hash_extension_token(token),
+        )
+        .first()
+    )
+    if not device:
+        raise HTTPException(status_code=404, detail="Linked extension not found")
+
+    device.is_active = False
+    device.revoked_at = _utcnow()
+    db.commit()
+    return {"ok": True, "message": "Extension disconnected"}
 
 
 def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_result: dict) -> dict:
@@ -1035,6 +1070,12 @@ async def capture_analysis(
     analysis.meta = meta_data
     db.commit()
 
+    # Auto-insert into global blocklist when result meets the risk threshold
+    try:
+        _maybe_insert_blocklist(analysis, db)
+    except Exception as e:
+        print(f"[Blocklist] Failed to auto-insert: {e}")
+
     return {
         "ok": True,
         "analysis_id": analysis.id,
@@ -1042,6 +1083,48 @@ async def capture_analysis(
         "score": analysis.score,
         "status": analysis.status,
     }
+
+
+# ─── Blocklist Policy ────────────────────────────────────────────────────────
+BLOCKLIST_RISK_THRESHOLD = int(os.getenv("BLOCKLIST_RISK_THRESHOLD", "70"))
+
+def _maybe_insert_blocklist(analysis: MediaAnalysis, db: Session):
+    """Insert into global_blocklist only when the result is strong enough."""
+    score_pct = round(float(analysis.score or 0) * 100)
+    verdict = (analysis.verdict or "").upper()
+
+    if verdict not in ("FAKE", "SUSPICIOUS") or score_pct < BLOCKLIST_RISK_THRESHOLD:
+        return  # Not strong enough — skip
+
+    # Build a stable fingerprint from what we know:
+    # Prefer video_id (most stable), else hash of page_url
+    raw_key = analysis.video_id or analysis.page_url or analysis.content_url or str(analysis.id)
+    fingerprint = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:64]
+
+    # Avoid duplicate entries
+    existing = db.query(GlobalBlocklist).filter(
+        GlobalBlocklist.fingerprint_hash == fingerprint
+    ).first()
+    if existing:
+        return
+
+    risk_score = max(score_pct, BLOCKLIST_RISK_THRESHOLD)
+    risk_level = "High" if risk_score >= 70 else "Medium"
+
+    entry = GlobalBlocklist(
+        fingerprint_hash=fingerprint,
+        source_url=analysis.page_url or analysis.content_url,
+        video_id=analysis.video_id,
+        platform=analysis.platform,
+        title=analysis.title,
+        verdict=verdict,
+        risk_score=risk_score,
+        risk_level=risk_level,
+        analysis_id=analysis.id,
+        status="active",
+    )
+    db.add(entry)
+    db.commit()
 
 @app.get("/api/analysis")
 def list_user_analyses(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
@@ -1052,6 +1135,29 @@ def list_user_analyses(db: Session = Depends(get_db), current_user: User = Depen
         .all()
     )
     return {"ok": True, "data": [_serialize_analysis(a) for a in analyses]}
+
+
+@app.get("/api/analysis/stats")
+def get_user_analysis_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    total = db.query(MediaAnalysis).filter(MediaAnalysis.user_id == current_user.id).count()
+    fake = db.query(MediaAnalysis).filter(
+        MediaAnalysis.user_id == current_user.id,
+        MediaAnalysis.verdict.in_(["FAKE", "SUSPICIOUS"])
+    ).count()
+    real = db.query(MediaAnalysis).filter(
+        MediaAnalysis.user_id == current_user.id,
+        MediaAnalysis.verdict == "REAL"
+    ).count()
+
+    return {
+        "ok": True,
+        "stats": {
+            "totalScans": total,
+            "threatsBlocked": fake,
+            "trustedMedia": real,
+            "queueReview": 0
+        }
+    }
 
 
 @app.get("/api/analysis/{analysis_id}")
@@ -1068,25 +1174,120 @@ def get_user_analysis(analysis_id: int, db: Session = Depends(get_db), current_u
         raise HTTPException(status_code=404, detail="Analysis not found")
     return {"ok": True, "data": _serialize_analysis(analysis)}
 
-
-@app.get("/api/analysis/stats")
-def get_user_analysis_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    total = db.query(MediaAnalysis).filter(MediaAnalysis.user_id == current_user.id).count()
-    fake = db.query(MediaAnalysis).filter(
-        MediaAnalysis.user_id == current_user.id,
-        MediaAnalysis.verdict.in_(["FAKE", "SUSPICIOUS"])
-    ).count()
-    real = db.query(MediaAnalysis).filter(
-        MediaAnalysis.user_id == current_user.id,
-        MediaAnalysis.verdict == "REAL"
-    ).count()
+@app.get("/api/analysis/{analysis_id}/preview")
+def get_user_analysis_preview(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    from fastapi.responses import FileResponse
+    analysis = (
+        db.query(MediaAnalysis)
+        .filter(
+            MediaAnalysis.id == analysis_id,
+            MediaAnalysis.user_id == current_user.id,
+        )
+        .first()
+    )
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+        
+    upload_dir = Path(__file__).resolve().parent / "uploads"
+    raw_dir = upload_dir / f"{analysis.id}_raw"
     
+    if raw_dir.exists() and raw_dir.is_dir():
+        files = list(raw_dir.glob("*.jpg"))
+        if files:
+            # Sort to ensure we get frame_0 / frame_000
+            files.sort()
+            return FileResponse(files[0])
+            
+    raise HTTPException(status_code=404, detail="Preview image not available")
+
+
+# ─── Blocklist API Endpoints ─────────────────────────────────────────────────
+
+@app.get("/api/blocklist/sync")
+def sync_blocklist(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Extension-facing endpoint: return all active blocklist fingerprints + video IDs for local sync."""
+    entries = (
+        db.query(GlobalBlocklist)
+        .filter(GlobalBlocklist.status == "active")
+        .order_by(GlobalBlocklist.created_at.desc())
+        .all()
+    )
     return {
         "ok": True,
-        "stats": {
-            "totalScans": total,
-            "threatsBlocked": fake,
-            "trustedMedia": real,
-            "queueReview": 0 # TODO: logic for review queue
-        }
+        "count": len(entries),
+        "entries": [
+            {
+                "fingerprint_hash": e.fingerprint_hash,
+                "video_id": e.video_id,
+                "source_url": e.source_url,
+                "platform": e.platform,
+                "title": e.title,
+                "verdict": e.verdict,
+                "risk_score": e.risk_score,
+                "risk_level": e.risk_level,
+                "status": e.status,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in entries
+        ]
+    }
+
+
+@app.get("/api/blocklist")
+def list_blocklist(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Portal-facing authenticated endpoint: full blocklist with analysis source info."""
+    entries = (
+        db.query(GlobalBlocklist)
+        .order_by(GlobalBlocklist.created_at.desc())
+        .all()
+    )
+    return {
+        "ok": True,
+        "data": [
+            {
+                "id": e.id,
+                "fingerprint_hash": e.fingerprint_hash,
+                "video_id": e.video_id,
+                "source_url": e.source_url,
+                "platform": e.platform,
+                "title": e.title,
+                "verdict": e.verdict,
+                "risk_score": e.risk_score,
+                "risk_level": e.risk_level,
+                "analysis_id": e.analysis_id,
+                "status": e.status,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            }
+            for e in entries
+        ]
+    }
+
+
+@app.post("/api/blocklist/check")
+def check_blocklist(payload: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Check one or more fingerprint_hashes/video_ids against the active blocklist."""
+    hashes = payload.get("hashes", [])
+    video_ids = [v for v in payload.get("video_ids", []) if v]
+
+    matched_hashes = set()
+    matched_video_ids = set()
+
+    if hashes:
+        rows = db.query(GlobalBlocklist.fingerprint_hash).filter(
+            GlobalBlocklist.fingerprint_hash.in_(hashes),
+            GlobalBlocklist.status == "active"
+        ).all()
+        matched_hashes = {r[0] for r in rows}
+
+    if video_ids:
+        rows = db.query(GlobalBlocklist.video_id).filter(
+            GlobalBlocklist.video_id.in_(video_ids),
+            GlobalBlocklist.status == "active"
+        ).all()
+        matched_video_ids = {r[0] for r in rows if r[0]}
+
+    return {
+        "ok": True,
+        "matched_hashes": list(matched_hashes),
+        "matched_video_ids": list(matched_video_ids),
     }

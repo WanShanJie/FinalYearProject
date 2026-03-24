@@ -37,16 +37,11 @@ body {
   gap: 10px;
 }
 
-.logo {
-  width: 34px;
-  height: 34px;
-  border-radius: 10px;
-  background: rgba(255, 255, 255, .08);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 800;
-  box-shadow: var(--shadow);
+.brandLogoImg {
+  width: 32px;
+  height: 32px;
+  object-fit: contain;
+  filter: drop-shadow(0 0 8px rgba(31, 139, 255, 0.25));
 }
 
 .miniText {
@@ -331,4 +326,77 @@ input:checked+.slider:before {
 
 .linkActions {
   margin-top: 10px;
+}
+
+/* --- Analysis Result Block --- */
+.resultBlock {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 12px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border);
+}
+
+.resultStrip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.riskText {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.riskText.green { color: var(--success, #16f07a); }
+.riskText.amber { color: var(--warning, #f59e0b); }
+.riskText.red { color: var(--danger, #ef4444); }
+
+.resReason {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  margin-bottom: 8px;
+}
+
+.resAction {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 8px 10px;
+  border-radius: 8px;
+  line-height: 1.35;
+}
+
+.resAction.green { color: var(--success, #16f07a); background: rgba(22, 240, 122, 0.12); }
+.resAction.amber { color: var(--warning, #f59e0b); background: rgba(245, 158, 11, 0.16); }
+.resAction.red { color: var(--danger, #ef4444); background: rgba(239, 68, 68, 0.14); }
+
+.resIdentity {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 8px;
+  font-size: 11px;
+}
+
+.idtRow {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 2px;
+  color: var(--muted);
+}
+
+.idtRow strong {
+  margin-right: 6px;
+  color: var(--muted);
+}
+
+.idtRow span {
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+  color: var(--text);
 }

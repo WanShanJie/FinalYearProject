@@ -6,6 +6,9 @@
 // 3) Never change currentTime or pause the player.
 
 const API_BASE = "http://127.0.0.1:8000";
+const FRONTEND_BASE = "http://localhost:5173";
+const PORTAL_ANALYSIS_URL = `${FRONTEND_BASE}/media-analysis`;
+
 
 const FRAME_COUNT = 48;
 const CAPTURE_INTERVAL_MS = 100;
@@ -21,8 +24,14 @@ chrome.runtime.onInstalled.addListener(async () => {
   await chrome.storage.local.set({
     monitoringEnabled: st.monitoringEnabled ?? false,
     scanned: st.scanned ?? 0,
-    blocked: st.blocked ?? 0
+    blocked: st.blocked ?? 0,
+    extensionLinkStatus: st.extensionLinkStatus ?? "idle",
+    extensionLinkError: st.extensionLinkError ?? "",
   });
+  // Sync blocklist on install/update
+  syncBlocklist().catch(() => {});
+  // Schedule periodic 30-min sync
+  chrome.alarms.create("blocklist_sync", { periodInMinutes: 30 });
 });
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -132,9 +141,9 @@ async function waitUntilReady(tabId, lockedVideoId) {
 }
 
 async function postToBackend(meta, blobs) {
-  const { token } = await chrome.storage.local.get(["token"]);
-  if (!token) {
-    throw new Error("Please sign in to the extension first.");
+  const { extensionToken } = await chrome.storage.local.get(["extensionToken"]);
+  if (!extensionToken) {
+    throw new Error("Connect the extension to the portal first.");
   }
 
   const fd = new FormData();
@@ -148,7 +157,7 @@ async function postToBackend(meta, blobs) {
   const res = await fetch(`${API_BASE}/api/analysis/capture`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${extensionToken}`,
     },
     body: fd,
   });
@@ -209,7 +218,107 @@ async function captureViaOffscreenTab(tabId, lockedRect) {
   };
 }
 
+async function clearExtensionLinkState({ keepCounts = true } = {}) {
+  const current = keepCounts ? await chrome.storage.local.get(["scanned", "blocked", "monitoringEnabled"]) : {};
+  await chrome.storage.local.clear();
+  await chrome.storage.local.set({
+    monitoringEnabled: current.monitoringEnabled ?? false,
+    scanned: current.scanned ?? 0,
+    blocked: current.blocked ?? 0,
+    extensionLinkStatus: "idle",
+    extensionLinkError: "",
+  });
+}
+
+async function revokeLinkedExtensionSelf() {
+  const { extensionToken } = await chrome.storage.local.get(["extensionToken"]);
+  if (!extensionToken) return;
+
+  try {
+    await fetch(`${API_BASE}/api/extension/devices/self/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${extensionToken}` },
+    });
+  } catch (err) {
+    console.warn("[Extension] Failed to revoke linked device on backend:", err);
+  }
+}
+
+async function handleCaptureSuccess(out, meta) {
+  const st = await chrome.storage.local.get(["scanned", "blocked"]);
+  const scanned = Number(st.scanned || 0) + 1;
+  const blocked = Number(st.blocked || 0) + (["FAKE", "SUSPICIOUS"].includes(String(out?.verdict || "").toUpperCase()) ? 1 : 0);
+
+  await chrome.storage.local.set({
+    scanned,
+    blocked,
+    lastAnalysisId: out?.analysis_id ?? null,
+    lastAnalysisVerdict: out?.verdict ?? null,
+    lastAnalysisScore: out?.score ?? 0,
+    lastAnalysisStatus: out?.status ?? null,
+    lastAnalysisMeta: meta ?? null,
+    lastPortalUrl: out?.analysis_id ? `${PORTAL_ANALYSIS_URL}?analysis_id=${encodeURIComponent(out.analysis_id)}` : PORTAL_ANALYSIS_URL,
+    extensionLinkError: "",
+  });
+
+  try {
+    await chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" });
+  } catch { }
+  // Keep local blocklist in sync after every successful high-risk scan
+  if (["FAKE", "SUSPICIOUS"].includes(String(out?.verdict || "").toUpperCase())) {
+    syncBlocklist().catch(() => {});
+  }
+}
+
+// ─── Blocklist Sync ───────────────────────────────────────────────────────────
+import('./idb.js').catch(() => {}); // ensure idb.js is loaded in sw context
+
+async function syncBlocklist() {
+  const { extensionToken } = await chrome.storage.local.get(["extensionToken"]);
+  if (!extensionToken) return; // Not linked, skip
+
+  try {
+    const res = await fetch(`${API_BASE}/api/blocklist/sync`, {
+      headers: { Authorization: `Bearer ${extensionToken}` }
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    if (!json.ok || !Array.isArray(json.entries)) return;
+
+    await self.DeepfakeIDB.idbBulkSync(json.entries);
+    await chrome.storage.local.set({ blocklistCount: json.entries.length, blocklistSyncedAt: Date.now() });
+    console.log(`[Blocklist] Synced ${json.entries.length} entries.`);
+
+    // Notify open content scripts to re-check their pages
+    const tabs = await chrome.tabs.query({ url: ["*://*.youtube.com/*", "*://*.tiktok.com/*", "*://*.facebook.com/*"] });
+    for (const tab of tabs) {
+      chrome.tabs.sendMessage(tab.id, { type: "BLOCKLIST_UPDATED" }).catch(() => {});
+    }
+  } catch (err) {
+    console.warn("[Blocklist] Sync failed:", err);
+  }
+}
+
+// Periodic alarm handler
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === "blocklist_sync") {
+    syncBlocklist().catch(() => {});
+  }
+});
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type === "DISCONNECT_EXTENSION") {
+    (async () => {
+      await revokeLinkedExtensionSelf();
+      await clearExtensionLinkState();
+      try {
+        await chrome.runtime.sendMessage({ type: "EXTENSION_LINK_UPDATED" });
+      } catch { }
+      sendResponse({ ok: true });
+    })().catch((err) => sendResponse({ ok: false, error: String(err?.message || err) }));
+    return true;
+  }
+
   if (msg?.type !== "CAPTURE_SCREEN_AND_SEND") return;
 
   (async () => {
@@ -326,7 +435,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       };
 
       const out = await postToBackend(meta, blobs);
-      sendResponse({ ok: true, ...out, capture_method: captureMethod });
+      await handleCaptureSuccess(out, meta);
+      sendResponse({ ok: true, ...out, capture_method: captureMethod, analysis_meta: meta });
     } catch (e) {
       sendResponse({ ok: false, error: String(e?.message || e) });
     } finally {

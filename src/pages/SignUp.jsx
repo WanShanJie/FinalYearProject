@@ -8,6 +8,8 @@ import LegalModal from "../components/LegalModal";
 import TermsContent from "../components/TermsContent";
 import PrivacyContent from "../components/PrivacyContent";
 
+const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+
 export default function SignUp() {
 
   const [firstName, setFirstName] = useState("");
@@ -25,11 +27,11 @@ export default function SignUp() {
 
   const nav = useNavigate();
 
-  
+
   async function onSubmit(e) {
     e.preventDefault();
     setError("");
-    
+
     // 1. Frontend Validation
     if (password.length < 8 || password.length > 72) {
       setError("Password must be 8 to 72 characters.");
@@ -78,16 +80,20 @@ export default function SignUp() {
     }
   }
 
+  function loginWithGoogle() {
+    window.location.href = `${BACKEND}/api/oauth/google/login`;
+  }
+
   return (
     <>
       <AuthLayout title="Sign Up" subtitle="Enter your email and password to sign up!">
         <div className={form.socialGrid}>
-          <button type="button" className={form.socialBtn}>
+          <button type="button" className={form.socialBtn} onClick={loginWithGoogle}>
             <GoogleIcon /> Sign up with Google
           </button>
-          <button type="button" className={form.socialBtn}>
+          {/* <button type="button" className={form.socialBtn}>
             <XIcon /> Sign up with X
-          </button>
+          </button> */}
         </div>
 
         <div className={form.divider}>
@@ -147,16 +153,16 @@ export default function SignUp() {
                 required
               />
 
-            <button
-              type="button"
-              className={form.eyeBtn}
-              onClick={() => setShowPassword(!showPassword)}
-              aria-label="Toggle password visibility"
-            >
-              {showPassword ? "Hide" : "Show"}
-            </button>
-            
-              </div>
+              <button
+                type="button"
+                className={form.eyeBtn}
+                onClick={() => setShowPassword(!showPassword)}
+                aria-label="Toggle password visibility"
+              >
+                {showPassword ? "Hide" : "Show"}
+              </button>
+
+            </div>
           </div>
 
           <label className={page.termsRow}>
@@ -166,7 +172,7 @@ export default function SignUp() {
               onChange={(e) => setAccepted(e.target.checked)}
             />
             <span>
-                By creating an account means you agree to the{" "}
+              By creating an account means you agree to the{" "}
               <button
                 type="button"
                 className={page.inlineLink}
@@ -192,7 +198,7 @@ export default function SignUp() {
             </pre>
           )}
 
-          <button type="submit" className={form.primaryBtn} disabled={loading|| !accepted}>
+          <button type="submit" className={form.primaryBtn} disabled={loading || !accepted}>
             {loading ? "Signing up..." : "Sign Up"}
           </button>
 
@@ -224,13 +230,13 @@ function GoogleIcon() {
   );
 }
 
-function XIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M18.9 2H22l-6.8 7.8L23 22h-6.8l-5.3-6.9L4.8 22H2l7.4-8.5L1 2h6.9l4.8 6.3L18.9 2zm-1.2 18h1.7L7.9 3.9H6.1L17.7 20z" />
-    </svg>
-  );
-}
+// function XIcon() {
+//   return (
+//     <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+//       <path d="M18.9 2H22l-6.8 7.8L23 22h-6.8l-5.3-6.9L4.8 22H2l7.4-8.5L1 2h6.9l4.8 6.3L18.9 2zm-1.2 18h1.7L7.9 3.9H6.1L17.7 20z" />
+//     </svg>
+//   );
+// }
 
 function getErrorMessage(err) {
   // If backend returns {detail: "..."}

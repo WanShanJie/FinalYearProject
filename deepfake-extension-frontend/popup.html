@@ -11,10 +11,10 @@
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="logo">A²U</div>
+      <img src="assets/deepfake_logo.png" alt="A2U Logo" class="brandLogoImg" />
       <div>
-        <strong>Deepfake Verification</strong>
-        <div class="miniText">Context-aware portal protection</div>
+        <strong>A2U</strong>
+        <div class="miniText">Context-aware Deepfake Verification</div>
       </div>
     </div>
     <div class="status">
@@ -77,12 +77,28 @@
       Analyze This Page Now
     </button>
     <div id="analyzeMsg" class="hint">
-      Works even if Real-Time Protection is OFF. Sends captured frames + page metadata to your backend.
+      Run analysis to view verdict and reason.
+    </div>
+
+    <div id="analysisResultBlock" class="resultBlock" style="display: none;">
+      <div class="resultStrip">
+        <span id="resVerdictBadge" class="statusBadge" style="font-size: 11px;">VERDICT</span>
+        <span id="resRiskBadge" class="riskText">0% Risk</span>
+      </div>
+      
+      <div id="resIdentity" class="resIdentity">
+        <div class="idtRow"><strong>Media:</strong> <span id="idtMediaType">Video</span></div>
+        <div class="idtRow"><strong>Platform:</strong> <span id="idtPlatform">YouTube</span></div>
+        <div id="idtSourceRow" class="idtRow"><strong>Source:</strong> <span id="idtSource">...</span></div>
+      </div>
+
+      <div id="resReason" class="resReason">No analysis result yet.</div>
+      <div id="resAction" class="resAction"></div>
     </div>
   </main>
 
   <footer class="footer">
-    <a id="openDashboard" href="#">View Full Dashboard →</a>
+    <a id="openDashboard" href="#">Open Portal Details →</a>
     <span class="ver">v0.2.1</span>
   </footer>
 
