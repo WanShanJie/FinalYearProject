@@ -56,21 +56,6 @@
   </main>
 
   <main class="card">
-    <div class="sectionTop">
-      <div>
-        <div class="label">Portal Connection</div>
-        <div id="linkStatusBadge" class="statusBadge statusIdle">Not connected</div>
-      </div>
-      <button id="btnConnectPortal" class="secondaryBtn">Connect to Portal</button>
-    </div>
-    <div id="connectedUser" class="hint">Link the extension once so all captures are stored under the correct signed-in
-      portal account.</div>
-    <div class="linkActions">
-      <button id="btnDisconnectPortal" class="ghostBtn" type="button">Disconnect</button>
-    </div>
-  </main>
-
-  <main class="card">
     <div class="label">Deep Media Analysis</div>
     <button id="btnAnalyzeNow" class="btn">
       <span class="btnIcon">✦</span>
@@ -85,15 +70,32 @@
         <span id="resVerdictBadge" class="statusBadge" style="font-size: 11px;">VERDICT</span>
         <span id="resRiskBadge" class="riskText">0% Risk</span>
       </div>
-      
+
       <div id="resIdentity" class="resIdentity">
-        <div class="idtRow"><strong>Media:</strong> <span id="idtMediaType">Video</span></div>
-        <div class="idtRow"><strong>Platform:</strong> <span id="idtPlatform">YouTube</span></div>
-        <div id="idtSourceRow" class="idtRow"><strong>Source:</strong> <span id="idtSource">...</span></div>
+        <div class="idtRow"><strong>Media Type:</strong> <span id="idtMediaType">Media</span></div>
+        <div class="idtRow"><strong>Platform:</strong> <span id="idtPlatform">Unknown</span></div>
+        <div class="idtRow" id="idtTitleRow"><strong>Title:</strong> <span id="idtTitle">Unknown</span></div>
+        <div class="idtRow" id="idtSourceRow"><strong>Source:</strong> <span id="idtSource">Not available</span></div>
+        <div class="idtRow" id="idtVideoIdRow"><strong>Video ID:</strong> <span id="idtVideoId">...</span></div>
       </div>
 
       <div id="resReason" class="resReason">No analysis result yet.</div>
       <div id="resAction" class="resAction"></div>
+    </div>
+  </main>
+
+  <main class="card">
+    <div class="sectionTop">
+      <div>
+        <div class="label">Portal Connection</div>
+        <div id="linkStatusBadge" class="statusBadge statusIdle">Not connected</div>
+      </div>
+      <button id="btnConnectPortal" class="secondaryBtn">Connect to Portal</button>
+    </div>
+    <div id="connectedUser" class="hint">Link the extension once so all captures are stored under the correct signed-in
+      portal account.</div>
+    <div class="linkActions">
+      <button id="btnDisconnectPortal" class="ghostBtn" type="button">Disconnect</button>
     </div>
   </main>
 

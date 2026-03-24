@@ -246,15 +246,40 @@ function updateResultUI(verdictRaw, rawScore, meta) {
   resRiskBadge.className = `riskText ${metrics.tone}`;
 
   // 2. Identity
-  const platform = meta?.platform || "Unknown";
   const mediaType = (meta?.media_type || "Media").charAt(0).toUpperCase() + (meta?.media_type || "Media").slice(1);
-  const sourceId = meta?.video_id || meta?.current_video_id || (meta?.canonical_url ? meta.canonical_url.split('/').pop() : "...") ;
+  let platform = meta?.platform || "Unknown";
+  let title = meta?.title || "Unknown detected media";
+  
+  const rawSource = meta?.canonical_url || meta?.source_url || meta?.page_url || "";
+  let readableSource = rawSource;
+  if (rawSource) {
+    try {
+      const u = new URL(rawSource);
+      readableSource = u.hostname.replace(/^www\./, "") + u.pathname + u.search;
+      if (platform === "Unknown") {
+        platform = u.hostname.replace(/^www\./, "").split(".")[0];
+      }
+    } catch(e) {}
+  }
+  if (!readableSource) readableSource = "Not available";
+  
+  const videoId = meta?.video_id || meta?.current_video_id || meta?.locked_video_id;
 
   document.getElementById("idtMediaType").textContent = mediaType;
   document.getElementById("idtPlatform").textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
-  document.getElementById("idtSource").textContent = sourceId;
-  document.getElementById("idtSource").title = meta?.canonical_url || meta?.page_url || "";
-
+  document.getElementById("idtTitle").textContent = title;
+  document.getElementById("idtTitle").title = title;
+  
+  document.getElementById("idtSource").textContent = readableSource;
+  document.getElementById("idtSource").title = rawSource;
+  
+  const vIdRow = document.getElementById("idtVideoIdRow");
+  if (videoId) {
+    vIdRow.style.display = "flex";
+    document.getElementById("idtVideoId").textContent = videoId;
+  } else {
+    vIdRow.style.display = "none";
+  }
   // 3. Narrative
   resReason.textContent = reason;
   resAction.textContent = policy.text;
