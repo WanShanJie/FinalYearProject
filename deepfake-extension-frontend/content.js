@@ -48,9 +48,21 @@ function unblockAllMedia() {
     delete el.dataset.deepfakeBlocked;
     el._deepfakeBlocked = false;
   });
-  document.querySelectorAll("[data-deepfake-overlay]").forEach(el => el.remove());
-}
 
+  document.querySelectorAll("[data-deepfake-overlay]").forEach(el => el.remove());
+
+  document.querySelectorAll("[data-deepfake-card-checked]").forEach(el => {
+    delete el.dataset.deepfakeCardChecked;
+  });
+
+  document.querySelectorAll("[data-deepfake-thumb-blocked]").forEach(el => {
+    delete el.dataset.deepfakeThumbBlocked;
+  });
+
+  document.querySelectorAll("[data-deepfake-hover-bound]").forEach(el => {
+    delete el.dataset.deepfakeHoverBound;
+  });
+}
 /**
  * Stops a video element from playing — and keeps it stopped.
  * Uses YouTube's internal API if available, plus HTML5 video aggressive pausing.
@@ -66,16 +78,16 @@ function enforceVideoPause(video) {
       if (ytPlayer && typeof ytPlayer.pauseVideo === "function") {
         ytPlayer.pauseVideo();
       }
-      
+
       // 2. Standard HTML5 aggression
       video.pause();
       video.muted = true;
       video.volume = 0;
-    } catch(_) {}
+    } catch (_) { }
   };
-  
+
   kill(); // immediate
-  video.addEventListener("play",    (e) => { e.preventDefault(); e.stopImmediatePropagation(); kill(); }, { capture: true });
+  video.addEventListener("play", (e) => { e.preventDefault(); e.stopImmediatePropagation(); kill(); }, { capture: true });
   video.addEventListener("playing", (e) => { e.preventDefault(); e.stopImmediatePropagation(); kill(); }, { capture: true });
 
   // Keep enforcing aggressively during startup
@@ -95,7 +107,7 @@ function enforceVideoPause(video) {
 function buildOverlay(entry, { compact = false, borderRadius = "8px" } = {}) {
   const overlay = document.createElement("div");
   overlay.dataset.deepfakeOverlay = "1";
-  
+
   // High-z-index, full width/height strict containment
   overlay.style.cssText = [
     "position: absolute !important",
@@ -173,11 +185,11 @@ function buildOverlay(entry, { compact = false, borderRadius = "8px" } = {}) {
     link.href = "http://localhost:5173/media-analysis";
     link.target = "_blank";
     link.style.cssText = "color: #60a5fa !important; font-size: 0.95rem !important; margin-top: 12px !important; text-decoration: none !important; font-weight: 600 !important; font-family: system-ui, sans-serif !important; cursor: pointer !important; padding: 8px 16px !important; background: rgba(37,99,235,0.1) !important; border-radius: 6px !important; border: 1px solid rgba(59,130,246,0.3) !important;";
-    
+
     // Explicit pointer events so it CAN be clicked
     link.style.pointerEvents = "auto";
-    
-    link.onmouseover  = () => link.style.background = "rgba(37,99,235,0.2)";
+
+    link.onmouseover = () => link.style.background = "rgba(37,99,235,0.2)";
     link.onmouseleave = () => link.style.background = "rgba(37,99,235,0.1)";
     link.addEventListener("click", e => e.stopPropagation()); // don't trigger the blocker's stopImmediatePropagation
     overlay.appendChild(link);
@@ -233,14 +245,14 @@ function blockElement(el, entry) {
   if (isVideo) {
     enforceVideoPause(el);
     blockWatchPageVideo(el, entry);
-    return; 
+    return;
   }
 
   // ── Structural card (e.g. ytd-rich-item-renderer) ───────────────────────
   if (window.getComputedStyle(el).position === "static") {
     el.style.setProperty("position", "relative", "important");
   }
-  
+
   // Guarantee a minimum dimensions so flex centering never collapses 
   // (YouTube often uses strictly calculated inner heights)
   const rect = el.getBoundingClientRect();
@@ -259,7 +271,7 @@ function blockElement(el, entry) {
 
   const cs = window.getComputedStyle(el);
   const elBR = cs.borderRadius || "12px";
-  
+
   // Append a heavy blur overlay over the entire card
   const overlay = buildOverlay(entry, { compact: true, borderRadius: elBR });
   el.appendChild(overlay);
@@ -297,31 +309,137 @@ function aHash(imageData) {
 
 function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-function frameStatsFromCanvas(canvas, sampleStep = 32) {
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  const { width, height } = canvas;
-  const w = Math.max(1, Math.floor(width / sampleStep));
-  const h = Math.max(1, Math.floor(height / sampleStep));
-  const probe = document.createElement("canvas");
-  probe.width = w;
-  probe.height = h;
-  const pctx = probe.getContext("2d", { willReadFrequently: true });
-  pctx.drawImage(canvas, 0, 0, w, h);
-  const data = pctx.getImageData(0, 0, w, h).data;
+function stopYouTubeHoverPreview(card) {
+  if (!card) return;
 
-  let sum = 0;
-  let nonBlack = 0;
-  for (let i = 0; i < data.length; i += 4) {
-    const lum = (data[i] * 0.299 + data[i + 1] * 0.587 + data[i + 2] * 0.114);
-    sum += lum;
-    if (lum > 8) nonBlack += 1;
-  }
-  const total = Math.max(1, data.length / 4);
-  return {
-    avgLuma: sum / total,
-    nonBlackRatio: nonBlack / total,
-    isMostlyBlack: (sum / total) < 6 || (nonBlack / total) < 0.02,
+  const previewSelectors = [
+    "video",
+    "ytd-moving-thumbnail-renderer",
+    "yt-image-banner-view-model",
+    "div#mouseover-overlay",
+    "div#hover-overlays",
+    ".ytd-moving-thumbnail-renderer",
+    ".html5-video-container"
+  ];
+
+  previewSelectors.forEach(sel => {
+    card.querySelectorAll(sel).forEach(node => {
+      try {
+        if (node.tagName === "VIDEO") {
+          node.pause?.();
+          node.currentTime = 0;
+          node.muted = true;
+          node.volume = 0;
+        }
+        node.style.setProperty("display", "none", "important");
+        node.style.setProperty("visibility", "hidden", "important");
+        node.style.setProperty("opacity", "0", "important");
+      } catch (_) { }
+    });
+  });
+}
+
+function suppressHoverPreviewEvents(target) {
+  if (!target || target.dataset.deepfakeHoverBound === "1") return;
+  target.dataset.deepfakeHoverBound = "1";
+
+  const killHover = (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+
+    stopYouTubeHoverPreview(
+      target.closest("ytd-rich-item-renderer, ytd-video-renderer, ytd-grid-video-renderer, ytd-compact-video-renderer, ytd-reel-item-renderer") || target
+    );
   };
+
+  [
+    "mouseenter",
+    "mouseover",
+    "mousemove",
+    "pointerenter",
+    "pointerover",
+    "pointermove",
+    "mousedown",
+    "mouseup",
+    "click"
+  ].forEach(evt => {
+    target.addEventListener(evt, killHover, { capture: true });
+  });
+}
+
+function blockYouTubeThumbnailCard(card, thumbHost, entry) {
+  if (!card) return;
+  if (card.dataset.deepfakeThumbBlocked === "1") return;
+  card.dataset.deepfakeThumbBlocked = "1";
+
+  const thumbnailBox =
+    thumbHost ||
+    card.querySelector("#thumbnail") ||
+    card.querySelector("ytd-thumbnail") ||
+    card;
+
+  if (window.getComputedStyle(card).position === "static") {
+    card.style.setProperty("position", "relative", "important");
+  }
+
+  if (window.getComputedStyle(thumbnailBox).position === "static") {
+    thumbnailBox.style.setProperty("position", "relative", "important");
+  }
+
+  // Disable navigation/clicks
+  const clickableEls = card.querySelectorAll("a, button, yt-icon-button");
+  clickableEls.forEach(node => {
+    node.style.setProperty("pointer-events", "none", "important");
+  });
+
+  // Hide all thumbnail images, not just one
+  const imgs = card.querySelectorAll("img, yt-image img");
+  imgs.forEach(img => {
+    img.style.setProperty("visibility", "hidden", "important");
+    img.style.setProperty("opacity", "0", "important");
+  });
+
+  // Hide preview/moving thumbnail parts immediately
+  stopYouTubeHoverPreview(card);
+
+  const thumbImageWrap =
+    card.querySelector("ytd-thumbnail") ||
+    card.querySelector("#thumbnail") ||
+    thumbnailBox;
+
+  if (thumbImageWrap) {
+    thumbImageWrap.style.setProperty("background", "#0f0f14", "important");
+    thumbImageWrap.style.setProperty("overflow", "hidden", "important");
+  }
+
+  const existing = thumbnailBox.querySelector("[data-deepfake-overlay='1']");
+  if (existing) return;
+
+  const overlay = buildOverlay(entry, {
+    compact: true,
+    borderRadius: "12px"
+  });
+
+  overlay.style.setProperty("position", "absolute", "important");
+  overlay.style.setProperty("top", "0", "important");
+  overlay.style.setProperty("left", "0", "important");
+  overlay.style.setProperty("width", "100%", "important");
+  overlay.style.setProperty("height", "100%", "important");
+  overlay.style.setProperty("z-index", "2147483647", "important");
+  overlay.style.setProperty("pointer-events", "auto", "important");
+
+  // Block hover-triggered preview on card, thumbnail, and overlay
+  suppressHoverPreviewEvents(card);
+  suppressHoverPreviewEvents(thumbnailBox);
+  suppressHoverPreviewEvents(overlay);
+
+  thumbnailBox.appendChild(overlay);
+
+  // Re-kill preview if YouTube injects it slightly later
+  setTimeout(() => stopYouTubeHoverPreview(card), 0);
+  setTimeout(() => stopYouTubeHoverPreview(card), 300);
+  setTimeout(() => stopYouTubeHoverPreview(card), 1000);
 }
 
 async function bumpCounter(key, inc = 1) {
@@ -363,7 +481,7 @@ async function processMedia(el) {
     }
 
     chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
-  } catch(err) {
+  } catch (err) {
     // canvas/CORS issues; skip silently
     console.debug("[BlocklistGuard] processMedia skip:", err?.message);
   }
@@ -392,7 +510,7 @@ async function checkVideoIdOnPage() {
     const ytShorts = url.match(/\/shorts\/([^/?]+)/);
     if (ytShorts) videoId = ytShorts[1];
     else {
-      try { videoId = new URL(url).searchParams.get("v"); } catch(_) {}
+      try { videoId = new URL(url).searchParams.get("v"); } catch (_) { }
     }
     if (!videoId) {
       console.log("[BlocklistGuard] No video_id found in current URL, skipping early block.");
@@ -407,7 +525,7 @@ async function checkVideoIdOnPage() {
     if (res?.ok && res?.entry) {
       const { entry } = res;
       console.log(`[BlocklistGuard] 🚫 video_id "${videoId}" is BLOCKED by SW. Title: "${entry.title || '?'}". Applying overlay.`);
-      window._blockedEntry = entry; 
+      window._blockedEntry = entry;
       document.querySelectorAll("video").forEach(v => {
         blockElement(v, entry);
       });
@@ -415,9 +533,9 @@ async function checkVideoIdOnPage() {
       chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
     } else {
       console.log(`[BlocklistGuard] SW says video_id "${videoId}" is CLEAN.`);
-      window._blockedEntry = null; 
+      window._blockedEntry = null;
     }
-  } catch(err) {
+  } catch (err) {
     console.warn("[BlocklistGuard] checkVideoIdOnPage SW query error:", err);
   }
 } // End of checkVideoIdOnPage
@@ -433,81 +551,160 @@ async function scanYouTubeCards(root = document) {
     "ytd-reel-item-renderer"
   ];
 
-  const cards = root.querySelectorAll(selectors.map(s => `${s}:not([data-deepfake-card-checked])`).join(", "));
-  
+  let cards = [];
+
+  if (root instanceof Element && root.matches(selectors.join(", "))) {
+    cards.push(root);
+  }
+
+  if (root.querySelectorAll) {
+    cards.push(
+      ...root.querySelectorAll(
+        selectors.map(s => `${s}:not([data-deepfake-card-checked])`).join(", ")
+      )
+    );
+  }
+
   for (const card of cards) {
-    card.dataset.deepfakeCardChecked = "1";
-    
-    // Find the link
-    const link = card.querySelector('a#thumbnail[href*="/watch?v="], a#thumbnail[href*="/shorts/"], a.ytd-thumbnail[href*="/watch?v="], a.ytd-thumbnail[href*="/shorts/"]');
+    const link = card.querySelector(
+      [
+        'a#thumbnail[href*="/watch?v="]',
+        'a#thumbnail[href*="/shorts/"]',
+        'a[href*="/watch?v="]',
+        'a[href*="/shorts/"]',
+        'a.ytd-thumbnail[href*="/watch?v="]',
+        'a.ytd-thumbnail[href*="/shorts/"]'
+      ].join(", ")
+    );
+
     if (!link) continue;
 
-    const href = link.getAttribute("href");
+    const href = link.getAttribute("href") || "";
     let videoId = null;
+
     const ytShorts = href.match(/\/shorts\/([^/?]+)/);
-    if (ytShorts) videoId = ytShorts[1];
-    else {
+    if (ytShorts) {
+      videoId = ytShorts[1];
+    } else {
       try {
         const u = new URL(href, "https://youtube.com");
         videoId = u.searchParams.get("v");
-      } catch(_) {}
+      } catch (_) { }
     }
 
     if (!videoId) continue;
 
-    chrome.runtime.sendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId }, res => {
-      if (res?.ok && res?.entry) {
-        console.log(`[BlocklistGuard] 🚫 Preview Card "${videoId}" confirmed by SW. Blocking card.`);
-        blockElement(card, res.entry);
-        bumpCounter("blocked", 1).catch(()=>{});
+    card.dataset.deepfakeCardChecked = "1";
+    console.log(`[BlocklistGuard] Checking preview card video_id: ${videoId}`);
+
+    chrome.runtime.sendMessage(
+      { type: "CHECK_VIDEO_ID_BLOCKLIST", videoId },
+      res => {
+        if (chrome.runtime.lastError) {
+          console.warn(
+            "[BlocklistGuard] CHECK_VIDEO_ID_BLOCKLIST error:",
+            chrome.runtime.lastError.message
+          );
+          return;
+        }
+
+        if (res?.ok && res?.entry) {
+          console.log(
+            `[BlocklistGuard] 🚫 Preview card blocked for video_id: ${videoId}`
+          );
+
+          const thumbHost =
+            card.querySelector("#thumbnail") ||
+            card.querySelector("ytd-thumbnail") ||
+            link;
+
+          blockYouTubeThumbnailCard(card, thumbHost, res.entry);
+        } else {
+          console.log(
+            `[BlocklistGuard] Preview card clean for video_id: ${videoId}`
+          );
+        }
       }
-    });
+    );
   }
 }
 
 function scanExisting() {
-  document.querySelectorAll("img, video").forEach(processMedia);
-  scanYouTubeCards();
+  if (monitoringEnabled) {
+    document.querySelectorAll("img,video").forEach(maybeHashAndCheck);
+  }
+
+  if (location.hostname.includes("youtube.com")) {
+    scanYouTubeCards(document);
+  }
+
+  checkVideoIdOnPage().catch(() => { });
 }
 
 const mo = new MutationObserver((mutations) => {
-  // Check for SPA navigation changes dynamically
-  if (location.href !== currentUrl) {
-    currentUrl = location.href;
-    console.log("[BlocklistGuard] URL changed (SPA navigation detected), rechecking context.");
-    window._blockedEntry = null; // reset state defensively
-    unblockAllMedia(); // Erase old overlays and dataset locks so recycled elements can be evaluated natively
-    checkVideoIdOnPage().catch(() => {});
-  }
+  try {
+    for (const m of mutations) {
+      for (const n of m.addedNodes) {
+        if (!(n instanceof HTMLElement)) continue;
 
-  // Use active global block immediately, skip checking monitoringEnabled as explicit blocks override disable
-  if (window._blockedEntry) {
-    document.querySelectorAll("video").forEach(v => blockElement(v, window._blockedEntry));
-    // Continue scanning for cards because sidebar cards have DIFFERENT video_ids
-  }
+        if (monitoringEnabled) {
+          if (typeof isMediaEl === "function" && isMediaEl(n)) {
+            if (typeof maybeHashAndCheck === "function") {
+              maybeHashAndCheck(n);
+            }
+          }
 
-  // Scan for cards on mutation regardless of monitoringEnabled if blocklist is working
-  if (location.hostname.includes("youtube.com")) {
-    scanYouTubeCards();
-  }
+          if (typeof n.querySelectorAll === "function") {
+            n.querySelectorAll("img,video").forEach(el => {
+              if (typeof maybeHashAndCheck === "function") {
+                maybeHashAndCheck(el);
+              }
+            });
+          }
+        }
 
-  if (!monitoringEnabled) return;
-  for (const m of mutations) {
-    for (const n of m.addedNodes) {
-      if (!(n instanceof HTMLElement)) continue;
-      if (isMediaEl(n)) processMedia(n);
-      n.querySelectorAll?.("img, video")?.forEach(processMedia);
+        if (location.hostname.includes("youtube.com")) {
+          if (typeof scanYouTubeCards === "function") {
+            scanYouTubeCards(n);
+          }
+        }
+      }
     }
+
+    if (location.hostname.includes("youtube.com")) {
+      if (typeof scanYouTubeCards === "function") {
+        scanYouTubeCards(document);
+      }
+    }
+
+    if (location.href !== currentUrl) {
+      currentUrl = location.href;
+      console.log("[BlocklistGuard] URL changed:", currentUrl);
+
+      if (typeof unblockAllMedia === "function") {
+        unblockAllMedia();
+      }
+
+      if (typeof checkVideoIdOnPage === "function") {
+        checkVideoIdOnPage().catch(() => { });
+      }
+
+      if (typeof scanExisting === "function") {
+        scanExisting();
+      }
+    }
+  } catch (err) {
+    console.warn("[BlocklistGuard] MutationObserver error:", err);
   }
 });
 
 // Defense in depth for slow-loading SPA players
 window.addEventListener("load", () => {
   console.log("[BlocklistGuard] load event fired, running final check...");
-  checkVideoIdOnPage().catch(() => {});
+  checkVideoIdOnPage().catch(() => { });
 });
-setTimeout(() => checkVideoIdOnPage().catch(() => {}), 1500);
-setTimeout(() => checkVideoIdOnPage().catch(() => {}), 3500);
+setTimeout(() => checkVideoIdOnPage().catch(() => { }), 1500);
+setTimeout(() => checkVideoIdOnPage().catch(() => { }), 3500);
 
 function getPlatform() {
   const h = location.hostname;
@@ -1057,3 +1254,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   return true;
 });
+
+(async function initDeepfakeGuard() {
+  await loadMonitoringFlag();
+  startObserver();
+  scanExisting();
+  setTimeout(() => scanExisting(), 1000);
+  setTimeout(() => scanExisting(), 2500);
+})();
