@@ -191,41 +191,46 @@ function getDisplayMetrics(backendVerdict, rawScore) {
   const raw = rawScore ?? 0;
   let riskScore = Math.round(raw * 100);
 
-  let displayVerdict = v;
-  if (!v || v === "UNKNOWN") {
-    if (riskScore <= 29) displayVerdict = "REAL";
-    else if (riskScore >= 70) displayVerdict = "FAKE";
-    else displayVerdict = "INCONCLUSIVE";
+  let mappedVerdict = v;
+  if (!mappedVerdict || mappedVerdict === "UNKNOWN" || mappedVerdict === "PROCESSED") {
+    mappedVerdict = window.getVerdictFromScore(riskScore);
+  } else if (!window.VERDICT_CONFIG[mappedVerdict]) {
+    mappedVerdict = window.getVerdictFromScore(riskScore);
   }
 
+  const scoreVerdict = window.getVerdictFromScore(riskScore);
   let riskLevel = "Medium Risk";
-  let scoreTone = "amber";
-  if (riskScore <= 29) { riskLevel = "Low Risk"; scoreTone = "green"; }
-  else if (riskScore >= 70) { riskLevel = "High Risk"; scoreTone = "red"; }
+  if (scoreVerdict === "FAKE") riskLevel = "High Risk";
+  else if (scoreVerdict === "REAL") riskLevel = "Low Risk";
 
-  if (displayVerdict === "REAL") {
+  if (mappedVerdict === "REAL") {
     riskLevel = (riskScore < 30) ? "Low Risk" : "Legitimate";
   }
 
-  let verdictTone = "amber";
-  if (displayVerdict === "REAL") verdictTone = "green";
-  else if (displayVerdict === "FAKE") verdictTone = "red";
+  const verdictConfig = window.VERDICT_CONFIG[mappedVerdict] || window.VERDICT_CONFIG.INCONCLUSIVE;
+  const scoreConfig = window.VERDICT_CONFIG[scoreVerdict] || window.VERDICT_CONFIG.INCONCLUSIVE;
 
-  if (displayVerdict === "REAL" && riskScore >= 50) scoreTone = "amber";
-  else if (displayVerdict === "FAKE" && riskScore < 50) scoreTone = "amber";
-
-  return { riskScore, displayVerdict, riskLevel, tone: verdictTone, scoreTone };
+  return { 
+    riskScore, 
+    displayVerdictKey: mappedVerdict,
+    displayVerdict: verdictConfig.label, 
+    riskLevel, 
+    scoreColor: scoreConfig.color,
+    scoreBg: scoreConfig.bg,
+    verdictColor: verdictConfig.color,
+    verdictBg: verdictConfig.bg
+  };
 }
 
-function getPolicyAction(displayVerdict, riskScore) {
-  if (displayVerdict === "FAKE") return { text: "Warning: Block or restrict sharing of this content.", tone: "red" };
-  if (displayVerdict === "REAL") return { text: "Verified: No immediate action required.", tone: "green" };
-  return { text: "Review carefully. Mixed or uncertain signals detected.", tone: "amber" };
+function getPolicyAction(displayVerdictKey) {
+  if (displayVerdictKey === "FAKE") return { text: "Warning: Block or restrict sharing of this content.", color: window.VERDICT_CONFIG.FAKE.color };
+  if (displayVerdictKey === "REAL") return { text: "Verified: No immediate action required.", color: window.VERDICT_CONFIG.REAL.color };
+  return { text: "Review carefully. Mixed or uncertain signals detected.", color: window.VERDICT_CONFIG.SUSPICIOUS.color };
 }
 
-function getReasoning(displayVerdict, riskScore) {
-  if (displayVerdict === "REAL") return "Analysis found no significant evidence of digital manipulation.";
-  if (displayVerdict === "FAKE") return "The AI model detected strong indicators of digital manipulation.";
+function getReasoning(displayVerdictKey) {
+  if (displayVerdictKey === "REAL") return "Analysis found no significant evidence of digital manipulation.";
+  if (displayVerdictKey === "FAKE") return "The AI model detected strong indicators of digital manipulation.";
   return "The analysis returned mixed or inconclusive signals, resulting in an uncertain classification.";
 }
 
@@ -234,16 +239,17 @@ function updateResultUI(verdictRaw, rawScore, meta) {
   analysisResultBlock.style.display = "block";
 
   const metrics = getDisplayMetrics(verdictRaw, rawScore);
-  const policy = getPolicyAction(metrics.displayVerdict, metrics.riskScore);
-  const reason = getReasoning(metrics.displayVerdict, metrics.riskScore);
+  const policy = getPolicyAction(metrics.displayVerdictKey);
+  const reason = getReasoning(metrics.displayVerdictKey);
 
   // 1. Verdict & Risk
   resVerdictBadge.textContent = metrics.displayVerdict;
-  resVerdictBadge.className = `statusBadge ${
-    metrics.tone === "green" ? "statusConnected" : metrics.tone === "red" ? "statusError" : "statusPending"
-  }`;
+  resVerdictBadge.style.color = metrics.verdictColor;
+  resVerdictBadge.style.backgroundColor = metrics.verdictBg;
+  resVerdictBadge.style.border = `1px solid ${metrics.verdictColor}`;
+  
   resRiskBadge.textContent = `${metrics.riskLevel} · ${metrics.riskScore}%`;
-  resRiskBadge.className = `riskText ${metrics.tone}`;
+  resRiskBadge.style.color = metrics.scoreColor;
 
   // 2. Identity
   const mediaType = (meta?.media_type || "Media").charAt(0).toUpperCase() + (meta?.media_type || "Media").slice(1);
@@ -283,7 +289,7 @@ function updateResultUI(verdictRaw, rawScore, meta) {
   // 3. Narrative
   resReason.textContent = reason;
   resAction.textContent = policy.text;
-  resAction.className = `resAction ${metrics.tone}`;
+  resAction.style.color = policy.color;
 }
 
 async function fetchLinkStatus(requestId) {

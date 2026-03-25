@@ -3,64 +3,56 @@ import layout from "../components/system/SystemLayout.module.css";
 import styles from "./MediaAnalysis.module.css";
 import { AlertIcon, CheckIcon, ImageIcon, SearchIcon, VideoIcon } from "../components/system/SystemIcons";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { VERDICT_CONFIG } from "../constants/verdictColors";
+import { getVerdictFromScore } from "../utils/riskMapping";
 
 // ─── Shared Risk & Presentation Logic ───────────────────────────────────────
-// Forces synchronization between Verdict, Risk Score, and Risk Level.
-// Display Verdicts are strictly: REAL | FAKE | INCONCLUSIVE
 export function getDisplayMetrics(backendVerdict, rawScore) {
   const v = (backendVerdict || "").toUpperCase();
   const raw = rawScore ?? 0;
-
-  // 1. Calculate Risk Score strictly from the raw score
   let riskScore = Math.round(raw * 100);
 
-  // 2. Initial Map for Risk Level and Score Tone (Base)
+  // 1. Standardize Final Verdict
+  let mappedVerdict = v;
+  if (!mappedVerdict || mappedVerdict === "UNKNOWN" || mappedVerdict === "PROCESSED") {
+    mappedVerdict = getVerdictFromScore(riskScore);
+  } else if (!VERDICT_CONFIG[mappedVerdict]) {
+    mappedVerdict = getVerdictFromScore(riskScore);
+  }
+
+  // 2. Standardize Risk Level & Score strictly by model score
+  const scoreVerdict = getVerdictFromScore(riskScore);
   let riskLevel = "Medium Risk";
-  let scoreTone = "amber";
-  if (riskScore <= 29) {
-    riskLevel = "Low Risk";
-    scoreTone = "green";
-  } else if (riskScore >= 70) {
-    riskLevel = "High Risk";
-    scoreTone = "red";
+  if (scoreVerdict === "FAKE") riskLevel = "High Risk";
+  else if (scoreVerdict === "REAL") riskLevel = "Low Risk";
+
+  if (mappedVerdict === "REAL") {
+    riskLevel = (riskScore < 30) ? "Low Risk" : "Legitimate"; 
   }
 
-  // 3. Determine Display Verdict
-  let displayVerdict = v;
-  if (!v || v === "UNKNOWN") {
-    if (riskScore <= 29) displayVerdict = "REAL";
-    else if (riskScore >= 70) displayVerdict = "FAKE";
-    else displayVerdict = "INCONCLUSIVE";
-  }
+  const verdictConfig = VERDICT_CONFIG[mappedVerdict] || VERDICT_CONFIG.INCONCLUSIVE;
+  const scoreConfig = VERDICT_CONFIG[scoreVerdict] || VERDICT_CONFIG.INCONCLUSIVE;
 
-  // 4. Resolve Verdict-Aware Labels (Avoid confusion for overrides)
-  if (displayVerdict === "REAL") {
-    riskLevel = (riskScore < 30) ? "Low Risk" : "Legitimate"; // Don't call it high risk if we result in REAL
-  }
-
-  // 5. Determine Verdict Tone (Dominant styling color)
-  let verdictTone = "amber";
-  if (displayVerdict === "REAL") verdictTone = "green";
-  else if (displayVerdict === "FAKE") verdictTone = "red";
-
-  // 6. Mute score tone if it contradicts the final verdict
-  if (displayVerdict === "REAL" && riskScore >= 50) {
-    scoreTone = "amber"; // Mute from red to amber to avoid false danger signals
-  } else if (displayVerdict === "FAKE" && riskScore < 50) {
-    scoreTone = "amber"; // Mute from green to amber
-  }
-
-  return { riskScore, displayVerdict, riskLevel, scoreTone, verdictTone };
+  return { 
+    riskScore, 
+    displayVerdictKey: mappedVerdict,
+    displayVerdict: verdictConfig.label, 
+    riskLevel, 
+    scoreColor: scoreConfig.color, 
+    scoreBg: scoreConfig.bg,
+    verdictColor: verdictConfig.color,
+    verdictBg: verdictConfig.bg
+  };
 }
 
-function getPolicyAction(displayVerdict) {
-  if (displayVerdict === "FAKE") {
-    return { text: "Warning recommended. Block or restrict sharing of this content.", tone: "red" };
+function getPolicyAction(displayVerdictKey) {
+  if (displayVerdictKey === "FAKE") {
+    return { text: "Warning recommended. Block or restrict sharing of this content.", color: VERDICT_CONFIG.FAKE.color, bg: VERDICT_CONFIG.FAKE.bg };
   }
-  if (displayVerdict === "REAL") {
-    return { text: "No immediate action required. The content was classified as authentic by the final decision logic.", tone: "green" };
+  if (displayVerdictKey === "REAL") {
+    return { text: "No immediate action required. The content was classified as authentic by the final decision logic.", color: VERDICT_CONFIG.REAL.color, bg: VERDICT_CONFIG.REAL.bg };
   }
-  return { text: "Review carefully before trusting or sharing. Mixed signals detected.", tone: "amber" };
+  return { text: "Review carefully before trusting or sharing. Mixed signals detected.", color: VERDICT_CONFIG.SUSPICIOUS.color, bg: VERDICT_CONFIG.SUSPICIOUS.bg };
 }
 
 function buildReasoning(item, metrics) {
@@ -80,9 +72,9 @@ function buildReasoning(item, metrics) {
   if (!summary) {
     if (isTalkingHeadOverride) {
       summary = `The raw model score was high, but the final result was classified as REAL because the analyzed video showed strong sequence stability, consistent face tracking, and passed the quality checks. The content matched a stable talking-head interview pattern, so the system applied an override to avoid a false fake classification.`;
-    } else if (displayVerdict === "REAL") {
+    } else if (metrics.displayVerdictKey === "REAL") {
       summary = `Analysis found no significant evidence of digital manipulation. The content appears authentic based on frame-by-frame AI inspection.`;
-    } else if (displayVerdict === "FAKE") {
+    } else if (metrics.displayVerdictKey === "FAKE") {
       summary = `The AI model detected strong indicators of digital manipulation across multiple frames. This content is likely synthetically generated or altered.`;
     } else {
       summary = `The analysis returned mixed or inconclusive signals. Evidence quality may have been too low for a definitive verdict.`;
@@ -91,11 +83,11 @@ function buildReasoning(item, metrics) {
 
   // 2. Score Interpretation
   let interpretation = "";
-  if (isOverride && displayVerdict === "REAL" && riskScore >= 70) {
+  if (isOverride && metrics.displayVerdictKey === "REAL" && riskScore >= 70) {
     interpretation = `The model produced a high suspicious score (about ${riskScore}%), which means some visual patterns looked unusual to the model. However, this score was reinterpreted using sequence stability and quality evidence before the final verdict was assigned.`;
-  } else if (displayVerdict === "FAKE") {
+  } else if (metrics.displayVerdictKey === "FAKE") {
     interpretation = `The model returned a suspiciously high score (${riskScore}%), confirming the presence of synthetic artifacts or deepfake manipulation patterns.`;
-  } else if (displayVerdict === "REAL") {
+  } else if (metrics.displayVerdictKey === "REAL") {
     interpretation = `The model returned a low risk score (${riskScore}%), indicating that the visual patterns align with natural, untampered media.`;
   } else {
     interpretation = `The model returned a baseline score of ${riskScore}%, which falls into the uncertain range.`;
@@ -111,8 +103,8 @@ function buildReasoning(item, metrics) {
   if (altfreezing.high_frame_count != null && altfreezing.high_frame_count > 0) signals.push(`${altfreezing.high_frame_count} frames flagged with elevated signals by the model`);
 
   if (signals.length === 0) {
-    if (displayVerdict === "REAL") signals.push("No repeated frame artifacts detected", "Facial consistency within expected natural range");
-    else if (displayVerdict === "FAKE") signals.push("High model confidence on multiple frames", "Anomalous facial patterns detected");
+    if (metrics.displayVerdictKey === "REAL") signals.push("No repeated frame artifacts detected", "Facial consistency within expected natural range");
+    else if (metrics.displayVerdictKey === "FAKE") signals.push("High model confidence on multiple frames", "Anomalous facial patterns detected");
     else signals.push("Mixed signals across frame analysis", "Insufficient evidence for definitive conclusion");
   }
 
@@ -123,7 +115,7 @@ function buildReasoning(item, metrics) {
   } else if (reasonCode) {
     logic = `The system applied the decision rule: ${reasonCode}.`;
   } else {
-    logic = `The verdict was derived directly from the model score falling into the ${displayVerdict} threshold range.`;
+    logic = `The verdict was derived directly from the model score falling into the ${metrics.displayVerdictKey} threshold range.`;
   }
 
   return { summary, interpretation, signals, logic };
@@ -131,24 +123,59 @@ function buildReasoning(item, metrics) {
 
 // ─── Components ─────────────────────────────────────────────────────────────
 
-function RiskRing({ riskScore, tone, scoreTone }) {
-  const colorMap = { green: "var(--success)", amber: "var(--warning)", red: "var(--danger)" };
-  // Visual ring uses the numeric score tone
-  const color = colorMap[scoreTone] || "var(--primary)";
-  const background = `conic-gradient(${color} 0 ${riskScore}%, var(--surface-2) ${riskScore}% 100%)`;
+function RiskRing({ riskScore, color }) {
+  const radius = 40;
+  const circumference = 2 * Math.PI * radius;
+  const offset = circumference - (riskScore / 100) * circumference;
+
   return (
-    <div className={styles.confidenceRing} style={{ background }}>
+    <div className={styles.confidenceRing}>
+      <svg className={styles.ringSvg} viewBox="0 0 100 100">
+        {/* Track */}
+        <circle 
+          cx="50" cy="50" r={radius} 
+          stroke="rgba(0,0,0,0.3)" 
+          strokeWidth="6" 
+          fill="transparent" 
+        />
+        {/* Progress */}
+        <circle 
+          cx="50" cy="50" r={radius} 
+          stroke={color} 
+          strokeWidth="6" 
+          fill="transparent" 
+          strokeDasharray={circumference}
+          strokeDashoffset={offset}
+          strokeLinecap="round"
+          transform="rotate(-90 50 50)"
+        />
+      </svg>
       <div className={styles.confidenceInner}>
         <span style={{ color }}>{riskScore}%</span>
-        <small>score</small>
+        <small>risk</small>
       </div>
     </div>
   );
 }
 
-function VerdictBadge({ verdict, tone }) {
-  const badgeMap = { red: layout.badgeRed, green: layout.badgeGreen, amber: layout.badgeAmber };
-  return <span className={`${layout.badge} ${badgeMap[tone] || layout.badgeAmber}`}>{verdict}</span>;
+function VerdictBadge({ verdict, color, bg }) {
+  return (
+    <span 
+      className={layout.badge} 
+      style={{ 
+        color, 
+        backgroundColor: bg, 
+        border: `1px solid ${color}44`,
+        textTransform: "uppercase",
+        letterSpacing: "0.04em",
+        fontWeight: 800,
+        padding: "6px 12px",
+        fontSize: "0.72rem"
+      }}
+    >
+      {verdict}
+    </span>
+  );
 }
 
 // ─── Main Component ──────────────────────────────────────────────────────────
@@ -157,6 +184,8 @@ export default function MediaAnalysis() {
   const [searchParams] = useSearchParams();
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState(null);
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 5;
   const [detections, setDetections] = useState([]);
   const [loading, setLoading] = useState(true);
 
@@ -198,6 +227,16 @@ export default function MediaAnalysis() {
       [item.title, item.platform, item.verdict, item.page_url].join(" ").toLowerCase().includes(value)
     );
   }, [query, detections]);
+
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [query]);
+
+  const totalPages = Math.ceil(filteredItems.length / itemsPerPage);
+  const paginatedItems = filteredItems.slice(
+    (currentPage - 1) * itemsPerPage,
+    currentPage * itemsPerPage
+  );
 
   const selected = useMemo(() => {
     return detections.find((item) => item.id === selectedId) || detections[0];
@@ -253,8 +292,8 @@ export default function MediaAnalysis() {
             </div>
 
             <div className={styles.listBody}>
-              {filteredItems.map((item) => {
-                const { riskScore, displayVerdict, riskLevel, scoreTone, verdictTone } = getDisplayMetrics(item.verdict, item.score);
+              {paginatedItems.map((item) => {
+                const metrics = getDisplayMetrics(item.verdict, item.score);
                 return (
                   <button
                     key={item.id}
@@ -263,25 +302,51 @@ export default function MediaAnalysis() {
                     className={item.id === (selected?.id) ? `${styles.mediaRow} ${styles.mediaRowActive}` : styles.mediaRow}
                   >
                     <div className={styles.thumb}>
-                      {item.meta?.media_type === "video" ? <VideoIcon className={styles.rowIcon} /> : <ImageIcon className={styles.rowIcon} />}
+                      <AuthImage 
+                        analysisId={item.id} 
+                        alt={item.title} 
+                        className={styles.listThumbImg}
+                        showLoader={false}
+                      />
                     </div>
                     <div className={styles.mediaMeta}>
                       <strong>{item.title}</strong>
                       <span>{item.platform || "Web"} · {new Date(item.created_at).toLocaleDateString()}</span>
-                      <span className={styles.riskLabel} data-tone={scoreTone}>{riskLevel} · {riskScore}%</span>
+                      <span className={styles.riskLabel} style={{ color: metrics.scoreColor }}>{metrics.riskLevel} · {metrics.riskScore}%</span>
                     </div>
-                    <VerdictBadge verdict={displayVerdict} tone={verdictTone} />
+                    <VerdictBadge verdict={metrics.displayVerdict} color={metrics.verdictColor} bg={metrics.verdictBg} />
                   </button>
                 );
               })}
             </div>
+
+            {totalPages > 1 && (
+              <div className={styles.pagination}>
+                <button 
+                  disabled={currentPage === 1}
+                  onClick={() => setCurrentPage(p => p - 1)}
+                  className={styles.pageBtn}
+                >
+                  Prev
+                </button>
+                <div className={styles.pageInfo}>
+                  Page <strong>{currentPage}</strong> of {totalPages}
+                </div>
+                <button 
+                  disabled={currentPage === totalPages}
+                  onClick={() => setCurrentPage(p => p + 1)}
+                  className={styles.pageBtn}
+                >
+                  Next
+                </button>
+              </div>
+            )}
           </article>
 
           {selected && (() => {
             const metrics = getDisplayMetrics(selected.verdict, selected.score);
-            const policy = getPolicyAction(metrics.displayVerdict);
+            const policy = getPolicyAction(metrics.displayVerdictKey);
             const reasoning = buildReasoning(selected, metrics);
-            const policyColorMap = { green: layout.badgeGreen, amber: layout.badgeAmber, red: layout.badgeRed };
 
             return (
               <section className={styles.detailColumn}>
@@ -293,29 +358,29 @@ export default function MediaAnalysis() {
                     </div>
                     <div className={styles.headerRight}>
                       <div className={styles.verdictBlock}>
-                        <VerdictBadge verdict={metrics.displayVerdict} tone={metrics.verdictTone} />
-                        <div className={styles.riskLevelBadge} data-tone={metrics.scoreTone}>{metrics.riskLevel}</div>
+                        <VerdictBadge verdict={metrics.displayVerdict} color={metrics.verdictColor} bg={metrics.verdictBg} />
+                        <div className={styles.riskLevelBadge} style={{ color: metrics.scoreColor, backgroundColor: metrics.scoreBg }}>{metrics.riskLevel}</div>
                       </div>
-                      <RiskRing riskScore={metrics.riskScore} tone={metrics.verdictTone} scoreTone={metrics.scoreTone} />
+                      <RiskRing riskScore={metrics.riskScore} color={metrics.scoreColor} />
                     </div>
                   </div>
 
                   <div className={styles.riskStrip}>
                     <div className={styles.riskStripItem}>
-                      <span>Model Score</span>
-                      <strong data-tone={metrics.scoreTone}>{metrics.riskScore}%</strong>
+                      <span>MANIPULATION RISK</span>
+                      <strong style={{ color: metrics.scoreColor }}>{metrics.riskScore}%</strong>
                     </div>
                     <div className={styles.riskStripItem}>
-                      <span>Risk Level</span>
-                      <strong data-tone={metrics.scoreTone}>{metrics.riskLevel}</strong>
+                      <span>RISK LEVEL</span>
+                      <strong style={{ color: metrics.scoreColor }}>{metrics.riskLevel}</strong>
                     </div>
                     <div className={styles.riskStripItem}>
-                      <span>Final Verdict</span>
-                      <strong data-tone={metrics.verdictTone}>{metrics.displayVerdict}</strong>
+                      <span>VERDICT</span>
+                      <strong style={{ color: metrics.verdictColor }}>{metrics.displayVerdict}</strong>
                     </div>
                     <div className={styles.riskStripItem}>
-                      <span>Platform</span>
-                      <strong>{selected.platform || "Web"}</strong>
+                      <span>PLATFORM</span>
+                      <strong style={{ color: "var(--text)" }}>{selected.platform || "unknown"}</strong>
                     </div>
                   </div>
 
@@ -353,9 +418,7 @@ export default function MediaAnalysis() {
                         <div className={layout.panelTitle}>Verdict Reasoning</div>
                         <div className={layout.panelSub}>Explanation of result</div>
                       </div>
-                      {metrics.verdictTone === "red" ?
-                        <AlertIcon className={`${styles.smallIcon} ${layout.toneRed}`} /> :
-                        <CheckIcon className={`${styles.smallIcon} ${metrics.verdictTone === "green" ? layout.toneGreen : layout.toneAmber}`} />}
+                      <AlertIcon className={styles.smallIcon} style={{ color: metrics.verdictColor }} />
                     </div>
                     
                     <div className={styles.signalsBlock} style={{marginTop: "0"}}>
@@ -380,8 +443,9 @@ export default function MediaAnalysis() {
                       <p className={styles.summaryText}>{reasoning.logic}</p>
                     </div>
 
-                    <div className={`${styles.policyBox} ${policyColorMap[policy.tone] || ""}`}>
-                      <strong>Recommended Policy: </strong>{policy.text}
+                    <div className={styles.policyBox} style={{ borderColor: policy.color, backgroundColor: policy.bg, color: policy.color, opacity: 0.9 }}>
+                      <strong style={{ color: policy.color }}>Recommended Policy: </strong>
+                      <span style={{ color: "var(--text)" }}>{policy.text}</span>
                     </div>
                   </article>
                 </div>
@@ -407,7 +471,7 @@ function MetaRow({ label, value }) {
   );
 }
 
-function AuthImage({ analysisId, alt }) {
+function AuthImage({ analysisId, alt, className, showLoader = true }) {
   const [src, setSrc] = useState(null);
   const [error, setError] = useState(false);
 
@@ -433,20 +497,18 @@ function AuthImage({ analysisId, alt }) {
       setError(false);
       loadImg();
     }
-    // Cleanup blob URL to prevent memory leaks when changing selected items
     return () => {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [analysisId]);
 
   if (error) return (
-    <>
+    <div className={styles.errorThumb}>
       <ImageIcon className={styles.previewIcon} />
-      <span>Preview not available for this analysis</span>
-    </>
+    </div>
   );
 
-  if (!src) return <span className={styles.loadingText}>Loading preview...</span>;
+  if (!src) return showLoader ? <span className={styles.loadingText}>Loading...</span> : <div className={styles.loaderThumb} />;
 
-  return <img src={src} alt={alt} className={styles.previewImg} />;
+  return <img src={src} alt={alt} className={className || styles.previewImg} />;
 }

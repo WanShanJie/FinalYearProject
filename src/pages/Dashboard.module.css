@@ -1,3 +1,10 @@
+/* ═══════════════════════════════════════════════════
+   Dashboard.module.css
+   All variables resolve from SystemLayout.module.css
+   (.shell / .shell[data-theme="light"])
+   ═══════════════════════════════════════════════════ */
+
+/* ── Layout rows ──────────────────────────────────── */
 .rowFull {
   width: 100%;
   margin-bottom: 24px;
@@ -15,6 +22,7 @@
   height: 100%;
 }
 
+/* ── KPI Cards ────────────────────────────────────── */
 .kpiCard {
   position: relative;
   overflow: hidden;
@@ -29,18 +37,22 @@
   gap: 12px;
 }
 
+/* Level 3: label */
 .kpiLabel {
   font-size: 0.84rem;
   color: var(--muted);
 }
 
+/* Level 1: value */
 .kpiValue {
   margin-top: 12px;
   font-size: 2rem;
   font-weight: 900;
   letter-spacing: -0.03em;
+  color: var(--text);
 }
 
+/* Level 2: sub */
 .kpiSub {
   margin-top: 6px;
   color: var(--muted);
@@ -57,21 +69,10 @@
   opacity: 0.42;
 }
 
-.tone_blue .kpiGlow {
-  background: rgba(59, 130, 246, 0.35);
-}
-
-.tone_red .kpiGlow {
-  background: rgba(239, 68, 68, 0.35);
-}
-
-.tone_amber .kpiGlow {
-  background: rgba(245, 158, 11, 0.28);
-}
-
-.tone_cyan .kpiGlow {
-  background: rgba(34, 211, 238, 0.28);
-}
+.tone_blue .kpiGlow  { background: rgba(59, 130, 246, 0.35); }
+.tone_red .kpiGlow   { background: rgba(239, 68, 68, 0.35); }
+.tone_amber .kpiGlow { background: rgba(245, 158, 11, 0.28); }
+.tone_cyan .kpiGlow  { background: rgba(34, 211, 238, 0.28); }
 
 .inlineIcon,
 .metricIcon,
@@ -80,6 +81,7 @@
   height: 18px;
 }
 
+/* ── Empty state ──────────────────────────────────── */
 .panelMessage {
   min-height: 180px;
   display: grid;
@@ -90,6 +92,7 @@
   background: var(--bg-elevated-2);
 }
 
+/* ── Live Capture Feed Grid ───────────────────────── */
 .feedGrid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -102,20 +105,21 @@
   overflow: hidden;
   border-radius: 22px;
   border: 1px solid var(--border);
-  background: linear-gradient(180deg, rgba(15, 23, 42, 0.72), rgba(15, 23, 42, 0.92));
+  background: var(--surface);
+  box-shadow: var(--shadow);
   transition: transform 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
 }
 
 .feedCard:hover {
   transform: translateY(-3px);
-  border-color: rgba(96, 165, 250, 0.55);
+  border-color: var(--border-strong);
   box-shadow: 0 18px 42px rgba(2, 8, 23, 0.28);
 }
 
 .feedPreviewFrame {
   aspect-ratio: 16 / 9;
-  background: linear-gradient(180deg, rgba(30, 41, 59, 0.92), rgba(15, 23, 42, 0.98));
-  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  background: var(--bg-elevated-2);
+  border-bottom: 1px solid var(--border);
   overflow: hidden;
 }
 
@@ -143,7 +147,7 @@
 .feedBody {
   padding: 16px 16px 18px;
   display: grid;
-  gap: 12px;
+  gap: 8px;
 }
 
 .feedTopRow {
@@ -153,6 +157,7 @@
   gap: 12px;
 }
 
+/* Level 3: platform label */
 .feedPlatform {
   font-size: 0.78rem;
   font-weight: 700;
@@ -161,9 +166,12 @@
   color: var(--muted);
 }
 
+/* Level 1: media title */
 .feedTitle {
-  font-size: 1rem;
+  font-size: 0.95rem;
+  font-weight: 600;
   line-height: 1.45;
+  color: var(--text);
   min-height: 2.9em;
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -176,19 +184,22 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  margin-top: 4px;
 }
 
+/* Level 3: timestamp */
 .feedTimestamp {
   font-size: 0.8rem;
   color: var(--muted);
 }
 
 .feedLink {
-  font-size: 0.86rem;
-  color: #93c5fd;
+  font-size: 0.82rem;
+  color: var(--primary);
   font-weight: 700;
 }
 
+/* ── Detection Trend Range Tabs ───────────────────── */
 .rangeTabs {
   display: inline-flex;
   align-items: center;
@@ -208,18 +219,24 @@
   font-size: 0.84rem;
   font-weight: 700;
   cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.rangeTab:hover {
+  color: var(--text);
+  background: var(--surface-2);
 }
 
 .rangeTabActive {
-  background: rgba(59, 130, 246, 0.16);
-  color: #dbeafe;
+  background: var(--primary-soft);
+  color: var(--text);
 }
 
 .legendAmber {
-  background: #f59e0b;
+  background: var(--warning);
 }
 
-/* Trend Summary */
+/* ── Trend Summary Cards ──────────────────────────── */
 .trendSummaryCards {
   display: flex;
   gap: 16px;
@@ -234,22 +251,24 @@
   padding: 16px 20px;
 }
 
+/* Level 3: summary label */
 .summaryLabel {
   font-size: 0.85rem;
   color: var(--muted);
   margin-bottom: 8px;
 }
 
+/* Level 1: summary values */
 .summaryValueBlue {
   font-size: 1.8rem;
   font-weight: 800;
-  color: #60a5fa;
+  color: var(--primary);
 }
 
 .summaryValueRed {
   font-size: 1.8rem;
   font-weight: 800;
-  color: #f87171;
+  color: var(--danger);
 }
 
 .chartContainer {
@@ -257,7 +276,7 @@
   padding-top: 10px;
 }
 
-/* Snapshot */
+/* ── Threat Snapshot ──────────────────────────────── */
 .snapshotContainer {
   display: flex;
   flex-direction: column;
@@ -266,16 +285,17 @@
 }
 
 .snapshotTotalCard {
-  background: linear-gradient(135deg, rgba(239, 68, 68, 0.08), rgba(15, 23, 42, 0.4));
+  background: linear-gradient(135deg, rgba(239, 68, 68, 0.08), transparent);
   border: 1px solid rgba(239, 68, 68, 0.2);
   border-radius: 16px;
   padding: 24px;
   text-align: center;
 }
 
+/* Level 3: snapshot section label */
 .snapshotLabel {
   display: block;
-  font-size: 0.95rem;
+  font-size: 0.85rem;
   font-weight: 600;
   color: var(--muted);
   margin-bottom: 8px;
@@ -283,11 +303,12 @@
   letter-spacing: 0.05em;
 }
 
+/* Level 1: total count */
 .snapshotTotalValue {
   display: block;
   font-size: 3.5rem;
   font-weight: 900;
-  color: #f87171;
+  color: var(--danger);
   line-height: 1;
 }
 
@@ -307,6 +328,7 @@
   border-radius: 14px;
 }
 
+/* Level 2: breakdown label */
 .breakdownLabel {
   display: flex;
   align-items: center;
@@ -315,11 +337,14 @@
   color: var(--muted);
 }
 
+/* Level 1: breakdown count (colour set inline) */
 .breakdownValue {
   font-size: 1.2rem;
   font-weight: 800;
+  color: var(--text);
 }
 
+/* ── Activity Timeline ────────────────────────────── */
 .timelineList {
   display: grid;
   gap: 10px;
@@ -331,6 +356,7 @@
   padding: 0;
   text-align: left;
   cursor: pointer;
+  width: 100%;
 }
 
 .timelinePreviewClip {
@@ -338,7 +364,7 @@
   height: 45px;
   border-radius: 6px;
   overflow: hidden;
-  background: var(--bg-elevated);
+  background: var(--bg-elevated-2);
 }
 
 .timelineRow {
@@ -351,55 +377,43 @@
   background: var(--bg-elevated-2);
   border: 1px solid var(--border);
   transition: transform 0.18s ease, border-color 0.18s ease;
+  color: var(--text);
 }
 
 .timelineRowButton:hover .timelineRow {
-  border-color: rgba(96, 165, 250, 0.55);
+  border-color: var(--border-strong);
   transform: translateY(-1px);
 }
 
-.timelineTime {
-  color: var(--muted);
-  font-size: 0.84rem;
-}
-
+/* Level 1: timeline entry text */
 .timelineText {
   line-height: 1.5;
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--text);
 }
 
+/* Level 3: timestamp */
+.timelineTime {
+  color: var(--muted);
+  font-size: 0.82rem;
+  margin-top: 3px;
+}
+
+/* ── Responsive ───────────────────────────────────── */
 @media (max-width: 1280px) {
-  .feedGrid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  
-  .rowSplit {
-    grid-template-columns: 1fr;
-  }
+  .feedGrid    { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rowSplit    { grid-template-columns: 1fr; }
 }
 
 @media (max-width: 900px) {
-  .timelineRow {
-    grid-template-columns: 1fr;
-  }
-
-  .rangeTabs {
-    width: 100%;
-    justify-content: space-between;
-  }
+  .timelineRow { grid-template-columns: 1fr; }
+  .rangeTabs   { width: 100%; justify-content: space-between; }
 }
 
 @media (max-width: 720px) {
-  .feedGrid {
-    grid-template-columns: 1fr;
-  }
-
+  .feedGrid { grid-template-columns: 1fr; }
   .feedFooter,
-  .feedTopRow {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-
-  .trendSummaryCards {
-    flex-direction: column;
-  }
+  .feedTopRow { flex-direction: column; align-items: flex-start; }
+  .trendSummaryCards { flex-direction: column; }
 }

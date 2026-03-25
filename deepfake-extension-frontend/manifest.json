@@ -38,6 +38,7 @@
         "https://youtu.be/*"
       ],
       "js": [
+        "shared/verdictColors.js",
         "idb.js",
         "content.js"
       ],

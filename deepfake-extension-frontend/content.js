@@ -158,7 +158,7 @@ function buildOverlay(entry, { compact = false, borderRadius = "8px" } = {}) {
     "border-radius: " + borderRadius + " !important",
     "pointer-events: auto !important",
     "cursor: not-allowed !important",
-    "box-shadow: inset 0 0 0 " + (compact ? "2px" : "3px") + " #ef4444 !important",
+    "box-shadow: inset 0 0 0 " + (compact ? "2px" : "3px") + " " + window.VERDICT_CONFIG.FAKE.color + " !important",
     "overflow: hidden !important",
     "text-align: center !important",
     "padding: " + (compact ? "12px" : "32px") + " !important",
@@ -182,7 +182,7 @@ function buildOverlay(entry, { compact = false, borderRadius = "8px" } = {}) {
 
   const heading = document.createElement("div");
   heading.textContent = compact ? "Blocked" : "Blocked: Suspected Deepfake";
-  heading.style.cssText = `color: #ef4444 !important; font-weight: 800 !important; font-size: ${compact ? "1rem" : "1.4rem"} !important; letter-spacing: 0.02em !important; font-family: system-ui, sans-serif !important; pointer-events:none !important; text-transform: uppercase !important;`;
+  heading.style.cssText = `color: ${window.VERDICT_CONFIG.FAKE.color} !important; font-weight: 800 !important; font-size: ${compact ? "1rem" : "1.4rem"} !important; letter-spacing: 0.02em !important; font-family: system-ui, sans-serif !important; pointer-events:none !important; text-transform: uppercase !important;`;
   overlay.appendChild(heading);
 
   if (compact) {

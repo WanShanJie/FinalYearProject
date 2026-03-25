@@ -1,9 +1,16 @@
+/* ═══════════════════════════════════════════════════
+   MediaAnalysis.module.css
+   All variables resolve from SystemLayout.module.css
+   (.shell / .shell[data-theme="light"])
+   ═══════════════════════════════════════════════════ */
+
 .analysisGrid {
   display: grid;
   grid-template-columns: 390px 1fr;
   gap: 16px;
 }
 
+/* ── Shared card base ─────────────────────────────── */
 .listPanel,
 .detailTopCard,
 .metadataCard,
@@ -21,6 +28,7 @@
   min-height: calc(100vh - 190px);
 }
 
+/* ── List Panel header ────────────────────────────── */
 .listHeader {
   padding: 18px;
   border-bottom: 1px solid var(--border);
@@ -50,14 +58,22 @@
   background: transparent;
   border: 0;
   outline: 0;
+  /* explicit text hierarchy: input uses primary text */
   color: var(--text);
 }
 
+.searchInput::placeholder {
+  color: var(--muted);
+}
+
+/* ── Detection list body ──────────────────────────── */
 .listBody {
   display: grid;
   gap: 10px;
   padding: 16px;
   overflow: auto;
+  flex: 1;
+  align-content: flex-start;
 }
 
 .mediaRow {
@@ -70,9 +86,16 @@
   border-radius: 18px;
   border: 1px solid var(--border);
   background: var(--bg-elevated-2);
+  /* primary text so the item title is always readable */
   color: var(--text);
   cursor: pointer;
   text-align: left;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.mediaRow:hover {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
 }
 
 .mediaRowActive {
@@ -83,45 +106,80 @@
 .thumb {
   width: 52px;
   height: 52px;
-  border-radius: 16px;
-  display: grid;
-  place-items: center;
-  background: var(--surface-2);
+  border-radius: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-elevated-2);
+  color: var(--muted);
+  overflow: hidden;
+  border: 1px solid var(--border);
 }
 
+.listThumbImg {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.loaderThumb {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--surface-2), transparent);
+  background-size: 200% 100%;
+  animation: skeleton 1.5s infinite linear;
+}
+
+.errorThumb {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  height: 100%;
+  background: var(--surface);
+  opacity: 0.6;
+}
+
+@keyframes skeleton {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
+}
+
+/* Three-level text hierarchy inside list items */
 .mediaMeta {
   display: grid;
   gap: 4px;
 }
 
+/* Level 1: title */
 .mediaMeta strong {
   font-size: 0.94rem;
+  font-weight: 600;
   line-height: 1.4;
+  color: var(--text);
 }
 
+/* Level 2: platform / date */
 .mediaMeta span {
   font-size: 0.8rem;
   color: var(--muted);
 }
 
+/* Level 3: risk label (coloured inline by JS) */
 .riskLabel {
   font-size: 0.76rem;
-  color: var(--muted);
   font-weight: 600;
   margin-top: 2px;
+  color: var(--muted);
 }
 
-.riskLabel[data-tone="green"] { color: var(--success); }
-.riskLabel[data-tone="amber"] { color: var(--warning); }
-.riskLabel[data-tone="red"] { color: var(--danger); }
-
+/* ── Detail Column ────────────────────────────────── */
 .detailColumn {
   display: grid;
   gap: 16px;
 }
 
 .detailTopCard {
-  padding: 18px;
+  padding: 20px 22px;
 }
 
 .detailHeader {
@@ -130,15 +188,21 @@
   gap: 16px;
 }
 
+/* Level 1: media title */
 .detailTitle {
   font-size: 1.18rem;
   font-weight: 800;
+  color: var(--text);
+  line-height: 1.35;
 }
 
+/* Level 2: URL / platform */
 .detailSub {
   margin-top: 6px;
+  font-size: 0.85rem;
   color: var(--muted);
   word-break: break-all;
+  line-height: 1.5;
 }
 
 .headerRight {
@@ -152,52 +216,61 @@
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 8px;
+  gap: 6px;
 }
 
 .riskLevelBadge {
-  font-size: 0.78rem;
-  font-weight: 700;
-  padding: 4px 10px;
+  font-size: 0.72rem;
+  font-weight: 800;
+  padding: 6px 12px;
   border-radius: 999px;
-  border: 1px solid var(--border);
-  background: var(--surface-2);
-  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid transparent;
 }
 
-.riskLevelBadge[data-tone="green"] { background: var(--success-soft); color: var(--success); border-color: transparent; }
-.riskLevelBadge[data-tone="amber"] { background: var(--warning-soft); color: var(--warning); border-color: transparent; }
-.riskLevelBadge[data-tone="red"] { background: var(--danger-soft); color: var(--danger); border-color: transparent; }
-
 .confidenceRing {
-  width: 96px;
-  height: 96px;
-  border-radius: 999px;
-  padding: 10px;
-  background: conic-gradient(var(--primary) 0 78%, var(--surface-2) 78% 100%);
+  width: 104px;
+  height: 104px;
+  position: relative;
+  display: grid;
+  place-items: center;
+}
+
+.ringSvg {
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  top: 0;
+  left: 0;
 }
 
 .confidenceInner {
-  width: 100%;
-  height: 100%;
-  border-radius: 999px;
-  display: grid;
-  place-items: center;
-  text-align: center;
-  background: var(--bg-elevated);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
 }
 
 .confidenceInner span {
-  font-size: 1.1rem;
+  font-size: 1.5rem;
   font-weight: 800;
+  line-height: 1;
 }
 
 .confidenceInner small {
   display: block;
-  margin-top: 2px;
+  margin-top: 4px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: lowercase;
   color: var(--muted);
 }
 
+/* ── Risk Strip (4-col bar) ───────────────────────── */
 .riskStrip {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -217,6 +290,7 @@
   background: var(--bg-elevated-2);
 }
 
+/* Level 3: strip label */
 .riskStripItem span {
   font-size: 0.74rem;
   color: var(--muted);
@@ -224,15 +298,13 @@
   letter-spacing: 0.04em;
 }
 
+/* Level 1: strip value (colour set inline) */
 .riskStripItem strong {
   font-size: 0.96rem;
   font-weight: 800;
 }
 
-.riskStripItem strong[data-tone="green"] { color: var(--success); }
-.riskStripItem strong[data-tone="amber"] { color: var(--warning); }
-.riskStripItem strong[data-tone="red"] { color: var(--danger); }
-
+/* ── Preview Area ─────────────────────────────────── */
 .previewArea {
   display: grid;
   grid-template-columns: 1fr 180px;
@@ -245,7 +317,7 @@
   border-radius: 22px;
   border: 1px dashed var(--border);
   background:
-    linear-gradient(180deg, rgba(59,130,246,0.06), transparent 45%),
+    linear-gradient(180deg, rgba(59, 130, 246, 0.06), transparent 45%),
     var(--bg-elevated-2);
   display: grid;
   place-items: center;
@@ -260,7 +332,7 @@
   max-height: 400px;
   object-fit: contain;
   border-radius: 20px;
-  background: black;
+  background: #000;
 }
 
 .loadingText {
@@ -280,7 +352,7 @@
 
 .primaryAction,
 .secondaryAction {
-  min-height: 48px;
+  min-height: 40px;
   border-radius: 16px;
   border: 1px solid var(--border);
   cursor: pointer;
@@ -289,7 +361,7 @@
 
 .primaryAction {
   background: var(--primary);
-  color: white;
+  color: #fff;
 }
 
 .secondaryAction {
@@ -297,6 +369,7 @@
   color: var(--text);
 }
 
+/* ── Info Grid (metadata + explanation) ───────────── */
 .infoGrid {
   display: grid;
   grid-template-columns: 1fr 1.2fr;
@@ -324,15 +397,24 @@
   border: 1px solid var(--border);
 }
 
+/* Level 2: label side */
 .metaRow span {
+  font-size: 0.88rem;
   color: var(--muted);
 }
 
+/* Level 1: value side */
 .metaRow strong {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
   text-align: right;
 }
 
+/* ── Explanation Card ─────────────────────────────── */
+/* Level 1: body text */
 .summaryText {
+  font-size: 0.9rem;
   line-height: 1.75;
   color: var(--text);
 }
@@ -345,6 +427,7 @@
   border: 1px solid var(--border);
 }
 
+/* Level 3: sub-heading */
 .signalsLabel {
   font-size: 0.76rem;
   font-weight: 700;
@@ -359,15 +442,16 @@
   gap: 6px;
   margin: 0;
   padding-left: 18px;
-  color: var(--text);
 }
 
+/* Level 2: signal points */
 .reasonList li {
   font-size: 0.88rem;
   line-height: 1.6;
   color: var(--muted);
 }
 
+/* ── Policy Box ───────────────────────────────────── */
 .policyBox {
   margin-top: 16px;
   padding: 14px 16px;
@@ -375,8 +459,10 @@
   border: 1px solid var(--border-strong);
   background: var(--primary-soft);
   font-weight: 600;
+  font-size: 0.9rem;
 }
 
+/* ── Evidence Section ─────────────────────────────── */
 .evidenceGrid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -395,7 +481,7 @@
   display: grid;
   place-items: center;
   background:
-    linear-gradient(135deg, rgba(59,130,246,0.09), rgba(34,211,238,0.08)),
+    linear-gradient(135deg, rgba(59, 130, 246, 0.09), rgba(34, 211, 238, 0.08)),
     var(--surface);
   color: var(--muted);
 }
@@ -411,6 +497,7 @@
   align-items: center;
 }
 
+/* Level 2-3: frame description */
 .frameBody p {
   margin-top: 12px;
   color: var(--muted);
@@ -418,15 +505,72 @@
   font-size: 0.88rem;
 }
 
+.pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-elevated);
+  border-bottom-left-radius: 24px;
+  border-bottom-right-radius: 24px;
+}
+
+.pageBtn {
+  padding: 8px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated-2);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.pageBtn:hover:not(:disabled) {
+  background: var(--surface-2);
+  border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+
+.pageBtn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.pageInfo {
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.pageInfo strong {
+  color: var(--text);
+}
+
+/* ── Responsive Breakpoints ───────────────────────── */
 @media (max-width: 1200px) {
+
   .analysisGrid,
   .infoGrid,
-  .previewArea { grid-template-columns: 1fr; }
+  .previewArea {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 760px) {
+
   .detailHeader,
-  .headerRight { flex-direction: column; align-items: flex-start; }
-  .evidenceGrid { grid-template-columns: 1fr; }
-  .mediaRow { grid-template-columns: 52px 1fr; }
+  .headerRight {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .evidenceGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .mediaRow {
+    grid-template-columns: 52px 1fr;
+  }
 }

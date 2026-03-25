@@ -12,17 +12,28 @@
 /* ---------- Base ---------- */
 :root {
   --bg: #ffffff;
-  --text: #0f172a;            /* slate-900 */
-  --muted: #64748b;           /* slate-500 */
-  --muted-2: #94a3b8;         /* slate-400 */
-  --border: #e2e8f0;          /* slate-200 */
+  --text: #0f172a;
+  /* slate-900 */
+  --muted: #64748b;
+  /* slate-500 */
+  --muted-2: #94a3b8;
+  /* slate-400 */
+  --border: #e2e8f0;
+  /* slate-200 */
   --primary: #2D56FF;
   --navy: #0B1B55;
-  --shadow: 0 20px 25px -5px rgba(0,0,0,0.12), 0 10px 10px -5px rgba(0,0,0,0.08);
+  --shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.12), 0 10px 10px -5px rgba(0, 0, 0, 0.08);
 }
 
-* { box-sizing: border-box; }
-html, body { height: 100%; }
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
 body {
   margin: 0;
   font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
@@ -45,7 +56,9 @@ body {
 }
 
 @media (min-width: 1024px) {
-  .authGrid { grid-template-columns: 1fr 1fr; }
+  .authGrid {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 .leftPanel {
@@ -77,7 +90,11 @@ body {
   gap: 8px;
 }
 
-.backLink:hover { color: #334155; } /* slate-700 */
+.backLink:hover {
+  color: #334155;
+}
+
+/* slate-700 */
 
 /* ---------- Titles ---------- */
 .authTitle {
@@ -102,7 +119,9 @@ body {
 }
 
 @media (min-width: 1024px) {
-  .rightPanel { display: block; }
+  .rightPanel {
+    display: block;
+  }
 }
 
 .gridOverlay {
@@ -110,8 +129,8 @@ body {
   inset: 0;
   opacity: 0.20;
   background-image:
-    linear-gradient(to right, rgba(255,255,255,0.10) 1px, transparent 1px),
-    linear-gradient(to bottom, rgba(255,255,255,0.10) 1px, transparent 1px);
+    linear-gradient(to right, rgba(255, 255, 255, 0.10) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.10) 1px, transparent 1px);
   background-size: 40px 40px;
 }
 
@@ -130,7 +149,7 @@ body {
 
 .square {
   border-radius: 3px;
-  background: rgba(255,255,255,0.10);
+  background: rgba(255, 255, 255, 0.10);
 }
 
 .centerBadgeWrap {
@@ -157,13 +176,13 @@ body {
   margin: 0;
   font-size: 14px;
   font-weight: 600;
-  color: rgba(255,255,255,0.90);
+  color: rgba(255, 255, 255, 0.90);
 }
 
 .rightTextBottom {
   margin: 4px 0 0;
   font-size: 14px;
-  color: rgba(255,255,255,0.70);
+  color: rgba(255, 255, 255, 0.70);
 }
 
 .fab {
@@ -177,13 +196,17 @@ body {
   background: var(--primary);
   color: #fff;
   cursor: pointer;
-  box-shadow: 0 12px 20px rgba(0,0,0,0.25);
+  box-shadow: 0 12px 20px rgba(0, 0, 0, 0.25);
 }
 
-.fab:hover { filter: brightness(1.05); }
+.fab:hover {
+  filter: brightness(1.05);
+}
 
 /* ---------- Form blocks ---------- */
-.formSpace { margin-top: 24px; }
+.formSpace {
+  margin-top: 24px;
+}
 
 .socialGrid {
   display: grid;
@@ -198,7 +221,8 @@ body {
   border-radius: 6px;
   font-size: 13px;
   font-weight: 600;
-  color: #334155; /* slate-700 */
+  color: #334155;
+  /* slate-700 */
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -206,7 +230,11 @@ body {
   cursor: pointer;
 }
 
-.socialBtn:hover { background: #f8fafc; } /* slate-50 */
+.socialBtn:hover {
+  background: #f8fafc;
+}
+
+/* slate-50 */
 
 .divider {
   margin: 24px 0;
@@ -286,7 +314,9 @@ body {
   cursor: pointer;
 }
 
-.eyeBtn:hover { color: var(--muted); }
+.eyeBtn:hover {
+  color: var(--muted);
+}
 
 /* ---------- Rows ---------- */
 .rowBetween {
@@ -316,7 +346,9 @@ body {
   text-decoration: none;
 }
 
-.link:hover { text-decoration: underline; }
+.link:hover {
+  text-decoration: underline;
+}
 
 /* ---------- Buttons ---------- */
 .primaryBtn {
@@ -333,7 +365,9 @@ body {
   box-shadow: 0 6px 12px rgba(45, 86, 255, 0.18);
 }
 
-.primaryBtn:hover { filter: brightness(1.05); }
+.primaryBtn:hover {
+  filter: brightness(1.05);
+}
 
 /* ---------- Small text ---------- */
 .bottomText {
@@ -363,4 +397,3 @@ body {
   margin-top: 2px;
   accent-color: var(--primary);
 }
-

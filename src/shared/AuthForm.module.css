@@ -140,7 +140,7 @@
   font-size: 13px;
   font-weight: 700;
   cursor: pointer;
-  box-shadow: var(--shadow-btn);
+  box-shadow: var(--shadow);
 }
 
 .primaryBtn:hover { filter: brightness(1.05); }

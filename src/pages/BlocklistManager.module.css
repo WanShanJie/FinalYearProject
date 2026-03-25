@@ -44,7 +44,7 @@
   flex-shrink: 0;
 }
 
-.switchActive.switch_blue { background: var(--primary-soft); border-color: var(--border-strong); }
+.switchActive.switch_blue { background: var(--primary-soft); border-color: var(--border); }
 .switchActive.switch_cyan { background: var(--cyan-soft); border-color: rgba(34, 211, 238, 0.25); }
 .switchActive.switch_amber { background: var(--warning-soft); border-color: rgba(245, 158, 11, 0.24); }
 
@@ -129,7 +129,7 @@
   place-items: center;
   flex-shrink: 0;
   background: var(--primary-soft);
-  border: 1px solid var(--border-strong);
+  border: 1px solid var(--border);
   color: var(--primary);
   font-weight: 800;
 }

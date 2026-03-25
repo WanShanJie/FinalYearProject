@@ -5,45 +5,36 @@ import { AlertIcon, EyeIcon, ImageIcon, SearchIcon, ShieldIcon } from "../compon
 import { useNavigate } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
+import { VERDICT_CONFIG } from "../constants/verdictColors";
+import { getVerdictFromScore } from "../utils/riskMapping";
+
 function getDashboardMetrics(verdict, score) {
   const v = (verdict || "").toUpperCase();
   const raw = score ?? 0;
   let riskScore = Math.round(raw * 100);
 
-  let displayLabel = "Processed";
-  let tone = "blue";
-  let isThreat = false;
-
-  if (v === "FAKE") {
-    displayLabel = "Fake";
-    tone = "red";
-    isThreat = true;
-    riskScore = Math.max(riskScore, 70);
-  } else if (v === "REAL") {
-    displayLabel = "Real";
-    tone = "green";
-    isThreat = false;
-    riskScore = Math.min(riskScore, 29);
-  } else if (v === "INCONCLUSIVE") {
-    displayLabel = "Inconclusive";
-    tone = "blue";
-  } else if (v === "SUSPICIOUS" || (riskScore >= 30 && riskScore <= 69)) {
-    displayLabel = "Suspicious";
-    tone = "amber";
-    isThreat = true;
-    if (v === "SUSPICIOUS") riskScore = Math.max(riskScore, 50);
+  // Derive normalized verdict if not explicitly provided or map risk -> verdict
+  let normalizedVerdict = v;
+  if (!normalizedVerdict || normalizedVerdict === "UNKNOWN" || normalizedVerdict === "PROCESSED") {
+    normalizedVerdict = getVerdictFromScore(riskScore);
+  } else {
+    // If backend provides SUSPICIOUS/etc, ensure case matches config keys
+    if (VERDICT_CONFIG[normalizedVerdict] === undefined) {
+      normalizedVerdict = getVerdictFromScore(riskScore);
+    }
   }
 
-  return { riskScore, displayLabel, tone, isThreat };
-}
+  const config = VERDICT_CONFIG[normalizedVerdict] || VERDICT_CONFIG.INCONCLUSIVE;
+  const isThreat = normalizedVerdict === "FAKE" || normalizedVerdict === "SUSPICIOUS";
 
-const toneMap = {
-  blue: layout.badgeBlue,
-  red: layout.badgeRed,
-  amber: layout.badgeAmber,
-  cyan: layout.badgeCyan,
-  green: layout.badgeGreen
-};
+  return { 
+    riskScore, 
+    displayLabel: config.label, 
+    color: config.color, 
+    bg: config.bg, 
+    isThreat 
+  };
+}
 
 const trendRanges = {
   "24h": { key: "24h", label: "24 Hours", totalHours: 24, bucketCount: 12, bucketHours: 2 },
@@ -281,7 +272,7 @@ export default function Dashboard() {
               <div className={styles.panelMessage}>No recent activity found.</div>
             ) : (
               recentActivity.map((item) => {
-                const { displayLabel, tone } = getDashboardMetrics(item.verdict, item.score);
+                const { displayLabel, color, bg } = getDashboardMetrics(item.verdict, item.score);
                 return (
                   <button
                     key={item.id}
@@ -296,7 +287,7 @@ export default function Dashboard() {
                     <div className={styles.feedBody}>
                       <div className={styles.feedTopRow}>
                         <span className={styles.feedPlatform}>{item.platform || "Web"}</span>
-                        <span className={`${layout.badge} ${toneMap[tone]}`}>{displayLabel}</span>
+                        <span className={layout.badge} style={{ color, backgroundColor: bg }}>{displayLabel}</span>
                       </div>
                       <strong className={styles.feedTitle}>{item.title || "Untitled media"}</strong>
                       <div className={styles.feedFooter}>
@@ -423,7 +414,7 @@ export default function Dashboard() {
               <div className={styles.panelMessage}>No activity found.</div>
             ) : (
               activity.slice(0, 5).map((item) => {
-                const { displayLabel, tone } = getDashboardMetrics(item.verdict, item.score);
+                const { displayLabel, color, bg } = getDashboardMetrics(item.verdict, item.score);
                 return (
                   <button
                     key={item.id}
@@ -439,7 +430,7 @@ export default function Dashboard() {
                         <strong>{item.title || "Untitled media"}</strong>
                         <div className={styles.timelineTime}>{formatTimelineTime(item.created_at)}</div>
                       </div>
-                      <span className={`${layout.badge} ${toneMap[tone]}`}>{displayLabel}</span>
+                      <span className={layout.badge} style={{ color, backgroundColor: bg }}>{displayLabel}</span>
                     </div>
                   </button>
                 );
