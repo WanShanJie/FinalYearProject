@@ -270,9 +270,11 @@ async function handleCaptureSuccess(out, meta) {
   try {
     await chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" });
   } catch { }
-  // Keep local blocklist in sync after every successful high-risk scan
+   // Keep local blocklist in sync after every successful high-risk scan
   if (["FAKE", "SUSPICIOUS"].includes(String(out?.verdict || "").toUpperCase())) {
-    syncBlocklist().catch(() => { });
+    setTimeout(() => {
+      syncBlocklist().catch(() => { });
+    }, 3000);
   }
 }
 
@@ -317,9 +319,7 @@ async function syncBlocklist() {
     }
 
     // Notify open content scripts to re-check their pages
-    const tabs = await chrome.tabs.query({
-      url: ["*://*.youtube.com/*", "*://*.tiktok.com/*", "*://*.facebook.com/*"],
-    });
+    const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       chrome.tabs.sendMessage(tab.id, { type: "BLOCKLIST_UPDATED" }).catch(() => { });
     }

@@ -6,6 +6,7 @@ let monitoringEnabled = false;
 let observerStarted = false;
 let currentUrl = location.href;
 window._blockedEntry = null;
+window.__captureInProgress = false;
 
 // NEW FUNCTION: Safe Messaging Wrapper
 let _extensionContextDead = false;
@@ -42,7 +43,7 @@ async function loadMonitoringFlag() {
   monitoringEnabled = st.monitoringEnabled === true;
   console.log(`[BlocklistGuard] Monitoring enabled: ${monitoringEnabled}`);
   // Run video_id check immediately on load, regardless of monitoring state
-  (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
+  (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })();
 }
 
 function startObserver() {
@@ -98,6 +99,10 @@ function unblockAllMedia() {
  * Uses YouTube's internal API if available, plus HTML5 video aggressive pausing.
  */
 function enforceVideoPause(video) {
+  if (window.__captureInProgress) {
+    console.log("[Capture] enforceVideoPause suppressed - active capture in progress");
+    return;
+  }
   if (video._deepfakeBlocked) return;
   video._deepfakeBlocked = true;
 
@@ -232,6 +237,10 @@ function buildOverlay(entry, { compact = false, borderRadius = "8px" } = {}) {
  * Block the main YouTube watch-page video player.
  */
 function blockWatchPageVideo(video, entry) {
+  if (window.__captureInProgress) {
+    console.log("[Capture] blockWatchPageVideo suppressed - active capture in progress");
+    return;
+  }
   enforceVideoPause(video);
 
   const playerContainer =
@@ -266,6 +275,10 @@ function blockWatchPageVideo(video, entry) {
  * Generic blockElement for thumbnails/cards.
  */
 function blockElement(el, entry) {
+  if (window.__captureInProgress) {
+    console.log("[Capture] blockElement suppressed - active capture in progress");
+    return;
+  }
   const elKey = el.dataset.deepfakeBlocked;
   if (elKey === "1") return;
   el.dataset.deepfakeBlocked = "1";
@@ -510,18 +523,24 @@ async function processMedia(el) {
       await bumpCounter("blocked", 1);
     }
 
-    Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
+    Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => { });
   } catch (err) {
     // canvas/CORS issues; skip silently
     console.debug("[BlocklistGuard] processMedia skip:", err?.message);
   }
 }
 
+const _fingerprintCache = new Map();
 async function getBlocklistEntry(hash) {
+  if (_fingerprintCache.has(hash)) return _fingerprintCache.get(hash);
   try {
     const res = await safeSendMessage({ type: "CHECK_FINGERPRINT_BLOCKLIST", hash });
-    if (!res?.ok || !res?.entry) return null;
+    if (!res?.ok || !res?.entry) {
+      _fingerprintCache.set(hash, null);
+      return null;
+    }
     const { entry } = res;
+    _fingerprintCache.set(hash, entry);
     console.log(`[BlocklistGuard] ✅ SW match for hash: ${hash} → ${entry.title || entry.video_id || "??"}`);
     return entry;
   } catch (err) {
@@ -634,19 +653,34 @@ const CACHE_TTL_MS = 5 * 60 * 1000;
 // _videoIdBlocked: Map<videoId, blocklist entry>  — confirmed BLOCKED
 // _videoIdClean:   Set<videoId>                   — confirmed CLEAN
 const _videoIdBlocked = new Map();
-const _videoIdClean   = new Set();
+const _videoIdClean = new Set();
+const blockCache = new Map();
 
 /** Clear videoId caches on navigation so a new page gets a fresh check. */
 function clearVideoIdCache() {
   _videoIdBlocked.clear();
   _videoIdClean.clear();
+  blockCache.clear();
+}
+
+/**
+ * NEW: In-memory cache for blocklist lookups via SW.
+ */
+async function checkBlocklist(videoId) {
+  if (blockCache.has(videoId)) return blockCache.get(videoId);
+
+  const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+  const entry = (res?.ok && res?.entry) ? res.entry : null;
+
+  blockCache.set(videoId, entry);
+  return entry;
 }
 
 // ── NEW: Scheduler / debounce for scanning ───────────────────────────────────
 // Instead of calling scanYouTubeCards() synchronously inside every mutation,
 // we batch pending roots and flush at most once every SCAN_DEBOUNCE_MS.
 const SCAN_DEBOUNCE_MS = 200;
-let   _scanScheduled   = false;
+let _scanScheduled = false;
 /** Pending root elements queued by the MutationObserver (null = full doc). */
 const _pendingScanRoots = new Set();
 
@@ -670,7 +704,7 @@ function scheduleScan(root) {
     const roots = Array.from(_pendingScanRoots);
     _pendingScanRoots.clear();
     for (const r of roots) {
-      try { scanYouTubeCards(r == null ? document : r); } catch (_) {}
+      try { scanYouTubeCards(r == null ? document : r); } catch (_) { }
     }
   }, SCAN_DEBOUNCE_MS);
 }
@@ -744,12 +778,11 @@ async function checkThumbnailPHashLayer(card, thumbHost, videoId) {
       console.log(`[BlocklistGuard][LayerB] 🚫 MATCH! card video_id "${videoId}" ~ blocked "${entry.video_id}" (Hamming ${dist}/64). Blocking.`);
       const syntheticEntry = {
         ...entry,
-        // Tag as variant so the overlay can say "visual variant"
         _variantOf: entry.video_id,
         title: entry.title ? `[Variant] ${entry.title}` : "Suspected Deepfake Variant",
       };
       bumpCounter("blocked", 1).catch(() => { });
-      Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
+      Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => { });
       blockYouTubeThumbnailCard(card, thumbHost, syntheticEntry);
       return true;
     }
@@ -760,6 +793,10 @@ async function checkThumbnailPHashLayer(card, thumbHost, videoId) {
 }
 
 async function checkVideoIdOnPage() {
+  if (window.__captureInProgress) {
+    console.log("[Blocklist] Skip page-level block during active capture");
+    return;
+  }
   // URL-based early block — runs before media loads.
   try {
     const url = location.href;
@@ -775,11 +812,10 @@ async function checkVideoIdOnPage() {
     }
 
     console.log(`[BlocklistGuard] Asking SW to check video_id: ${videoId}`);
-    const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+    const entry = await checkBlocklist(videoId);
 
-    if (res?.ok && res?.entry) {
-      const { entry } = res;
-      console.log(`[BlocklistGuard] 🚫 video_id "${videoId}" is BLOCKED by SW. Title: "${entry.title || '?'}". Applying overlay.`);
+    if (entry) {
+      console.log(`[BlocklistGuard] 🚫 video_id "${videoId}" is BLOCKED. Title: "${entry.title || '?'}". Applying overlay.`);
       window._blockedEntry = entry;
       document.querySelectorAll("video").forEach(v => {
         blockElement(v, entry);
@@ -787,11 +823,11 @@ async function checkVideoIdOnPage() {
       await bumpCounter("blocked", 1);
       Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
     } else {
-      console.log(`[BlocklistGuard] SW says video_id "${videoId}" is CLEAN.`);
+      console.log(`[BlocklistGuard] video_id "${videoId}" is CLEAN.`);
       window._blockedEntry = null;
     }
   } catch (err) {
-    console.warn("[BlocklistGuard] checkVideoIdOnPage SW query error:", err);
+    console.warn("[BlocklistGuard] checkVideoIdOnPage query error:", err);
   }
 } // End of checkVideoIdOnPage
 
@@ -878,9 +914,9 @@ async function processYouTubeCard(card) {
   if (card.dataset.deepfakeThumbBlocked === "1") return;
   if (card.dataset.deepfakeCardChecked === "1") return;
 
-  const result   = extractYouTubeCardVideoId(card);
+  const result = extractYouTubeCardVideoId(card);
   const thumbHost = getThumbHost(card);
-  const imgEl    = findBestThumbnailImage(card);
+  const imgEl = findBestThumbnailImage(card);
 
   // If we lack BOTH videoId and a thumbnail image we cannot do anything yet.
   // Schedule a single retry but do NOT mark the card so it stays in the queue.
@@ -940,7 +976,7 @@ async function processYouTubeCard(card) {
     // Visibility guard — skip pHash for off-screen cards (expensive!)
     const rect = card.getBoundingClientRect();
     const isVisible = rect.bottom > 0 && rect.top < window.innerHeight &&
-                      rect.right  > 0 && rect.left < window.innerWidth;
+      rect.right > 0 && rect.left < window.innerWidth;
     if (!isVisible) {
       // Re-allow processing once the card scrolls into view
       _processedNodes.delete(card);
@@ -982,18 +1018,26 @@ function scanYouTubeCards(root = document) {
 function scanExisting() {
   if (monitoringEnabled) {
     Array.from(document.querySelectorAll("img,video")).forEach(el => {
-      (async () => { try { await processMedia(el); } catch(e){} })();
+      (async () => { try { await processMedia(el); } catch (e) { } })();
     });
   }
 
   if (location.hostname.includes("youtube.com")) {
-    (async () => { try { await scanYouTubeCards(document); } catch(e){} })();
+    (async () => { try { await scanYouTubeCards(document); } catch (e) { } })();
   }
 
-  (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
+  (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })();
+}
+
+function scanThumbnails(root = null) {
+  if (location.hostname.includes("youtube.com")) {
+    try { scanYouTubeCards(root == null ? document : root); } catch (_) { }
+    try { checkVideoIdOnPage(); } catch (_) { }
+  }
 }
 
 // MODIFIED — MutationObserver: lightweight, delegates heavy work to scheduler
+let scanTimeout;
 const mo = new MutationObserver((mutations) => {
   try {
     // ── SPA navigation detection (cheapest check first) ─────────────────
@@ -1003,34 +1047,19 @@ const mo = new MutationObserver((mutations) => {
       unblockAllMedia();
       invalidateBlocklistCache();
       clearVideoIdCache();
-      // _processedNodes is a WeakSet — old card nodes become unreachable after
-      // YouTube removes them from the DOM on navigation, so GC handles cleanup.
-      // Schedule a fresh full-page scan after navigation settles.
-      scheduleScan(null);
-      (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
+      
+      // Debounced full page check on navigation
+      clearTimeout(scanTimeout);
+      scanTimeout = setTimeout(() => scanThumbnails(null), 300);
       return;
     }
 
-    // ── Process only addedNodes — never scan the whole document inline ───
+    // ── Check if any relevant changes occurred ───
     for (const m of mutations) {
-      for (const n of Array.from(m.addedNodes)) {
-        if (!(n instanceof HTMLElement)) continue;
-
-        // Media elements for Layer A fingerprint check (monitoring flag guarded)
-        if (monitoringEnabled) {
-          if (isMediaEl(n)) {
-            (async () => { try { await processMedia(n); } catch(e){} })();
-          } else if (typeof n.querySelectorAll === "function") {
-            Array.from(n.querySelectorAll("img,video")).forEach(el => {
-              (async () => { try { await processMedia(el); } catch(e){} })();
-            });
-          }
-        }
-
-        // YouTube card detection — schedule, never call inline
-        if (location.hostname.includes("youtube.com")) {
-          scheduleScan(n);
-        }
+      if (m.addedNodes.length > 0) {
+        clearTimeout(scanTimeout);
+        scanTimeout = setTimeout(() => scanThumbnails(null), 300);
+        break;
       }
     }
   } catch (err) {
@@ -1041,10 +1070,10 @@ const mo = new MutationObserver((mutations) => {
 // Defense in depth for slow-loading SPA players
 window.addEventListener("load", () => {
   console.log("[BlocklistGuard] load event fired, running final check...");
-  (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
+  (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })();
 });
-setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch(e){} })(), 1500);
-setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch(e){} })(), 3500);
+setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })(), 1500);
+setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })(), 3500);
 
 function getPlatform() {
   const h = location.hostname;
@@ -1448,7 +1477,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const safeRes = (data) => {
       if (!responded) {
         responded = true;
-        try { sendResponse(data); } catch(e) {}
+        try { sendResponse(data); } catch (e) { }
       }
     };
     try {
@@ -1486,6 +1515,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         const quality = Number(msg.quality || 0.8);
         const warmupMs = Number(msg.warmupMs || 350);
 
+        window.__captureInProgress = true;
+        console.log("[Capture] START - blocking suspended");
+
         const out = await extractLiveFramesFromVideo(v, {
           frameCount,
           intervalMs: Math.max(250, intervalMs),
@@ -1493,6 +1525,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           warmupMs
         });
         sendResponse(out);
+        window.__captureInProgress = false;
+        console.log("[Capture] END - blocking resumed");
+
         return;
       }
 
