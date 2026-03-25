@@ -629,6 +629,59 @@ let _blocklistCache = null;
 let _blocklistCacheTs = 0;
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
+// ── NEW: Video ID result cache ───────────────────────────────────────────────
+// Prevents repeated CHECK_VIDEO_ID_BLOCKLIST messages to the service worker.
+// _videoIdBlocked: Map<videoId, blocklist entry>  — confirmed BLOCKED
+// _videoIdClean:   Set<videoId>                   — confirmed CLEAN
+const _videoIdBlocked = new Map();
+const _videoIdClean   = new Set();
+
+/** Clear videoId caches on navigation so a new page gets a fresh check. */
+function clearVideoIdCache() {
+  _videoIdBlocked.clear();
+  _videoIdClean.clear();
+}
+
+// ── NEW: Scheduler / debounce for scanning ───────────────────────────────────
+// Instead of calling scanYouTubeCards() synchronously inside every mutation,
+// we batch pending roots and flush at most once every SCAN_DEBOUNCE_MS.
+const SCAN_DEBOUNCE_MS = 200;
+let   _scanScheduled   = false;
+/** Pending root elements queued by the MutationObserver (null = full doc). */
+const _pendingScanRoots = new Set();
+
+/**
+ * NEW — Schedule a (debounced) scan pass.
+ * @param {Element|Document|null} root  Pass null to request a full-document scan.
+ */
+function scheduleScan(root) {
+  if (!location.hostname.includes("youtube.com")) return;
+  // null means "scan document" — coarses out any individual roots already queued
+  if (root == null) {
+    _pendingScanRoots.clear();
+    _pendingScanRoots.add(null);
+  } else if (!_pendingScanRoots.has(null)) {
+    _pendingScanRoots.add(root);
+  }
+  if (_scanScheduled) return;
+  _scanScheduled = true;
+  setTimeout(() => {
+    _scanScheduled = false;
+    const roots = Array.from(_pendingScanRoots);
+    _pendingScanRoots.clear();
+    for (const r of roots) {
+      try { scanYouTubeCards(r == null ? document : r); } catch (_) {}
+    }
+  }, SCAN_DEBOUNCE_MS);
+}
+
+// ── NEW: Processed-node guard ─────────────────────────────────────────────────
+// Tracks DOM nodes already handed to processYouTubeCard() so the scheduler
+// never re-queues the same card during rapid scroll / layout mutations.
+const _processedNodes = new WeakSet();
+
+// Threshold: Hamming distance ≤ 10 out of 64 bits (~84% similarity) is treated as a match.
+
 async function getBlocklistCache() {
   if (_blocklistCache && (Date.now() - _blocklistCacheTs) < CACHE_TTL_MS) {
     return _blocklistCache;
@@ -818,45 +871,80 @@ function getThumbHost(card) {
   );
 }
 
+// MODIFIED — processYouTubeCard: uses videoId cache + visibility guard for Layer B
 async function processYouTubeCard(card) {
+  // ── Guard: already fully processed ──────────────────────────────────────
+  if (_processedNodes.has(card)) return;
   if (card.dataset.deepfakeThumbBlocked === "1") return;
   if (card.dataset.deepfakeCardChecked === "1") return;
 
-  const result = extractYouTubeCardVideoId(card);
+  const result   = extractYouTubeCardVideoId(card);
   const thumbHost = getThumbHost(card);
-  const imgEl = findBestThumbnailImage(card);
+  const imgEl    = findBestThumbnailImage(card);
 
-  // If we lack BOTH videoId and thumbnail image, wait and retry.
+  // If we lack BOTH videoId and a thumbnail image we cannot do anything yet.
+  // Schedule a single retry but do NOT mark the card so it stays in the queue.
   if (!result && !imgEl) {
-    setTimeout(() => processYouTubeCard(card), 1500);
+    setTimeout(() => {
+      if (!_processedNodes.has(card)) processYouTubeCard(card);
+    }, 1500);
     return;
   }
 
-  // Mark as checked to prevent duplicate concurrent runs
+  // ── Permanently mark as in-progress / done — prevents all future re-runs ─
+  _processedNodes.add(card);
   card.dataset.deepfakeCardChecked = "1";
 
   try {
-    let videoId = result ? result.videoId : "unknown";
-    let isShorts = result ? result.isShorts : false;
+    const videoId = result ? result.videoId : "unknown";
+    const isShorts = result ? result.isShorts : false;
 
+    // ── LAYER A: exact video_id check (with cache) ───────────────────────
     if (result) {
-      console.log(`[BlocklistGuard] Scanning ${isShorts ? "[Shorts]" : "[Video]"} card video_id: ${videoId}`);
-      const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
-      
-      if (res?.ok && res?.entry) {
-        console.log(`[BlocklistGuard] 🚫 [LayerA] Blocking ${isShorts ? "Shorts" : "video"} card: ${videoId}`);
-        blockYouTubeThumbnailCard(card, thumbHost, res.entry);
+      // HIT: already known BLOCKED
+      if (_videoIdBlocked.has(videoId)) {
+        console.log(`[BlocklistGuard] [LayerA][cache-hit] Blocking ${isShorts ? "Shorts" : "video"} card: ${videoId}`);
+        blockYouTubeThumbnailCard(card, thumbHost, _videoIdBlocked.get(videoId));
         return;
+      }
+      // HIT: already known CLEAN → skip directly to Layer B
+      if (!_videoIdClean.has(videoId)) {
+        // MISS: first time seeing this videoId → ask the service worker
+        console.log(`[BlocklistGuard] Scanning ${isShorts ? "[Shorts]" : "[Video]"} card video_id: ${videoId}`);
+        const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+        if (res?.ok && res?.entry) {
+          _videoIdBlocked.set(videoId, res.entry);
+          console.log(`[BlocklistGuard] 🚫 [LayerA] Blocking ${isShorts ? "Shorts" : "video"} card: ${videoId}`);
+          blockYouTubeThumbnailCard(card, thumbHost, res.entry);
+          return;
+        }
+        // Clean — cache it so future cards with the same id skip the SW call
+        _videoIdClean.add(videoId);
       }
     } else {
       console.debug("[BlocklistGuard] No videoId on card; trying Layer B only.");
     }
 
-    // Layer B
+    // ── LAYER B: thumbnail pHash (only when card is visible on screen) ────
     if (!imgEl) {
-      // Unmark so we can retry later when the image loads
+      // No image yet — schedule a single retry (card is still un-fully-processed
+      // re: Layer B, but we already cached the Layer A clean result).
+      _processedNodes.delete(card);          // allow one more attempt
       delete card.dataset.deepfakeCardChecked;
-      setTimeout(() => processYouTubeCard(card), 1500);
+      setTimeout(() => {
+        if (!_processedNodes.has(card)) processYouTubeCard(card);
+      }, 1500);
+      return;
+    }
+
+    // Visibility guard — skip pHash for off-screen cards (expensive!)
+    const rect = card.getBoundingClientRect();
+    const isVisible = rect.bottom > 0 && rect.top < window.innerHeight &&
+                      rect.right  > 0 && rect.left < window.innerWidth;
+    if (!isVisible) {
+      // Re-allow processing once the card scrolls into view
+      _processedNodes.delete(card);
+      delete card.dataset.deepfakeCardChecked;
       return;
     }
 
@@ -866,7 +954,8 @@ async function processYouTubeCard(card) {
   }
 }
 
-async function scanYouTubeCards(root = document) {
+// MODIFIED — scanYouTubeCards: skips already-processed nodes early
+function scanYouTubeCards(root = document) {
   if (!location.hostname.includes("youtube.com")) return;
 
   const candidates = [];
@@ -878,6 +967,8 @@ async function scanYouTubeCards(root = document) {
   }
 
   for (const card of candidates) {
+    // Fast-skip: WeakSet membership check is O(1)
+    if (_processedNodes.has(card)) continue;
     // Shelf containers: recurse into children instead of treating the shelf as a card
     if (card.tagName.toLowerCase() === "ytd-reel-shelf-renderer") {
       scanYouTubeCards(card);
@@ -902,41 +993,45 @@ function scanExisting() {
   (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
 }
 
+// MODIFIED — MutationObserver: lightweight, delegates heavy work to scheduler
 const mo = new MutationObserver((mutations) => {
   try {
+    // ── SPA navigation detection (cheapest check first) ─────────────────
+    if (location.href !== currentUrl) {
+      currentUrl = location.href;
+      console.log("[BlocklistGuard] URL changed:", currentUrl);
+      unblockAllMedia();
+      invalidateBlocklistCache();
+      clearVideoIdCache();
+      // _processedNodes is a WeakSet — old card nodes become unreachable after
+      // YouTube removes them from the DOM on navigation, so GC handles cleanup.
+      // Schedule a fresh full-page scan after navigation settles.
+      scheduleScan(null);
+      (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
+      return;
+    }
+
+    // ── Process only addedNodes — never scan the whole document inline ───
     for (const m of mutations) {
       for (const n of Array.from(m.addedNodes)) {
         if (!(n instanceof HTMLElement)) continue;
 
+        // Media elements for Layer A fingerprint check (monitoring flag guarded)
         if (monitoringEnabled) {
           if (isMediaEl(n)) {
             (async () => { try { await processMedia(n); } catch(e){} })();
-          }
-
-          if (typeof n.querySelectorAll === "function") {
+          } else if (typeof n.querySelectorAll === "function") {
             Array.from(n.querySelectorAll("img,video")).forEach(el => {
               (async () => { try { await processMedia(el); } catch(e){} })();
             });
           }
         }
 
+        // YouTube card detection — schedule, never call inline
         if (location.hostname.includes("youtube.com")) {
-          (async () => { try { await scanYouTubeCards(n); } catch(e){} })();
+          scheduleScan(n);
         }
       }
-    }
-
-    if (location.hostname.includes("youtube.com")) {
-      (async () => { try { await scanYouTubeCards(document); } catch(e){} })();
-    }
-
-    if (location.href !== currentUrl) {
-      currentUrl = location.href;
-      console.log("[BlocklistGuard] URL changed:", currentUrl);
-      unblockAllMedia();
-      invalidateBlocklistCache();
-      (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
-      scanExisting();
     }
   } catch (err) {
     console.warn("[BlocklistGuard] MutationObserver error:", err);
