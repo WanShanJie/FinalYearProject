@@ -1,7 +1,7 @@
 // idb.js — IndexedDB helper for the local blocklist cache.
 // Stores fingerprint_hash (aHash), video_id, and source_url for fast matching.
 const DB_NAME = "deepfake_blocklist_db";
-const DB_VER = 2;
+const DB_VER = 3; // v3 adds thumbnail_phash for Layer B pHash matching
 const STORE = "blocklist";
 const META_STORE = "meta";
 
@@ -47,6 +47,7 @@ async function idbPutEntry(entry) {
       risk_score: entry.risk_score || 70,
       risk_level: entry.risk_level || "High",
       status: entry.status || "active",
+      thumbnail_phash: entry.thumbnail_phash || null, // Layer B
       synced_at: Date.now(),
     });
     tx.oncomplete = () => resolve(true);
@@ -126,6 +127,7 @@ async function idbBulkSync(entries) {
         risk_score: entry.risk_score || 70,
         risk_level: entry.risk_level || "High",
         status: entry.status || "active",
+        thumbnail_phash: entry.thumbnail_phash || null, // Layer B
         synced_at: Date.now(),
       });
     }
@@ -143,6 +145,19 @@ async function idbGetLastSyncedAt() {
     const tx = db.transaction(META_STORE, "readonly");
     const req = tx.objectStore(META_STORE).get("last_synced_at");
     req.onsuccess = () => resolve(req.result?.value ?? null);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+/** Layer B: get all active blocklist entries (including thumbnail_phash) */
+async function idbGetAllActive() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, "readonly");
+    const req = tx.objectStore(STORE).getAll();
+    req.onsuccess = () => resolve(
+      (req.result || []).filter(e => e.status === "active" || !e.status)
+    );
     req.onerror = () => reject(req.error);
   });
 }
@@ -167,5 +182,6 @@ self.DeepfakeIDB = {
   idbGetByVideoId,
   idbBulkSync,
   idbGetLastSyncedAt,
+  idbGetAllActive,
   idbClear,
 };

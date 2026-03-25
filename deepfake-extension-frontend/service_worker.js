@@ -378,6 +378,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Layer B: bulk-return all active entries so content script can run pHash comparisons locally
+  if (msg?.type === "GET_ALL_BLOCKLIST_ENTRIES") {
+    (async () => {
+      try {
+        if (!self.DeepfakeIDB) throw new Error("IDB not loaded in SW");
+        const entries = await self.DeepfakeIDB.idbGetAllActive();
+        console.log(`[SW] GET_ALL_BLOCKLIST_ENTRIES: ${entries.length} active entries.`);
+        sendResponse({ ok: true, entries });
+      } catch (err) {
+        console.error("[SW] GET_ALL_BLOCKLIST_ENTRIES error:", err);
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
   if (msg?.type !== "CAPTURE_SCREEN_AND_SEND") return;
 
   (async () => {

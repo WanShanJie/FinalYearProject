@@ -7,12 +7,42 @@ let observerStarted = false;
 let currentUrl = location.href;
 window._blockedEntry = null;
 
+// NEW FUNCTION: Safe Messaging Wrapper
+let _extensionContextDead = false;
+async function safeSendMessage(msg) {
+  return new Promise(resolve => {
+    if (_extensionContextDead) return resolve({ ok: false, error: "Extension context invalidated" });
+    try {
+      if (!chrome || !chrome.runtime || !chrome.runtime.sendMessage) {
+        return resolve({ ok: false, error: "No chrome.runtime" });
+      }
+      chrome.runtime.sendMessage(msg, response => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          const errMsg = err.message || "";
+          if (errMsg.includes("Extension context invalidated")) {
+            _extensionContextDead = true;
+            console.warn("[BlocklistGuard] Extension context invalidated! Halting messaging.");
+          }
+          return resolve({ ok: false, error: errMsg });
+        }
+        resolve(response || { ok: true });
+      });
+    } catch (err) {
+      if (err.message && err.message.includes("Extension context invalidated")) {
+        _extensionContextDead = true;
+      }
+      resolve({ ok: false, error: err.message || "Unknown error" });
+    }
+  });
+}
+
 async function loadMonitoringFlag() {
   const st = await chrome.storage.local.get(["monitoringEnabled"]);
   monitoringEnabled = st.monitoringEnabled === true;
   console.log(`[BlocklistGuard] Monitoring enabled: ${monitoringEnabled}`);
   // Run video_id check immediately on load, regardless of monitoring state
-  checkVideoIdOnPage().catch(() => { });
+  (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
 }
 
 function startObserver() {
@@ -44,22 +74,22 @@ function markMatched(el) {
  * where YouTube recycles the same <video> node for a new video.
  */
 function unblockAllMedia() {
-  document.querySelectorAll("[data-deepfake-blocked]").forEach(el => {
+  Array.from(document.querySelectorAll("[data-deepfake-blocked]")).forEach(el => {
     delete el.dataset.deepfakeBlocked;
     el._deepfakeBlocked = false;
   });
 
-  document.querySelectorAll("[data-deepfake-overlay]").forEach(el => el.remove());
+  Array.from(document.querySelectorAll("[data-deepfake-overlay]")).forEach(el => el.remove());
 
-  document.querySelectorAll("[data-deepfake-card-checked]").forEach(el => {
+  Array.from(document.querySelectorAll("[data-deepfake-card-checked]")).forEach(el => {
     delete el.dataset.deepfakeCardChecked;
   });
 
-  document.querySelectorAll("[data-deepfake-thumb-blocked]").forEach(el => {
+  Array.from(document.querySelectorAll("[data-deepfake-thumb-blocked]")).forEach(el => {
     delete el.dataset.deepfakeThumbBlocked;
   });
 
-  document.querySelectorAll("[data-deepfake-hover-bound]").forEach(el => {
+  Array.from(document.querySelectorAll("[data-deepfake-hover-bound]")).forEach(el => {
     delete el.dataset.deepfakeHoverBound;
   });
 }
@@ -323,7 +353,7 @@ function stopYouTubeHoverPreview(card) {
   ];
 
   previewSelectors.forEach(sel => {
-    card.querySelectorAll(sel).forEach(node => {
+    Array.from(card.querySelectorAll(sel)).forEach(node => {
       try {
         if (node.tagName === "VIDEO") {
           node.pause?.();
@@ -389,13 +419,13 @@ function blockYouTubeThumbnailCard(card, thumbHost, entry) {
 
   // Disable navigation/clicks
   const clickableEls = card.querySelectorAll("a, button, yt-icon-button");
-  clickableEls.forEach(node => {
+  Array.from(clickableEls).forEach(node => {
     node.style.setProperty("pointer-events", "none", "important");
   });
 
   // Hide all thumbnail images, not just one
   const imgs = card.querySelectorAll("img, yt-image img");
-  imgs.forEach(img => {
+  Array.from(imgs).forEach(img => {
     img.style.setProperty("visibility", "hidden", "important");
     img.style.setProperty("opacity", "0", "important");
   });
@@ -480,7 +510,7 @@ async function processMedia(el) {
       await bumpCounter("blocked", 1);
     }
 
-    chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
+    Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
   } catch (err) {
     // canvas/CORS issues; skip silently
     console.debug("[BlocklistGuard] processMedia skip:", err?.message);
@@ -489,9 +519,7 @@ async function processMedia(el) {
 
 async function getBlocklistEntry(hash) {
   try {
-    const res = await new Promise(r => {
-      chrome.runtime.sendMessage({ type: "CHECK_FINGERPRINT_BLOCKLIST", hash }, r);
-    });
+    const res = await safeSendMessage({ type: "CHECK_FINGERPRINT_BLOCKLIST", hash });
     if (!res?.ok || !res?.entry) return null;
     const { entry } = res;
     console.log(`[BlocklistGuard] ✅ SW match for hash: ${hash} → ${entry.title || entry.video_id || "??"}`);
@@ -500,6 +528,182 @@ async function getBlocklistEntry(hash) {
     console.warn("[BlocklistGuard] getBlocklistEntry SW query error:", err);
     return null;
   }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// LAYER B — Thumbnail Perceptual Hash (pHash) Matching
+// Catches reposted / reformatted variants that have a different video_id
+// but a visually similar thumbnail image.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Hamming distance between two hex-encoded pHash strings */
+function hammingDistance(hexA, hexB) {
+  if (!hexA || !hexB || hexA.length !== hexB.length) return Infinity;
+  let dist = 0;
+  for (let i = 0; i < hexA.length; i++) {
+    const xor = parseInt(hexA[i], 16) ^ parseInt(hexB[i], 16);
+    // Count set bits in 4-bit nibble
+    dist += (xor & 1) + ((xor >> 1) & 1) + ((xor >> 2) & 1) + ((xor >> 3) & 1);
+  }
+  return dist;
+}
+
+/**
+ * Compute perceptual hash from an ImageData object (32×32 DCT-based pHash).
+ * Returns a 16-char hex string (64 bits).
+ */
+function pHashFromImageData(imageData) {
+  const SIZE = 32;
+  // Grayscale
+  const gray = new Float32Array(SIZE * SIZE);
+  for (let i = 0; i < SIZE * SIZE; i++) {
+    const off = i * 4;
+    gray[i] = imageData.data[off] * 0.299 + imageData.data[off + 1] * 0.587 + imageData.data[off + 2] * 0.114;
+  }
+
+  // 2D DCT (only compute the top-left 8×8 frequencies)
+  const dct = new Float32Array(8 * 8);
+  for (let u = 0; u < 8; u++) {
+    for (let v = 0; v < 8; v++) {
+      let sum = 0;
+      for (let x = 0; x < SIZE; x++) {
+        for (let y = 0; y < SIZE; y++) {
+          sum += gray[x * SIZE + y] *
+            Math.cos(((2 * x + 1) * u * Math.PI) / (2 * SIZE)) *
+            Math.cos(((2 * y + 1) * v * Math.PI) / (2 * SIZE));
+        }
+      }
+      const cu = u === 0 ? 1 / Math.SQRT2 : 1;
+      const cv = v === 0 ? 1 / Math.SQRT2 : 1;
+      dct[u * 8 + v] = (2 / SIZE) * cu * cv * sum;
+    }
+  }
+
+  // Median as threshold (skip DC component at index 0)
+  const sorted = dct.slice(1).sort((a, b) => a - b);
+  const median = sorted[Math.floor(sorted.length / 2)];
+
+  // Build bit hash, convert to hex nibbles
+  let bits = "";
+  for (let i = 1; i < 65; i++) bits += dct[i] >= median ? "1" : "0";
+  let hex = "";
+  for (let i = 0; i < bits.length; i += 4) hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
+  return hex; // 16 hex chars = 64 bits
+}
+
+/**
+ * Load an image URL into a 32×32 canvas and compute its pHash.
+ * Returns null on CORS / load errors.
+ */
+function computeThumbnailPHash(imgUrl) {
+  return new Promise(resolve => {
+    if (!imgUrl) return resolve(null);
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+
+    const timeout = setTimeout(() => resolve(null), 4000);
+
+    img.onload = () => {
+      clearTimeout(timeout);
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = 32;
+        canvas.height = 32;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0, 32, 32);
+        const imageData = ctx.getImageData(0, 0, 32, 32);
+        resolve(pHashFromImageData(imageData));
+      } catch (_) {
+        resolve(null);
+      }
+    };
+
+    img.onerror = () => { clearTimeout(timeout); resolve(null); };
+    img.src = imgUrl;
+  });
+}
+
+// In-memory cache of all blocklist entries for Layer B.
+// Refreshed when blocklist is synced or on page load (max 5 min stale).
+let _blocklistCache = null;
+let _blocklistCacheTs = 0;
+const CACHE_TTL_MS = 5 * 60 * 1000;
+
+async function getBlocklistCache() {
+  if (_blocklistCache && (Date.now() - _blocklistCacheTs) < CACHE_TTL_MS) {
+    return _blocklistCache;
+  }
+  try {
+    const res = await safeSendMessage({ type: "GET_ALL_BLOCKLIST_ENTRIES" });
+    if (res?.ok && Array.isArray(res.entries)) {
+      _blocklistCache = res.entries;
+      _blocklistCacheTs = Date.now();
+      return _blocklistCache;
+    }
+  } catch (err) {
+    console.debug("[BlocklistGuard] Layer B cache fetch error:", err?.message);
+  }
+  return [];
+}
+
+/** Invalidate the cache when a new sync arrives */
+function invalidateBlocklistCache() {
+  _blocklistCache = null;
+  _blocklistCacheTs = 0;
+}
+
+// Threshold: Hamming distance ≤ 10 out of 64 bits (~84% similarity) is treated as a match.
+const PHASH_HAMMING_THRESHOLD = 10;
+
+/**
+ * LAYER B — Check if a card's thumbnail pHash visually matches any blocked entry.
+ * @param {Element} card — the ytd-*-renderer element
+ * @param {Element} thumbHost — the #thumbnail or ytd-thumbnail element
+ * @param {string} videoId — already-checked Layer A video_id (CLEAN at this point)
+ * @returns {Promise<boolean>} true if blocked by Layer B
+ */
+async function checkThumbnailPHashLayer(card, thumbHost, videoId) {
+  if (!card || card.dataset.deepfakeThumbBlocked === "1") return false;
+
+  // Find the thumbnail image src
+  const imgEl =
+    thumbHost?.querySelector("img") ||
+    card.querySelector("img") ||
+    card.querySelector("yt-image img");
+
+  if (!imgEl?.src || imgEl.src.startsWith("data:")) return false;
+
+  // Fetch blocked entry list
+  const entries = await getBlocklistCache();
+  const entriesWithHash = entries.filter(e => e.thumbnail_phash);
+  if (entriesWithHash.length === 0) return false;
+
+  console.log(`[BlocklistGuard][LayerB] Computing pHash for card video_id: ${videoId}`);
+  const thumbHash = await computeThumbnailPHash(imgEl.src);
+  if (!thumbHash) {
+    console.debug(`[BlocklistGuard][LayerB] pHash failed (CORS?) for ${imgEl.src.slice(0, 60)}`);
+    return false;
+  }
+
+  for (const entry of entriesWithHash) {
+    const dist = hammingDistance(thumbHash, entry.thumbnail_phash);
+    if (dist <= PHASH_HAMMING_THRESHOLD) {
+      console.log(`[BlocklistGuard][LayerB] 🚫 MATCH! card video_id "${videoId}" ~ blocked "${entry.video_id}" (Hamming ${dist}/64). Blocking.`);
+      const syntheticEntry = {
+        ...entry,
+        // Tag as variant so the overlay can say "visual variant"
+        _variantOf: entry.video_id,
+        title: entry.title ? `[Variant] ${entry.title}` : "Suspected Deepfake Variant",
+      };
+      bumpCounter("blocked", 1).catch(() => { });
+      Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
+      blockYouTubeThumbnailCard(card, thumbHost, syntheticEntry);
+      return true;
+    }
+  }
+
+  console.debug(`[BlocklistGuard][LayerB] No pHash match for card video_id: ${videoId} (best dist > ${PHASH_HAMMING_THRESHOLD})`);
+  return false;
 }
 
 async function checkVideoIdOnPage() {
@@ -518,9 +722,7 @@ async function checkVideoIdOnPage() {
     }
 
     console.log(`[BlocklistGuard] Asking SW to check video_id: ${videoId}`);
-    const res = await new Promise(r => {
-      chrome.runtime.sendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId }, r);
-    });
+    const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
 
     if (res?.ok && res?.entry) {
       const { entry } = res;
@@ -530,7 +732,7 @@ async function checkVideoIdOnPage() {
         blockElement(v, entry);
       });
       await bumpCounter("blocked", 1);
-      chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
+      Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
     } else {
       console.log(`[BlocklistGuard] SW says video_id "${videoId}" is CLEAN.`);
       window._blockedEntry = null;
@@ -540,158 +742,201 @@ async function checkVideoIdOnPage() {
   }
 } // End of checkVideoIdOnPage
 
-async function scanYouTubeCards(root = document) {
-  if (!location.hostname.includes("youtube.com")) return;
+// ── YouTube Card Detection Helpers ──────────────────────────────────────────
 
-  const selectors = [
-    "ytd-rich-item-renderer",
-    "ytd-video-renderer",
-    "ytd-grid-video-renderer",
-    "ytd-compact-video-renderer",
-    "ytd-reel-item-renderer"
+/**
+ * All YouTube card renderers we want to scan.
+ * Includes standard video cards, Shorts shelf cells, and newer yt-lockup-view-model.
+ */
+const YT_CARD_SELECTORS = [
+  "ytd-rich-item-renderer",
+  "ytd-video-renderer",
+  "ytd-grid-video-renderer",
+  "ytd-compact-video-renderer",
+  "ytd-reel-item-renderer",
+  "ytd-rich-grid-slim-media",  // Shorts shelf grid cell
+  "ytd-shorts",               // Shorts page full card
+  "yt-lockup-view-model",     // New YouTube UI Shorts lockup
+  "ytd-reel-shelf-renderer",  // Entire Shorts shelf (recurse into children)
+].join(", ");
+
+/**
+ * Walk ALL anchors inside a card and extract the first valid YouTube video_id.
+ * Supports /shorts/<id> and /watch?v=<id>.
+ * Returns { videoId, isShorts } or null.
+ */
+function extractYouTubeCardVideoId(card) {
+  const anchors = Array.from(card.querySelectorAll("a[href]"));
+  if (card.tagName === "A" && card.getAttribute("href")) anchors.unshift(card);
+
+  for (const a of anchors) {
+    const href = a.getAttribute("href") || "";
+    const shortsMatch = href.match(/\/shorts\/([A-Za-z0-9_-]{6,20})/);
+    if (shortsMatch) return { videoId: shortsMatch[1], isShorts: true };
+    try {
+      const u = new URL(href, "https://www.youtube.com");
+      if (u.pathname === "/watch") {
+        const v = u.searchParams.get("v");
+        if (v) return { videoId: v, isShorts: false };
+      }
+    } catch (_) { }
+  }
+  return null;
+}
+
+/**
+ * Find the best thumbnail image for pHash computation.
+ * Handles lazy-loaded and deeply nested Shorts thumbnails.
+ */
+function findBestThumbnailImage(card) {
+  const prioritySelectors = [
+    "ytd-thumbnail img",
+    "#thumbnail img",
+    "yt-image img",
+    "img#img",
+    "img.yt-core-image",
+    "img[src*='ytimg.com']",
+    "img[src*='i.ytimg.com']",
   ];
+  for (const sel of prioritySelectors) {
+    const img = card.querySelector(sel);
+    if (img?.src && !img.src.startsWith("data:") && img.naturalWidth !== 0) return img;
+  }
+  for (const img of card.querySelectorAll("img")) {
+    if (img.src && !img.src.startsWith("data:") && img.naturalWidth !== 0) return img;
+  }
+  return null;
+}
 
-  let cards = [];
+/** Find the visual container element for overlay placement. */
+function getThumbHost(card) {
+  return (
+    card.querySelector("ytd-thumbnail") ||
+    card.querySelector("#thumbnail") ||
+    card.querySelector("yt-image") ||
+    card
+  );
+}
 
-  if (root instanceof Element && root.matches(selectors.join(", "))) {
-    cards.push(root);
+async function processYouTubeCard(card) {
+  if (card.dataset.deepfakeThumbBlocked === "1") return;
+  if (card.dataset.deepfakeCardChecked === "1") return;
+
+  const result = extractYouTubeCardVideoId(card);
+  const thumbHost = getThumbHost(card);
+  const imgEl = findBestThumbnailImage(card);
+
+  // If we lack BOTH videoId and thumbnail image, wait and retry.
+  if (!result && !imgEl) {
+    setTimeout(() => processYouTubeCard(card), 1500);
+    return;
   }
 
-  if (root.querySelectorAll) {
-    cards.push(
-      ...root.querySelectorAll(
-        selectors.map(s => `${s}:not([data-deepfake-card-checked])`).join(", ")
-      )
-    );
-  }
+  // Mark as checked to prevent duplicate concurrent runs
+  card.dataset.deepfakeCardChecked = "1";
 
-  for (const card of cards) {
-    const link = card.querySelector(
-      [
-        'a#thumbnail[href*="/watch?v="]',
-        'a#thumbnail[href*="/shorts/"]',
-        'a[href*="/watch?v="]',
-        'a[href*="/shorts/"]',
-        'a.ytd-thumbnail[href*="/watch?v="]',
-        'a.ytd-thumbnail[href*="/shorts/"]'
-      ].join(", ")
-    );
+  try {
+    let videoId = result ? result.videoId : "unknown";
+    let isShorts = result ? result.isShorts : false;
 
-    if (!link) continue;
-
-    const href = link.getAttribute("href") || "";
-    let videoId = null;
-
-    const ytShorts = href.match(/\/shorts\/([^/?]+)/);
-    if (ytShorts) {
-      videoId = ytShorts[1];
+    if (result) {
+      console.log(`[BlocklistGuard] Scanning ${isShorts ? "[Shorts]" : "[Video]"} card video_id: ${videoId}`);
+      const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+      
+      if (res?.ok && res?.entry) {
+        console.log(`[BlocklistGuard] 🚫 [LayerA] Blocking ${isShorts ? "Shorts" : "video"} card: ${videoId}`);
+        blockYouTubeThumbnailCard(card, thumbHost, res.entry);
+        return;
+      }
     } else {
-      try {
-        const u = new URL(href, "https://youtube.com");
-        videoId = u.searchParams.get("v");
-      } catch (_) { }
+      console.debug("[BlocklistGuard] No videoId on card; trying Layer B only.");
     }
 
-    if (!videoId) continue;
+    // Layer B
+    if (!imgEl) {
+      // Unmark so we can retry later when the image loads
+      delete card.dataset.deepfakeCardChecked;
+      setTimeout(() => processYouTubeCard(card), 1500);
+      return;
+    }
 
-    card.dataset.deepfakeCardChecked = "1";
-    console.log(`[BlocklistGuard] Checking preview card video_id: ${videoId}`);
-
-    chrome.runtime.sendMessage(
-      { type: "CHECK_VIDEO_ID_BLOCKLIST", videoId },
-      res => {
-        if (chrome.runtime.lastError) {
-          console.warn(
-            "[BlocklistGuard] CHECK_VIDEO_ID_BLOCKLIST error:",
-            chrome.runtime.lastError.message
-          );
-          return;
-        }
-
-        if (res?.ok && res?.entry) {
-          console.log(
-            `[BlocklistGuard] 🚫 Preview card blocked for video_id: ${videoId}`
-          );
-
-          const thumbHost =
-            card.querySelector("#thumbnail") ||
-            card.querySelector("ytd-thumbnail") ||
-            link;
-
-          blockYouTubeThumbnailCard(card, thumbHost, res.entry);
-        } else {
-          console.log(
-            `[BlocklistGuard] Preview card clean for video_id: ${videoId}`
-          );
-        }
-      }
-    );
+    await checkThumbnailPHashLayer(card, thumbHost, videoId);
+  } catch (err) {
+    console.debug("[BlocklistGuard] processYouTubeCard error:", err?.message);
   }
 }
 
+async function scanYouTubeCards(root = document) {
+  if (!location.hostname.includes("youtube.com")) return;
+
+  const candidates = [];
+  if (root instanceof Element && root.matches(YT_CARD_SELECTORS)) {
+    candidates.push(root);
+  }
+  if (typeof root.querySelectorAll === "function") {
+    Array.from(root.querySelectorAll(YT_CARD_SELECTORS)).forEach(el => candidates.push(el));
+  }
+
+  for (const card of candidates) {
+    // Shelf containers: recurse into children instead of treating the shelf as a card
+    if (card.tagName.toLowerCase() === "ytd-reel-shelf-renderer") {
+      scanYouTubeCards(card);
+      continue;
+    }
+    processYouTubeCard(card);
+  }
+}
+
+
 function scanExisting() {
   if (monitoringEnabled) {
-    document.querySelectorAll("img,video").forEach(maybeHashAndCheck);
+    Array.from(document.querySelectorAll("img,video")).forEach(el => {
+      (async () => { try { await processMedia(el); } catch(e){} })();
+    });
   }
 
   if (location.hostname.includes("youtube.com")) {
-    scanYouTubeCards(document);
+    (async () => { try { await scanYouTubeCards(document); } catch(e){} })();
   }
 
-  checkVideoIdOnPage().catch(() => { });
+  (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
 }
 
 const mo = new MutationObserver((mutations) => {
   try {
     for (const m of mutations) {
-      for (const n of m.addedNodes) {
+      for (const n of Array.from(m.addedNodes)) {
         if (!(n instanceof HTMLElement)) continue;
 
         if (monitoringEnabled) {
-          if (typeof isMediaEl === "function" && isMediaEl(n)) {
-            if (typeof maybeHashAndCheck === "function") {
-              maybeHashAndCheck(n);
-            }
+          if (isMediaEl(n)) {
+            (async () => { try { await processMedia(n); } catch(e){} })();
           }
 
           if (typeof n.querySelectorAll === "function") {
-            n.querySelectorAll("img,video").forEach(el => {
-              if (typeof maybeHashAndCheck === "function") {
-                maybeHashAndCheck(el);
-              }
+            Array.from(n.querySelectorAll("img,video")).forEach(el => {
+              (async () => { try { await processMedia(el); } catch(e){} })();
             });
           }
         }
 
         if (location.hostname.includes("youtube.com")) {
-          if (typeof scanYouTubeCards === "function") {
-            scanYouTubeCards(n);
-          }
+          (async () => { try { await scanYouTubeCards(n); } catch(e){} })();
         }
       }
     }
 
     if (location.hostname.includes("youtube.com")) {
-      if (typeof scanYouTubeCards === "function") {
-        scanYouTubeCards(document);
-      }
+      (async () => { try { await scanYouTubeCards(document); } catch(e){} })();
     }
 
     if (location.href !== currentUrl) {
       currentUrl = location.href;
       console.log("[BlocklistGuard] URL changed:", currentUrl);
-
-      if (typeof unblockAllMedia === "function") {
-        unblockAllMedia();
-      }
-
-      if (typeof checkVideoIdOnPage === "function") {
-        checkVideoIdOnPage().catch(() => { });
-      }
-
-      if (typeof scanExisting === "function") {
-        scanExisting();
-      }
+      unblockAllMedia();
+      invalidateBlocklistCache();
+      (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
+      scanExisting();
     }
   } catch (err) {
     console.warn("[BlocklistGuard] MutationObserver error:", err);
@@ -701,10 +946,10 @@ const mo = new MutationObserver((mutations) => {
 // Defense in depth for slow-loading SPA players
 window.addEventListener("load", () => {
   console.log("[BlocklistGuard] load event fired, running final check...");
-  checkVideoIdOnPage().catch(() => { });
+  (async () => { try { await checkVideoIdOnPage(); } catch(e){} })();
 });
-setTimeout(() => checkVideoIdOnPage().catch(() => { }), 1500);
-setTimeout(() => checkVideoIdOnPage().catch(() => { }), 3500);
+setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch(e){} })(), 1500);
+setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch(e){} })(), 3500);
 
 function getPlatform() {
   const h = location.hostname;
@@ -1104,151 +1349,169 @@ async function extractLiveFramesFromVideo(video, {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
-    if (msg?.type === "PING") {
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg?.type === "WAIT_UNTIL_READY") {
-      const res = await waitForVideoReady(
-        Number(msg.timeoutMs || 12000),
-        msg.lockedVideoId || null
-      );
-      sendResponse(res);
-      return;
-    }
-
-    if (msg?.type === "PREP_CAPTURE") {
-      const res = await waitForVideoReady(12000, msg.lockedVideoId || null);
-      sendResponse(res.ok ? { ok: true, ...res } : res);
-      return;
-    }
-
-    if (msg?.type === "EXTRACT_FRAMES_LIVE") {
-      // Lock onto the video element NOW before any async work.
-      // For Shorts: this reference stays valid even if the user scrolls to a new reel.
-      const v = findVideoElementForCapture(msg.lockedVideoId);
-      if (!v) {
-        sendResponse({ ok: false, error: "no_video_element" });
+    let responded = false;
+    const safeRes = (data) => {
+      if (!responded) {
+        responded = true;
+        try { sendResponse(data); } catch(e) {}
+      }
+    };
+    try {
+      const origSendResponse = sendResponse;
+      sendResponse = safeRes;
+      if (msg?.type === "PING") {
+        sendResponse({ ok: true });
         return;
       }
 
-      const frameCount = Number(msg.frameCount || 8);
-      const intervalMs = Number(msg.intervalMs || 1000);
-      const quality = Number(msg.quality || 0.8);
-      const warmupMs = Number(msg.warmupMs || 350);
-
-      const out = await extractLiveFramesFromVideo(v, {
-        frameCount,
-        intervalMs: Math.max(250, intervalMs),
-        quality,
-        warmupMs
-      });
-      sendResponse(out);
-      return;
-    }
-
-    if (msg?.type === "SET_MONITORING") {
-      monitoringEnabled = !!msg.enabled;
-      await chrome.storage.local.set({ monitoringEnabled });
-      if (monitoringEnabled) startObserver();
-      else stopObserver();
-      sendResponse({ ok: true });
-      return;
-    }
-
-    if (msg?.type === "GET_CURRENT_TS") {
-      const platform = getPlatform();
-      const ts = platform === "youtube" ? getYouTubeTimestamp() : getVideoTimestamp();
-      sendResponse({ ok: true, video_ts: ts });
-      return;
-    }
-
-    if (msg?.type === "GET_VIDEO_RECT") {
-      const v = getBestVideoElementForRect();
-      if (!v) {
-        sendResponse({ ok: false, error: "no_video_element" });
+      if (msg?.type === "WAIT_UNTIL_READY") {
+        const res = await waitForVideoReady(
+          Number(msg.timeoutMs || 12000),
+          msg.lockedVideoId || null
+        );
+        sendResponse(res);
         return;
       }
-      const r = v.getBoundingClientRect();
-      sendResponse({
-        ok: true,
-        rect: { x: r.x, y: r.y, w: r.width, h: r.height },
-        dpr: window.devicePixelRatio || 1,
-        video_wh: { w: v.videoWidth || 0, h: v.videoHeight || 0 }
-      });
-      return;
-    }
 
-    if (msg?.type === "GET_PAGE_META") {
-      const platform = getPlatform();
-      const media = pickBestVisibleMediaEl();
-
-      let title = document.title || "";
-      let video_id = null;
-      let current_video_id = null;
-      let canonical_url = null;
-      let player_context = null;
-      let video_ts = 0;
-      let duration = null;
-      let media_type = media?.tagName === "VIDEO" ? "video" : (media?.tagName === "IMG" ? "image" : "unknown");
-
-      if (platform === "youtube") {
-        title = getYouTubeTitle();
-        const yt = getYouTubeCurrentVideoIdAndContext();
-        current_video_id = yt.videoId;
-        video_id = yt.videoId;
-        player_context = yt.context;
-        canonical_url = buildYouTubeCanonicalUrl(yt.videoId, yt.context);
-        video_ts = getYouTubeTimestamp();
-        const v = getMainVideoEl();
-        duration = Number(v?.duration || 0) || null;
-      } else if (platform === "tiktok") {
-        video_id = getTikTokVideoId();
-        current_video_id = video_id;
-        canonical_url = location.href;
-        video_ts = getVideoTimestamp();
-        duration = Number(document.querySelector("video")?.duration || 0) || null;
-      } else if (platform === "facebook") {
-        const fb = findFacebookPostUrlFromDom();
-        video_id = fb.post_id || getFacebookVideoId();
-        current_video_id = video_id;
-        canonical_url = fb.post_url || location.href;
-        video_ts = getVideoTimestamp();
-        duration = Number(document.querySelector("video")?.duration || 0) || null;
-      } else {
-        canonical_url = location.href;
-        video_ts = getVideoTimestamp();
-        duration = Number(document.querySelector("video")?.duration || 0) || null;
+      if (msg?.type === "PREP_CAPTURE") {
+        const res = await waitForVideoReady(12000, msg.lockedVideoId || null);
+        sendResponse(res.ok ? { ok: true, ...res } : res);
+        return;
       }
 
-      sendResponse({
-        ok: true,
-        meta: {
-          title,
-          platform,
-          page_url: location.href,
-          canonical_url,
-          video_id,
-          current_video_id,
-          player_context,
-          video_ts,
-          duration,
-          media_type,
-          captured_at: new Date().toISOString(),
-          user_agent: navigator.userAgent,
-          viewport: { w: window.innerWidth, h: window.innerHeight }
+      if (msg?.type === "EXTRACT_FRAMES_LIVE") {
+        const v = findVideoElementForCapture(msg.lockedVideoId);
+        if (!v) {
+          sendResponse({ ok: false, error: "no_video_element" });
+          return;
         }
-      });
-      return;
-    }
 
-    if (msg?.type === "BLOCKLIST_UPDATED") {
-      // Service worker synced a new blocklist — re-check this page immediately
-      checkVideoIdOnPage().catch(() => { });
-      scanExisting();
-      sendResponse({ ok: true });
-      return;
+        const frameCount = Number(msg.frameCount || 8);
+        const intervalMs = Number(msg.intervalMs || 1000);
+        const quality = Number(msg.quality || 0.8);
+        const warmupMs = Number(msg.warmupMs || 350);
+
+        const out = await extractLiveFramesFromVideo(v, {
+          frameCount,
+          intervalMs: Math.max(250, intervalMs),
+          quality,
+          warmupMs
+        });
+        sendResponse(out);
+        return;
+      }
+
+      if (msg?.type === "SET_MONITORING") {
+        monitoringEnabled = !!msg.enabled;
+        await chrome.storage.local.set({ monitoringEnabled });
+        if (monitoringEnabled) startObserver();
+        else stopObserver();
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (msg?.type === "GET_CURRENT_TS") {
+        const platform = getPlatform();
+        const ts = platform === "youtube" ? getYouTubeTimestamp() : getVideoTimestamp();
+        sendResponse({ ok: true, video_ts: ts });
+        return;
+      }
+
+      if (msg?.type === "GET_VIDEO_RECT") {
+        const v = getBestVideoElementForRect();
+        if (!v) {
+          sendResponse({ ok: false, error: "no_video_element" });
+          return;
+        }
+        const r = v.getBoundingClientRect();
+        sendResponse({
+          ok: true,
+          rect: { x: r.x, y: r.y, w: r.width, h: r.height },
+          dpr: window.devicePixelRatio || 1,
+          video_wh: { w: v.videoWidth || 0, h: v.videoHeight || 0 }
+        });
+        return;
+      }
+
+      if (msg?.type === "GET_PAGE_META") {
+        const platform = getPlatform();
+        const media = pickBestVisibleMediaEl();
+
+        let title = document.title || "";
+        let video_id = null;
+        let current_video_id = null;
+        let canonical_url = null;
+        let player_context = null;
+        let video_ts = 0;
+        let duration = null;
+        let media_type = media?.tagName === "VIDEO" ? "video" : (media?.tagName === "IMG" ? "image" : "unknown");
+
+        if (platform === "youtube") {
+          title = getYouTubeTitle();
+          const yt = getYouTubeCurrentVideoIdAndContext();
+          current_video_id = yt.videoId;
+          video_id = yt.videoId;
+          player_context = yt.context;
+          canonical_url = buildYouTubeCanonicalUrl(yt.videoId, yt.context);
+          video_ts = getYouTubeTimestamp();
+          const v = getMainVideoEl();
+          duration = Number(v?.duration || 0) || null;
+        } else if (platform === "tiktok") {
+          video_id = getTikTokVideoId();
+          current_video_id = video_id;
+          canonical_url = location.href;
+          video_ts = getVideoTimestamp();
+          duration = Number(document.querySelector("video")?.duration || 0) || null;
+        } else if (platform === "facebook") {
+          const fb = findFacebookPostUrlFromDom();
+          video_id = fb.post_id || getFacebookVideoId();
+          current_video_id = video_id;
+          canonical_url = fb.post_url || location.href;
+          video_ts = getVideoTimestamp();
+          duration = Number(document.querySelector("video")?.duration || 0) || null;
+        } else {
+          canonical_url = location.href;
+          video_ts = getVideoTimestamp();
+          duration = Number(document.querySelector("video")?.duration || 0) || null;
+        }
+
+        sendResponse({
+          ok: true,
+          meta: {
+            title,
+            platform,
+            page_url: location.href,
+            canonical_url,
+            video_id,
+            current_video_id,
+            player_context,
+            video_ts,
+            duration,
+            media_type,
+            captured_at: new Date().toISOString(),
+            user_agent: navigator.userAgent,
+            viewport: { w: window.innerWidth, h: window.innerHeight }
+          }
+        });
+        return;
+      }
+
+      if (msg?.type === "BLOCKLIST_UPDATED") {
+        invalidateBlocklistCache();
+        checkVideoIdOnPage().catch(() => { });
+        scanExisting();
+        sendResponse({ ok: true });
+        return;
+      }
+
+      sendResponse({ ok: false, error: "unknown_message_type" });
+    } catch (err) {
+      console.warn("[BlocklistGuard] onMessage handler error:", err);
+      sendResponse({ ok: false, error: err?.message || "handler_failed" });
+    } finally {
+      if (!responded) {
+        sendResponse({ ok: false, error: "no_response_sent" });
+      }
     }
   })();
 
