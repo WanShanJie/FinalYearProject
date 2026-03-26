@@ -2,14 +2,14 @@
 // Real-Time Protection: monitors IMG/VIDEO and checks local IndexedDB blocklist using a demo aHash.
 // Analyze feature: provides GET_PAGE_META metadata and supports PREP_CAPTURE / WAIT_UNTIL_READY / SEEK_TO.
 
-let monitoringEnabled = false;
-let observerStarted = false;
-let currentUrl = location.href;
+var monitoringEnabled = false;
+var observerStarted = false;
+var currentUrl = location.href;
 window._blockedEntry = null;
 window.__captureInProgress = false;
 
 // NEW FUNCTION: Safe Messaging Wrapper
-let _extensionContextDead = false;
+var _extensionContextDead = false;
 async function safeSendMessage(msg) {
   return new Promise(resolve => {
     if (_extensionContextDead) return resolve({ ok: false, error: "Extension context invalidated" });
@@ -42,8 +42,11 @@ async function loadMonitoringFlag() {
   const st = await chrome.storage.local.get(["monitoringEnabled"]);
   monitoringEnabled = st.monitoringEnabled === true;
   console.log(`[BlocklistGuard] Monitoring enabled: ${monitoringEnabled}`);
-  // Run video_id check immediately on load, regardless of monitoring state
-  (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })();
+  // Run video_id check immediately on load — but not if a capture is already in
+  // progress (can happen when the content script is freshly injected mid-capture).
+  if (!window.__captureInProgress) {
+    (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })();
+  }
 }
 
 function startObserver() {
@@ -503,6 +506,8 @@ async function fingerprintElement(el) {
 }
 
 async function processMedia(el) {
+  if (window.__captureInProgress) return;
+
   // If the whole page/video_id is actively blocked, block this element immediately
   if (window._blockedEntry) {
     blockElement(el, window._blockedEntry);
@@ -530,7 +535,7 @@ async function processMedia(el) {
   }
 }
 
-const _fingerprintCache = new Map();
+var _fingerprintCache = new Map();
 async function getBlocklistEntry(hash) {
   if (_fingerprintCache.has(hash)) return _fingerprintCache.get(hash);
   try {
@@ -644,17 +649,17 @@ function computeThumbnailPHash(imgUrl) {
 
 // In-memory cache of all blocklist entries for Layer B.
 // Refreshed when blocklist is synced or on page load (max 5 min stale).
-let _blocklistCache = null;
-let _blocklistCacheTs = 0;
-const CACHE_TTL_MS = 5 * 60 * 1000;
+var _blocklistCache = null;
+var _blocklistCacheTs = 0;
+var CACHE_TTL_MS = 5 * 60 * 1000;
 
 // ── NEW: Video ID result cache ───────────────────────────────────────────────
 // Prevents repeated CHECK_VIDEO_ID_BLOCKLIST messages to the service worker.
 // _videoIdBlocked: Map<videoId, blocklist entry>  — confirmed BLOCKED
 // _videoIdClean:   Set<videoId>                   — confirmed CLEAN
-const _videoIdBlocked = new Map();
-const _videoIdClean = new Set();
-const blockCache = new Map();
+var _videoIdBlocked = new Map();
+var _videoIdClean = new Set();
+var blockCache = new Map();
 
 /** Clear videoId caches on navigation so a new page gets a fresh check. */
 function clearVideoIdCache() {
@@ -679,10 +684,10 @@ async function checkBlocklist(videoId) {
 // ── NEW: Scheduler / debounce for scanning ───────────────────────────────────
 // Instead of calling scanYouTubeCards() synchronously inside every mutation,
 // we batch pending roots and flush at most once every SCAN_DEBOUNCE_MS.
-const SCAN_DEBOUNCE_MS = 200;
-let _scanScheduled = false;
+var SCAN_DEBOUNCE_MS = 200;
+var _scanScheduled = false;
 /** Pending root elements queued by the MutationObserver (null = full doc). */
-const _pendingScanRoots = new Set();
+var _pendingScanRoots = new Set();
 
 /**
  * NEW — Schedule a (debounced) scan pass.
@@ -712,7 +717,7 @@ function scheduleScan(root) {
 // ── NEW: Processed-node guard ─────────────────────────────────────────────────
 // Tracks DOM nodes already handed to processYouTubeCard() so the scheduler
 // never re-queues the same card during rapid scroll / layout mutations.
-const _processedNodes = new WeakSet();
+var _processedNodes = new WeakSet();
 
 // Threshold: Hamming distance ≤ 10 out of 64 bits (~84% similarity) is treated as a match.
 
@@ -740,7 +745,7 @@ function invalidateBlocklistCache() {
 }
 
 // Threshold: Hamming distance ≤ 10 out of 64 bits (~84% similarity) is treated as a match.
-const PHASH_HAMMING_THRESHOLD = 10;
+var PHASH_HAMMING_THRESHOLD = 10;
 
 /**
  * LAYER B — Check if a card's thumbnail pHash visually matches any blocked entry.
@@ -821,7 +826,7 @@ async function checkVideoIdOnPage() {
         blockElement(v, entry);
       });
       await bumpCounter("blocked", 1);
-      Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => {});
+      Promise.resolve(safeSendMessage({ type: "COUNTS_UPDATED" })).catch(() => { });
     } else {
       console.log(`[BlocklistGuard] video_id "${videoId}" is CLEAN.`);
       window._blockedEntry = null;
@@ -837,7 +842,7 @@ async function checkVideoIdOnPage() {
  * All YouTube card renderers we want to scan.
  * Includes standard video cards, Shorts shelf cells, and newer yt-lockup-view-model.
  */
-const YT_CARD_SELECTORS = [
+var YT_CARD_SELECTORS = [
   "ytd-rich-item-renderer",
   "ytd-video-renderer",
   "ytd-grid-video-renderer",
@@ -909,6 +914,7 @@ function getThumbHost(card) {
 
 // MODIFIED — processYouTubeCard: uses videoId cache + visibility guard for Layer B
 async function processYouTubeCard(card) {
+  if (window.__captureInProgress) return;
   // ── Guard: already fully processed ──────────────────────────────────────
   if (_processedNodes.has(card)) return;
   if (card.dataset.deepfakeThumbBlocked === "1") return;
@@ -992,6 +998,7 @@ async function processYouTubeCard(card) {
 
 // MODIFIED — scanYouTubeCards: skips already-processed nodes early
 function scanYouTubeCards(root = document) {
+  if (window.__captureInProgress) return;
   if (!location.hostname.includes("youtube.com")) return;
 
   const candidates = [];
@@ -1016,6 +1023,8 @@ function scanYouTubeCards(root = document) {
 
 
 function scanExisting() {
+  if (window.__captureInProgress) return;
+
   if (monitoringEnabled) {
     Array.from(document.querySelectorAll("img,video")).forEach(el => {
       (async () => { try { await processMedia(el); } catch (e) { } })();
@@ -1037,8 +1046,9 @@ function scanThumbnails(root = null) {
 }
 
 // MODIFIED — MutationObserver: lightweight, delegates heavy work to scheduler
-let scanTimeout;
-const mo = new MutationObserver((mutations) => {
+var scanTimeout;
+var mo = new MutationObserver((mutations) => {
+  if (window.__captureInProgress) return;
   try {
     // ── SPA navigation detection (cheapest check first) ─────────────────
     if (location.href !== currentUrl) {
@@ -1047,7 +1057,7 @@ const mo = new MutationObserver((mutations) => {
       unblockAllMedia();
       invalidateBlocklistCache();
       clearVideoIdCache();
-      
+
       // Debounced full page check on navigation
       clearTimeout(scanTimeout);
       scanTimeout = setTimeout(() => scanThumbnails(null), 300);
@@ -1072,8 +1082,8 @@ window.addEventListener("load", () => {
   console.log("[BlocklistGuard] load event fired, running final check...");
   (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })();
 });
-setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })(), 1500);
-setTimeout(() => (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })(), 3500);
+setTimeout(() => { if (!window.__captureInProgress) (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })(); }, 1500);
+setTimeout(() => { if (!window.__captureInProgress) (async () => { try { await checkVideoIdOnPage(); } catch (e) { } })(); }, 3500);
 
 function getPlatform() {
   const h = location.hostname;
@@ -1137,19 +1147,31 @@ function buildYouTubeCanonicalUrl(videoId, context) {
   return `https://www.youtube.com/watch?v=${videoId}`;
 }
 
+function getSafeVideo() {
+  const videos = document.querySelectorAll("video");
+  let best = null;
+  let maxArea = 0;
+
+  videos.forEach(v => {
+    const rect = v.getBoundingClientRect();
+    const area = rect.width * rect.height;
+
+    if (
+      area > maxArea &&
+      rect.width > 200 &&
+      rect.height > 150 &&
+      v.readyState >= 2
+    ) {
+      best = v;
+      maxArea = area;
+    }
+  });
+
+  return best;
+}
+
 function getBestVideoElementForRect() {
-  const shortsActive =
-    document.querySelector('ytd-reel-video-renderer[is-active] video') ||
-    document.querySelector('ytd-reel-video-renderer[is-active]')?.querySelector("video");
-  if (shortsActive) return shortsActive;
-
-  const main = document.querySelector("video.html5-main-video");
-  if (main) return main;
-
-  const vids = Array.from(document.querySelectorAll("video"))
-    .filter(v => v.offsetParent !== null);
-  vids.sort((a, b) => (b.videoWidth * b.videoHeight) - (a.videoWidth * a.videoHeight));
-  return vids[0] || null;
+  return getSafeVideo();
 }
 
 /**
@@ -1161,21 +1183,29 @@ function getBestVideoElementForRect() {
 function findVideoElementForCapture(lockedVideoId) {
   const isShorts = location.pathname.includes('/shorts/');
 
+  console.log("[Capture DEBUG] Attempting to lock video:", { lockedVideoId });
+
   if (isShorts) {
     // Primary: the active reel renderer's <video>
     const active =
       document.querySelector('ytd-reel-video-renderer[is-active] video') ||
       document.querySelector('ytd-reel-video-renderer[is-active]')?.querySelector('video');
     if (active) return active;
-
-    // Fallback: any Shorts video visible on screen
-    const any = document.querySelector('ytd-reel-video-renderer video');
-    if (any) return any;
   }
 
-  // Standard watch page or any other context
-  return getBestVideoElementForRect() || getMainVideoEl();
+  // Prefer the real main YouTube player on watch pages
+  const main =
+    document.querySelector("#movie_player video.html5-main-video") ||
+    document.querySelector(".html5-video-player video") ||
+    document.querySelector("video.html5-main-video");
+
+  if (main && main.readyState >= 2 && main.videoWidth > 0 && main.videoHeight > 0) {
+    return main;
+  }
+
+  return getSafeVideo();
 }
+
 
 function getTikTokVideoId() {
   const m = location.href.match(/\/video\/(\d+)/);
@@ -1270,34 +1300,44 @@ async function safePlayMuted(v) {
   }
 }
 
-async function waitForVideoReady(timeoutMs = 12000, lockedVideoId = null) {
+async function waitForVideoReady(video = null, timeoutMs = 12000, lockedVideoId = null) {
   const start = Date.now();
 
   while (Date.now() - start < timeoutMs) {
-    const v = findVideoElementForCapture(lockedVideoId) || getMainVideoEl();
+    let v = null;
+
+    if (
+      video &&
+      video.isConnected &&
+      video.readyState >= 2 &&
+      video.videoWidth > 0 &&
+      video.videoHeight > 0
+    ) {
+      v = video;
+    } else {
+      v = findVideoElementForCapture(lockedVideoId) || getMainVideoEl();
+    }
 
     if (v) {
-      const hasMetadata = v.videoWidth > 0 && v.videoHeight > 0;
-      const hasFrameData = v.readyState >= 2;
-
-      // For Shorts, metadata may appear a bit earlier than full "ready"
-      if (hasMetadata) {
-        await waitForPresentedVideoFrame(v, 800);
+      if (v.videoWidth > 0 && v.videoHeight > 0) {
+        try {
+          await waitForPresentedVideoFrame(v, 800);
+        } catch {
+          await wait(100);
+        }
 
         if (v.videoWidth > 0 && v.videoHeight > 0 && v.readyState >= 2) {
           return {
             ok: true,
             ready: true,
+            video: v,
             w: v.videoWidth,
             h: v.videoHeight,
             ts: Number(v.currentTime || 0)
           };
         }
       }
-
-      // Retry quickly for Shorts while the reel is attaching / activating
     }
-
     await wait(150);
   }
 
@@ -1354,6 +1394,46 @@ async function waitForPresentedVideoFrame(video, timeoutMs = 1200) {
   return true;
 }
 
+function frameStatsFromCanvas(canvas) {
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  if (!ctx || !canvas.width || !canvas.height) {
+    return { avgLuma: 0, nonBlackRatio: 0, isMostlyBlack: true };
+  }
+
+  // Sample a 64×64 center crop instead of the full frame.
+  // For 1920×1080 this cuts getImageData + pixel iteration cost by ~900×
+  // while remaining accurate enough to detect mostly-black frames.
+  const sw = Math.min(64, canvas.width);
+  const sh = Math.min(64, canvas.height);
+  const sx = Math.floor((canvas.width - sw) / 2);
+  const sy = Math.floor((canvas.height - sh) / 2);
+  const { data, width, height } = ctx.getImageData(sx, sy, sw, sh);
+
+  let totalLuma = 0;
+  let nonBlack = 0;
+  const pixelCount = width * height;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i];
+    const g = data[i + 1];
+    const b = data[i + 2];
+
+    const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    totalLuma += luma;
+
+    if (luma > 10) nonBlack += 1;
+  }
+
+  const avgLuma = pixelCount ? totalLuma / pixelCount : 0;
+  const nonBlackRatio = pixelCount ? nonBlack / pixelCount : 0;
+
+  return {
+    avgLuma,
+    nonBlackRatio,
+    isMostlyBlack: avgLuma < 8 || nonBlackRatio < 0.02
+  };
+}
+
 async function waitUntilNotMostlyBlack(video, canvas, ctx, timeoutMs = 2500, quality = 0.8) {
   const started = Date.now();
   let lastStats = null;
@@ -1371,7 +1451,8 @@ async function waitUntilNotMostlyBlack(video, canvas, ctx, timeoutMs = 2500, qua
 
     try {
       ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    } catch {
+    } catch (err) {
+      console.warn("[Capture] drawImage failed:", err);
       await wait(120);
       continue;
     }
@@ -1380,16 +1461,19 @@ async function waitUntilNotMostlyBlack(video, canvas, ctx, timeoutMs = 2500, qua
     lastStats = stats;
 
     if (!stats.isMostlyBlack) {
+      const dataUrl = canvas.toDataURL("image/jpeg", quality);
+      console.log("[Capture] usable frame captured");
       return {
         ok: true,
         stats,
-        dataUrl: canvas.toDataURL("image/jpeg", quality)
+        dataUrl
       };
     }
 
     await waitForPresentedVideoFrame(video, 600);
   }
 
+  console.warn("[Capture] frame stayed mostly black until timeout", lastStats);
   return { ok: false, stats: lastStats };
 }
 
@@ -1397,12 +1481,28 @@ async function extractLiveFramesFromVideo(video, {
   frameCount = 8,
   intervalMs = 1000,
   quality = 0.8,
-  warmupMs = 350
+  warmupMs = 350,
+  lockedVideoId = null
 } = {}) {
   if (!video) return { ok: false, error: "no_video_element" };
 
-  const ready = await waitForVideoReady(12000);
+  const ready = await waitForVideoReady(video, 12000, lockedVideoId);
   if (!ready.ok) return { ok: false, error: ready.error || "not_ready" };
+
+  video = ready.video || video;
+
+  if (video.videoWidth === 0 || video.videoHeight === 0) {
+    console.error("[Capture] Invalid video element: zero dimension");
+    return { ok: false, error: "invalid_video" };
+  }
+
+  console.log("[Capture] video ready:", {
+    width: video.videoWidth,
+    height: video.videoHeight,
+    currentTime: video.currentTime,
+    frameCount,
+    intervalMs
+  });
 
   const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth || 640;
@@ -1414,15 +1514,23 @@ async function extractLiveFramesFromVideo(video, {
   const tsMs = [];
   const perFrame = [];
   let blankCount = 0;
+  const MAX_CONSECUTIVE_BLANKS = 4;
+  let consecutiveBlankCount = 0;
 
   await wait(Math.max(0, Number(warmupMs || 0)));
-  await waitForPresentedVideoFrame(video, 1200);
+
+  try {
+    await waitForPresentedVideoFrame(video, 1200);
+  } catch {
+    await wait(100);
+  }
 
   for (let i = 0; i < frameCount; i++) {
-    const capture = await waitUntilNotMostlyBlack(video, canvas, ctx, 2200, quality);
+    const capture = await waitUntilNotMostlyBlack(video, canvas, ctx, 180, quality);
     const currentTsMs = Math.round(Number(video.currentTime || 0) * 1000);
 
     if (capture.ok) {
+      consecutiveBlankCount = 0;
       frames.push(capture.dataUrl);
       tsMs.push(currentTsMs);
       perFrame.push({
@@ -1432,7 +1540,17 @@ async function extractLiveFramesFromVideo(video, {
         avgLuma: capture.stats.avgLuma,
         nonBlackRatio: capture.stats.nonBlackRatio
       });
+
+      console.log(`[Capture] frame ${i} captured at ${currentTsMs}ms`);
     } else {
+
+      consecutiveBlankCount += 1;
+
+      if (consecutiveBlankCount >= MAX_CONSECUTIVE_BLANKS) {
+        console.warn("[Capture] Early stop: too many consecutive blank frames");
+        break;
+      }
+
       blankCount += 1;
       perFrame.push({
         idx: i,
@@ -1442,32 +1560,35 @@ async function extractLiveFramesFromVideo(video, {
         avgLuma: capture.stats?.avgLuma ?? 0,
         nonBlackRatio: capture.stats?.nonBlackRatio ?? 0
       });
+
+      console.warn(`[Capture] frame ${i} blank/failed`);
     }
 
     if (i < frameCount - 1) {
-      const loopStart = Date.now();
-      while (Date.now() - loopStart < intervalMs) {
-        await waitForPresentedVideoFrame(video, Math.min(600, intervalMs));
-      }
+      await wait(intervalMs);
     }
   }
+
+  console.log("[Capture] extraction done:", {
+    requested: frameCount,
+    captured: frames.length,
+    blankCount,
+    elapsedMs: Date.now() - startedAt
+  });
 
   return {
     ok: frames.length > 0,
     frames,
     tsMs,
-    w: canvas.width,
-    h: canvas.height,
+    w: video.videoWidth,
+    h: video.videoHeight,
     debug: {
-      extractedCount: frames.length,
-      blankCount,
       totalRequested: frameCount,
-      perFrame,
-      source: "dom_canvas_live",
-      nonBlocking: true,
-      elapsedMs: Date.now() - startedAt
-    },
-    error: frames.length > 0 ? null : "all_frames_blank_or_failed"
+      capturedCount: frames.length,
+      blankCount,
+      elapsedMs: Date.now() - startedAt,
+      perFrame
+    }
   };
 }
 
@@ -1484,12 +1605,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const origSendResponse = sendResponse;
       sendResponse = safeRes;
       if (msg?.type === "PING") {
-        sendResponse({ ok: true });
-        return;
+        sendResponse({ ok: true, ready: true, url: location.href });
+        return true;
       }
 
       if (msg?.type === "WAIT_UNTIL_READY") {
         const res = await waitForVideoReady(
+          null,
           Number(msg.timeoutMs || 12000),
           msg.lockedVideoId || null
         );
@@ -1498,37 +1620,63 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       if (msg?.type === "PREP_CAPTURE") {
-        const res = await waitForVideoReady(12000, msg.lockedVideoId || null);
+        // Use a 3 s limit: Chrome extension message channels time out around 5 s,
+        // so 12 000 ms caused silent channel drops when the video wasn't ready yet.
+        // EXTRACT_FRAMES_LIVE's internal waitForVideoReady handles any remaining
+        // wait, so a short PREP_CAPTURE timeout is safe.
+        const res = await waitForVideoReady(
+          null,
+          3000,
+          msg.lockedVideoId || null
+        );
         sendResponse(res.ok ? { ok: true, ...res } : res);
         return;
       }
 
       if (msg?.type === "EXTRACT_FRAMES_LIVE") {
-        const v = findVideoElementForCapture(msg.lockedVideoId);
-        if (!v) {
-          sendResponse({ ok: false, error: "no_video_element" });
-          return;
-        }
-
-        const frameCount = Number(msg.frameCount || 8);
-        const intervalMs = Number(msg.intervalMs || 1000);
-        const quality = Number(msg.quality || 0.8);
-        const warmupMs = Number(msg.warmupMs || 350);
-
         window.__captureInProgress = true;
-        console.log("[Capture] START - blocking suspended");
+        stopObserver();
+        console.log("[Capture] START - blocking + scanning suspended");
 
-        const out = await extractLiveFramesFromVideo(v, {
-          frameCount,
-          intervalMs: Math.max(250, intervalMs),
-          quality,
-          warmupMs
-        });
-        sendResponse(out);
-        window.__captureInProgress = false;
-        console.log("[Capture] END - blocking resumed");
+        try {
+          const v = findVideoElementForCapture(msg.lockedVideoId);
+          if (!v) {
+            sendResponse({ ok: false, error: "no_video_element" });
+            return;
+          }
 
-        return;
+          const frameCount = Number(msg.frameCount || 8);
+          const intervalMs = Number(msg.intervalMs || 1000);
+          const quality = Number(msg.quality || 0.8);
+          const warmupMs = Number(msg.warmupMs || 350);
+
+          console.log("[Capture] Using video:", {
+            readyState: v.readyState,
+            w: v.videoWidth,
+            h: v.videoHeight,
+            currentTime: v.currentTime
+          });
+
+          const out = await extractLiveFramesFromVideo(v, {
+            frameCount,
+            intervalMs: Math.max(90, intervalMs),
+            quality,
+            warmupMs,
+            lockedVideoId: msg.lockedVideoId || null
+          });
+
+          console.log("[Capture] Result:", out?.ok, out?.error, out?.debug);
+          sendResponse(out);
+          return;
+        } catch (err) {
+          console.error("[Capture] EXTRACT_FRAMES_LIVE failed:", err);
+          sendResponse({ ok: false, error: err?.message || "extract_failed" });
+          return;
+        } finally {
+          window.__captureInProgress = false;
+          startObserver();
+          console.log("[Capture] END - blocking + scanning resumed");
+        }
       }
 
       if (msg?.type === "SET_MONITORING") {
@@ -1536,6 +1684,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         await chrome.storage.local.set({ monitoringEnabled });
         if (monitoringEnabled) startObserver();
         else stopObserver();
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (msg?.type === "SUSPEND_SCANNING_FOR_CAPTURE") {
+        window.__captureInProgress = true;
+        stopObserver();
+        sendResponse({ ok: true });
+        return;
+      }
+
+      if (msg?.type === "RESUME_SCANNING_AFTER_CAPTURE") {
+        window.__captureInProgress = false;
+        startObserver();
         sendResponse({ ok: true });
         return;
       }
@@ -1548,7 +1710,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       if (msg?.type === "GET_VIDEO_RECT") {
-        const v = getBestVideoElementForRect();
+        const v = findVideoElementForCapture(msg.lockedVideoId || null) || getBestVideoElementForRect();
         if (!v) {
           sendResponse({ ok: false, error: "no_video_element" });
           return;
@@ -1652,6 +1814,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   await loadMonitoringFlag();
   startObserver();
   scanExisting();
-  setTimeout(() => scanExisting(), 1000);
-  setTimeout(() => scanExisting(), 2500);
+  setTimeout(() => { if (!window.__captureInProgress) scanExisting(); }, 1000);
+  setTimeout(() => { if (!window.__captureInProgress) scanExisting(); }, 2500);
 })();

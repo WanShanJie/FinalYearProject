@@ -151,7 +151,7 @@ async function refreshUI() {
     setConnectionVisual("connected", `Linked as ${st.linkedUser.email}`);
     btnDisconnectPortal.disabled = false;
     btnAnalyzeNow.disabled = false;
-    
+
     if (st.lastAnalysisId) {
       updateResultUI(st.lastAnalysisVerdict, st.lastAnalysisScore, st.lastAnalysisMeta);
     } else {
@@ -210,11 +210,11 @@ function getDisplayMetrics(backendVerdict, rawScore) {
   const verdictConfig = window.VERDICT_CONFIG[mappedVerdict] || window.VERDICT_CONFIG.INCONCLUSIVE;
   const scoreConfig = window.VERDICT_CONFIG[scoreVerdict] || window.VERDICT_CONFIG.INCONCLUSIVE;
 
-  return { 
-    riskScore, 
+  return {
+    riskScore,
     displayVerdictKey: mappedVerdict,
-    displayVerdict: verdictConfig.label, 
-    riskLevel, 
+    displayVerdict: verdictConfig.label,
+    riskLevel,
     scoreColor: scoreConfig.color,
     scoreBg: scoreConfig.bg,
     verdictColor: verdictConfig.color,
@@ -247,7 +247,7 @@ function updateResultUI(verdictRaw, rawScore, meta) {
   resVerdictBadge.style.color = metrics.verdictColor;
   resVerdictBadge.style.backgroundColor = metrics.verdictBg;
   resVerdictBadge.style.border = `1px solid ${metrics.verdictColor}`;
-  
+
   resRiskBadge.textContent = `${metrics.riskLevel} · ${metrics.riskScore}%`;
   resRiskBadge.style.color = metrics.scoreColor;
 
@@ -255,7 +255,7 @@ function updateResultUI(verdictRaw, rawScore, meta) {
   const mediaType = (meta?.media_type || "Media").charAt(0).toUpperCase() + (meta?.media_type || "Media").slice(1);
   let platform = meta?.platform || "Unknown";
   let title = meta?.title || "Unknown detected media";
-  
+
   const rawSource = meta?.canonical_url || meta?.source_url || meta?.page_url || "";
   let readableSource = rawSource;
   if (rawSource) {
@@ -265,20 +265,20 @@ function updateResultUI(verdictRaw, rawScore, meta) {
       if (platform === "Unknown") {
         platform = u.hostname.replace(/^www\./, "").split(".")[0];
       }
-    } catch(e) {}
+    } catch (e) { }
   }
   if (!readableSource) readableSource = "Not available";
-  
+
   const videoId = meta?.video_id || meta?.current_video_id || meta?.locked_video_id;
 
   document.getElementById("idtMediaType").textContent = mediaType;
   document.getElementById("idtPlatform").textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
   document.getElementById("idtTitle").textContent = title;
   document.getElementById("idtTitle").title = title;
-  
+
   document.getElementById("idtSource").textContent = readableSource;
   document.getElementById("idtSource").title = rawSource;
-  
+
   const vIdRow = document.getElementById("idtVideoIdRow");
   if (videoId) {
     vIdRow.style.display = "flex";
@@ -416,17 +416,33 @@ btnAnalyzeNow.addEventListener("click", async () => {
   analyzeMsg.style.display = "block";
   analysisResultBlock.style.display = "none";
   analyzeMsg.textContent = "Capturing screen and sending to backend…";
-  const res = await chrome.runtime.sendMessage({ type: "CAPTURE_SCREEN_AND_SEND" });
-  if (res?.ok) {
-    await refreshUI();
-  } else {
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      throw new Error("No active tab.");
+    }
+
+    const streamId = await chrome.tabCapture.getMediaStreamId({
+      targetTabId: tab.id
+    });
+
+    const res = await chrome.runtime.sendMessage({
+      type: "CAPTURE_SCREEN_AND_SEND",
+      targetTabId: tab.id,
+      targetTabUrl: tab.url || "",
+      streamId
+    });
+
+    if (res?.ok) {
+      await refreshUI();
+    } else {
+      throw new Error(res?.detail || res?.error || "capture/send failed");
+    }
+  } catch (err) {
     analyzeMsg.style.display = "block";
     analysisResultBlock.style.display = "none";
-    analyzeMsg.textContent = `Failed: ${res?.detail || res?.error || "capture/send failed"}`;
-    if (String(res?.error || "").includes("401")) {
-      await setDisconnectedState("Portal link expired. Connect the extension again.");
-      await refreshUI();
-    }
+    analyzeMsg.textContent = `Failed: ${err?.message || err}`;
   }
 });
 
@@ -478,7 +494,7 @@ btnDisconnectPortal.addEventListener("click", async () => {
     await chrome.runtime.sendMessage({ type: "DISCONNECT_EXTENSION" });
   } catch { }
   await setDisconnectedState("Extension disconnected. Connect again to resume account-linked capture.");
-  
+
   analyzeMsg.style.display = "block";
   analysisResultBlock.style.display = "none";
   analyzeMsg.textContent = "Extension disconnected. Connect again to resume account-linked capture.";

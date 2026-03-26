@@ -18,8 +18,9 @@ const PORTAL_ANALYSIS_URL = `${FRONTEND_BASE}/media-analysis`;
 
 const FRAME_COUNT = 48;
 const CAPTURE_INTERVAL_MS = 100;
+const FALLBACK_CAPTURE_INTERVAL_MS = 300;
 const JPEG_QUALITY = 80;
-const READY_TIMEOUT_MS = 12000;
+const READY_TIMEOUT_MS = 2500;
 const BLANK_FALLBACK_THRESHOLD = 0.7;
 const OFFSCREEN_URL = "offscreen.html";
 
@@ -81,28 +82,57 @@ function buildCanonicalYouTubeUrl(videoId, contextHint = "watch") {
   return `https://www.youtube.com/watch?v=${videoId}`;
 }
 
-async function ensureContentScript(tabId) {
-  try {
-    await chrome.tabs.sendMessage(tabId, { type: "PING" });
-    return;
-  } catch { }
+async function ensureContentScript(tabId, retries = 1, delayMs = 100) {
+  // 1. Try to ping existing script
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await chrome.tabs.sendMessage(tabId, { type: "PING" });
+      if (res?.ok) return true;
+    } catch (e) { }
+    if (i < retries - 1) await sleep(delayMs);
+  }
 
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ["idb.js", "content.js"]
-  });
-  await sleep(350);
+  // 2. If no response, try manual injection
+  try {
+    console.log("[SW] Content script missing on tab", tabId, "- Injecting...");
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["idb.js", "content.js"]
+    }).catch(e => {
+        if (String(e.message || e).includes("context_invalidated")) return;
+        throw e;
+    });
+
+    await sleep(500); // Give time for script to initialize
+
+    try {
+      const res2 = await chrome.tabs.sendMessage(tabId, { type: "PING" });
+      return !!res2?.ok;
+    } catch (msgErr) {
+      // If injection worked but ping failed (e.g. channel closed), assume it's there
+      return true;
+    }
+  } catch (err) {
+    console.warn("[SW] Failed to inject content script:", err);
+    return false;
+  }
 }
 
 async function getPageMeta(tabId, tab) {
-  await ensureContentScript(tabId);
-  for (let i = 0; i < 10; i++) {
-    try {
-      const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_META" });
-      if (res?.ok && res?.meta) return res.meta;
-      if (res?.page_url && res?.platform) return res;
-    } catch { }
-    await sleep(200);
+  try {
+    const reachable = await ensureContentScript(tabId);
+    if (reachable) {
+      for (let i = 0; i < 3; i++) {
+        try {
+          const res = await chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_META" });
+          if (res?.ok && res?.meta) return res.meta;
+          if (res?.page_url && res?.platform) return res;
+        } catch { }
+        await sleep(150);
+      }
+    }
+  } catch (err) {
+    console.warn("[SW] getPageMeta failed to reach content script, using tab fallback:", err);
   }
 
   return {
@@ -123,26 +153,22 @@ async function getPageMeta(tabId, tab) {
 }
 
 async function waitUntilReady(tabId, lockedVideoId) {
-  await ensureContentScript(tabId);
+  // ensureContentScript was already called in getPageMeta — do not re-inject here.
+  // Re-injecting races the first injection's initialisation and can create two
+  // content-script instances with duplicate listeners.
   try {
-    await chrome.tabs.sendMessage(tabId, {
-      type: "PREP_CAPTURE",
-      lockedVideoId
-    });
+    await chrome.tabs.sendMessage(tabId, { type: "PREP_CAPTURE", lockedVideoId });
   } catch { }
 
-  const start = Date.now();
-  while (Date.now() - start < READY_TIMEOUT_MS) {
-    try {
-      const r = await chrome.tabs.sendMessage(tabId, {
-        type: "WAIT_UNTIL_READY",
-        timeoutMs: READY_TIMEOUT_MS,
-        lockedVideoId
-      });
-      if (r?.ok && r?.ready) return true;
-    } catch { }
-    await sleep(250);
-  }
+  // Single ready check — EXTRACT_FRAMES_LIVE has its own internal waitForVideoReady.
+  try {
+    const r = await chrome.tabs.sendMessage(tabId, {
+      type: "WAIT_UNTIL_READY",
+      timeoutMs: READY_TIMEOUT_MS,
+      lockedVideoId
+    });
+    if (r?.ok && r?.ready) return true;
+  } catch { }
   return false;
 }
 
@@ -160,6 +186,12 @@ async function postToBackend(meta, blobs) {
     fd.append("files", b, b.__filename || `frame_${String(i).padStart(3, "0")}.jpg`);
   }
 
+  console.log("[SW] Posting to backend:", {
+    url: `${API_BASE}/api/analysis/capture`,
+    fileCount: blobs.length,
+    meta
+  });
+
   const res = await fetch(`${API_BASE}/api/analysis/capture`, {
     method: "POST",
     headers: {
@@ -168,12 +200,17 @@ async function postToBackend(meta, blobs) {
     body: fd,
   });
 
+  console.log("[SW] Backend response status:", res.status);
+
   if (!res.ok) {
     const txt = await res.text().catch(() => "");
+    console.error("[SW] Backend upload failed:", txt);
     throw new Error(`HTTP ${res.status} ${txt}`.trim());
   }
 
-  return await res.json();
+  const json = await res.json();
+  console.log("[SW] Backend response JSON:", json);
+  return json;
 }
 
 async function ensureOffscreenDocument() {
@@ -192,18 +229,31 @@ async function ensureOffscreenDocument() {
   });
 }
 
-async function captureViaOffscreenTab(tabId, lockedRect) {
+async function captureViaOffscreenTab(tabId, rect = null, providedStreamId = null) {
   await ensureOffscreenDocument();
-  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
 
-  const response = await chrome.runtime.sendMessage({
-    type: "OFFSCREEN_CAPTURE_TAB",
-    streamId,
-    frameCount: FRAME_COUNT,
-    intervalMs: CAPTURE_INTERVAL_MS,
-    quality: JPEG_QUALITY / 100,
-    lockedRect
-  });
+  let streamId = providedStreamId;
+  if (!streamId) {
+    try {
+      streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+    } catch (e) {
+      throw new Error(`tab_capture_stream_id_failed: ${e?.message || e}`);
+    }
+  }
+
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({
+      type: "OFFSCREEN_CAPTURE_TAB",
+      streamId,
+      frameCount: FRAME_COUNT,
+      intervalMs: CAPTURE_INTERVAL_MS,
+      quality: JPEG_QUALITY / 100,
+      rect
+    });
+  } catch (e) {
+    throw new Error(`offscreen_message_failed: ${e?.message || e}`);
+  }
 
   if (!response?.ok) {
     throw new Error(response?.error || "offscreen_capture_failed");
@@ -220,7 +270,7 @@ async function captureViaOffscreenTab(tabId, lockedRect) {
     blobs,
     tsMs: response.tsMs || [],
     videoDimensions: response.videoDimensions || null,
-    debug: response.debug || { source: "tab_capture_offscreen", nonBlocking: true }
+    debug: response.debug || { source: "tab_capture_offscreen_locked", nonBlocking: true }
   };
 }
 
@@ -270,7 +320,7 @@ async function handleCaptureSuccess(out, meta) {
   try {
     await chrome.runtime.sendMessage({ type: "COUNTS_UPDATED" });
   } catch { }
-   // Keep local blocklist in sync after every successful high-risk scan
+  // Keep local blocklist in sync after every successful high-risk scan
   if (["FAKE", "SUSPICIOUS"].includes(String(out?.verdict || "").toUpperCase())) {
     setTimeout(() => {
       syncBlocklist().catch(() => { });
@@ -333,6 +383,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "blocklist_sync") {
     syncBlocklist().catch(() => { });
   }
+  // "capture_keepalive" is intentionally a no-op: firing the alarm wakes the
+  // service worker, preventing Chrome from killing it mid-capture.
 });
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -403,20 +455,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     isCapturing = true;
 
+    let tabId = 0;
+
     try {
-      const tab = await getActiveTab();
-      if (!tab?.id) {
-        sendResponse({ ok: false, error: "No active tab." });
+      tabId = Number(msg.targetTabId || 0);
+      if (!tabId) {
+        sendResponse({ ok: false, error: "Missing targetTabId." });
         return;
       }
 
-      const tabId = tab.id;
-      const tabUrlSnapshot = tab.url || "";
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (!tab?.id) {
+        sendResponse({ ok: false, error: "Target tab no longer exists." });
+        return;
+      }
+
+      const tabUrlSnapshot = msg.targetTabUrl || tab.url || "";
+      const providedStreamId = msg.streamId || null;
+
+      // First suspension attempt: catches content scripts that are already running.
+      await chrome.tabs.sendMessage(tabId, { type: "SUSPEND_SCANNING_FOR_CAPTURE" }).catch(() => { });
+
+      // Keep the service worker alive for the full capture + upload sequence.
+      // Chrome MV3 SWs can be killed during long async operations; a periodic
+      // alarm prevents that without interfering with any other logic.
+      chrome.alarms.create("capture_keepalive", { periodInMinutes: 0.4 }).catch(() => { });
+
+      // getPageMeta may inject content.js if it isn't running yet. A freshly
+      // injected script initialises with __captureInProgress = false, so we
+      // must re-suspend immediately after getPageMeta returns.
       const meta0 = await getPageMeta(tabId, tab);
+      await chrome.tabs.sendMessage(tabId, { type: "SUSPEND_SCANNING_FOR_CAPTURE" }).catch(() => { });
       const yt = meta0.platform === "youtube" || isYouTubeUrl(tabUrlSnapshot);
 
       if (!yt) {
-        sendResponse({ ok: false, error: "This non-blocking analyzer is currently optimized for video pages." });
+        sendResponse({ ok: false, error: "This analyzer is optimized for YouTube and supported video platforms." });
         return;
       }
 
@@ -427,7 +500,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         null;
 
       if (!lockedVideoId) {
-        sendResponse({ ok: false, error: "Could not determine YouTube video_id to lock." });
+        sendResponse({ ok: false, error: "Could not determine YouTube video_id." });
         return;
       }
 
@@ -435,20 +508,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const canonicalUrlRaw = meta0.canonical_url || buildCanonicalYouTubeUrl(lockedVideoId, contextHint);
 
       const ready = await waitUntilReady(tabId, lockedVideoId);
-      if (!ready) {
-        console.warn("[Capture] Preflight ready check failed; trying live extraction anyway.", {
-          lockedVideoId,
-          url: tabUrlSnapshot
-        });
-      }
 
-      const nativeRes = await chrome.tabs.sendMessage(tabId, {
+      // --- PRIMARY EXTRACTION: NATIVE DOM CANVAS (FAST) ---
+      let nativeRes = await chrome.tabs.sendMessage(tabId, {
         type: "EXTRACT_FRAMES_LIVE",
         frameCount: FRAME_COUNT,
         intervalMs: CAPTURE_INTERVAL_MS,
         quality: JPEG_QUALITY / 100,
-        warmupMs: 350,
-        lockedVideoId,          // content.js uses this to lock onto the right reel element
+        warmupMs: 300,
+        lockedVideoId
       }).catch(() => null);
 
       let blobs = [];
@@ -461,11 +529,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         ? ((nativeRes.debug.blankCount || 0) / nativeRes.debug.totalRequested)
         : 1;
 
-      const shouldFallback =
-        !nativeRes?.ok ||
-        !Array.isArray(nativeRes.frames) ||
-        nativeRes.frames.length === 0 ||
-        nativeBlankRatio >= BLANK_FALLBACK_THRESHOLD;
+      const shouldFallback = !nativeRes?.ok || !Array.isArray(nativeRes.frames) || nativeRes.frames.length === 0 || nativeBlankRatio >= BLANK_FALLBACK_THRESHOLD;
 
       if (!shouldFallback) {
         for (let i = 0; i < nativeRes.frames.length; i++) {
@@ -475,20 +539,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         tsMs = nativeRes.tsMs || [];
       } else {
-        // YouTube: NEVER fall back to tabCapture.
-        // tabCapture hijacks the tab's audio pipeline at the OS level.
-        // Even with loopback, stopping the stream disconnects YouTube's Web Audio
-        // graph permanently — the user must reload the page to get sound back.
-        // The native canvas path already works and never touches audio.
-        sendResponse({
-          ok: false,
-          error: "live_capture_insufficient_frames",
-          detail: contextHint === "shorts"
-            ? "Shorts target was found, but not enough usable frames were produced. Try again after the reel has visibly started rendering."
-            : `Native capture got ${nativeRes?.frames?.length ?? 0} usable frames (blank ratio: ${nativeBlankRatio.toFixed(2)}).`,
-          capture_debug: nativeRes?.debug || null,
-        });
-        return;
+        // --- SECONDARY EXTRACTION: OFFSCREEN TAB CAPTURE (BACKGROUND STABLE) ---
+        console.warn("[SW] Native capture failed/blank. Using offscreen fallback.", { nativeBlankRatio });
+
+        let lockedRect = null;
+        const offscreenRes = await captureViaOffscreenTab(tabId, lockedRect, providedStreamId);
+
+        blobs = offscreenRes.blobs || [];
+        tsMs = offscreenRes.tsMs || [];
+        videoDimensions = offscreenRes.videoDimensions || videoDimensions;
+        captureMethod = "tab_capture_offscreen_locked";
+        captureDebug = {
+          source: "tab_capture_offscreen_fallback",
+          native_error: nativeRes?.error || "unknown",
+          native_blank_ratio: nativeBlankRatio,
+          offscreen_debug: offscreenRes?.debug || null
+        };
       }
 
       const meta = {
@@ -502,20 +568,35 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         extension_version: chrome.runtime.getManifest().version,
         capture_mode: "multi_frame",
         capture_method: captureMethod,
-        capture_debug: captureDebug,
+        capture_debug: {
+          ...captureDebug,
+          native_debug: captureDebug?.native_debug ? { ...captureDebug.native_debug, perFrame: undefined } : undefined,
+          perFrame: undefined
+        },
         frame_count: blobs.length,
         frame_interval_ms: CAPTURE_INTERVAL_MS,
         frame_timestamps_ms: tsMs,
         video_dimensions: videoDimensions
       };
 
-      const out = await postToBackend(meta, blobs);
-      await handleCaptureSuccess(out, meta);
-      sendResponse({ ok: true, ...out, capture_method: captureMethod, analysis_meta: meta });
+      try {
+        const out = await postToBackend(meta, blobs);
+        await handleCaptureSuccess(out, meta);
+        sendResponse({ ok: true, ...out, capture_method: captureMethod, analysis_meta: meta });
+      } catch (postErr) {
+        console.error("[SW] Upload/Response failed:", postErr);
+        sendResponse({ ok: false, error: String(postErr?.message || postErr) });
+      }
+
     } catch (e) {
+      console.error("[SW] CAPTURE_SCREEN_AND_SEND critical failure:", e);
       sendResponse({ ok: false, error: String(e?.message || e) });
     } finally {
       isCapturing = false;
+      chrome.alarms.clear("capture_keepalive").catch(() => { });
+      if (tabId) {
+        await chrome.tabs.sendMessage(tabId, { type: "RESUME_SCANNING_AFTER_CAPTURE" }).catch(() => { });
+      }
     }
   })();
 
