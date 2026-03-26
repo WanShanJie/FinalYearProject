@@ -450,24 +450,28 @@ async function extractLiveFramesFromVideo(video, {
 } = {}) {
   if (!video) return { ok: false, error: "no_video_element" };
 
+  // Enforce 250ms minimum so the video decoder has time to advance between frames.
+  // At 100ms consecutive captures often share the same currentTime; the opencv
+  // pipeline's duplicate-frame filter discards them and the quality gate fails.
+  intervalMs = Math.max(250, intervalMs);
+
+  // Wait for the video to be ready, but do NOT replace the locked video element.
+  // The original working code keeps the element that was locked at message-receive
+  // time — replacing it with whatever waitForVideoReady finds can produce the wrong
+  // element (e.g. a different size or a Shorts reel that's not the active one).
   const ready = await waitForVideoReady(12000, lockedVideoId);
   if (!ready.ok) return { ok: false, error: ready.error || "not_ready" };
-  video = ready.video || video;
-
-  if (video.videoWidth === 0 || video.videoHeight === 0) return { ok: false, error: "invalid_video" };
-
-  console.log("[Capture] video ready:", { w: video.videoWidth, h: video.videoHeight, frameCount, intervalMs });
 
   const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 360;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
   const startedAt = Date.now();
   const frames = [], tsMs = [], perFrame = [];
   let blankCount = 0;
 
-  await wait(Math.max(0, warmupMs));
+  await wait(Math.max(0, Number(warmupMs || 0)));
   await waitForPresentedVideoFrame(video, 1200);
 
   for (let i = 0; i < frameCount; i++) {
@@ -477,24 +481,49 @@ async function extractLiveFramesFromVideo(video, {
     if (capture.ok) {
       frames.push(capture.dataUrl);
       tsMs.push(currentTsMs);
-      perFrame.push({ idx: i, tsMs: currentTsMs, ok: true });
+      perFrame.push({
+        idx: i, tsMs: currentTsMs, ok: true,
+        avgLuma: capture.stats.avgLuma,
+        nonBlackRatio: capture.stats.nonBlackRatio,
+      });
       console.log(`[Capture] frame ${i} at ${currentTsMs}ms`);
     } else {
       blankCount++;
-      perFrame.push({ idx: i, tsMs: currentTsMs, ok: false, reason: "blank" });
+      perFrame.push({
+        idx: i, tsMs: currentTsMs, ok: false, reason: "blank_frame",
+        avgLuma: capture.stats?.avgLuma ?? 0,
+        nonBlackRatio: capture.stats?.nonBlackRatio ?? 0,
+      });
       console.warn(`[Capture] frame ${i} blank`);
     }
 
-    if (i < frameCount - 1) await wait(intervalMs);
+    if (i < frameCount - 1) {
+      // Wait for a genuinely new decoded frame — not a fixed timer.
+      const loopStart = Date.now();
+      while (Date.now() - loopStart < intervalMs) {
+        await waitForPresentedVideoFrame(video, Math.min(600, intervalMs));
+      }
+    }
   }
 
-  console.log("[Capture] extraction done:", { requested: frameCount, captured: frames.length, blankCount, elapsedMs: Date.now() - startedAt });
+  console.log("[Capture] extraction done:", {
+    requested: frameCount, captured: frames.length, blankCount,
+    elapsedMs: Date.now() - startedAt,
+  });
 
   return {
     ok: frames.length > 0, frames, tsMs,
     w: canvas.width, h: canvas.height,
-    debug: { totalRequested: frameCount, capturedCount: frames.length, blankCount, elapsedMs: Date.now() - startedAt, perFrame },
-    error: frames.length > 0 ? null : "all_frames_blank",
+    debug: {
+      extractedCount: frames.length,
+      blankCount,
+      totalRequested: frameCount,
+      perFrame,
+      source: "dom_canvas_live",
+      nonBlocking: true,
+      elapsedMs: Date.now() - startedAt,
+    },
+    error: frames.length > 0 ? null : "all_frames_blank_or_failed",
   };
 }
 
