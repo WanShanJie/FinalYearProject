@@ -33,6 +33,7 @@ import os as _os
 _os.environ.setdefault("PYTHONUTF8", "1")
 from scripts import altfreezing_service
 from scripts.altfreezing_config import SEQUENCE_LENGTH as ALT_ANALYSIS_SEQUENCE_LENGTH
+from scripts import wav2lip_service
 
 # Create tables (dev). For production, use Alembic migrations.
 Base.metadata.create_all(bind=engine)
@@ -1486,6 +1487,340 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
         evidence_quality=evidence_quality,
         evidence_strength=evidence_strength,
     )
+
+def _combine_verdicts(visual_decision: dict, wav2lip_result: dict) -> dict:
+    """
+    Merge AltFreezing visual verdict with Wav2Lip audio-visual sync result.
+
+    Rules (in priority order):
+      1.  Wav2Lip unavailable / low-confidence → keep visual verdict unchanged
+      2.  Visual FAKE  + sync out_of_sync      → FAKE   (both agree)
+      3.  Visual FAKE  + sync synced           → SUSPICIOUS (conflicting)
+      4.  Visual REAL  + sync out_of_sync      → SUSPICIOUS (audio mismatch)
+      5.  Visual REAL  + sync synced/uncertain → REAL   (keeps visual verdict)
+      6.  Visual SUSPICIOUS                   → SUSPICIOUS (sync as support)
+      7.  Visual INCONCLUSIVE + sync out_of_sync → SUSPICIOUS
+      8.  Visual INCONCLUSIVE + sync synced   → REAL (audio evidence)
+      9.  Fallback                            → keep visual verdict
+    """
+    visual_verdict = visual_decision.get("final_verdict", "INCONCLUSIVE")
+    sync_ok        = wav2lip_result.get("ok", False)
+    sync_score     = wav2lip_result.get("sync_score")
+    sync_interp    = wav2lip_result.get("interpretation", "unavailable")
+    sync_conf      = wav2lip_result.get("confidence", "low")
+
+    # Rule 1: Skip if wav2lip unavailable or confidence too low
+    if not sync_ok or sync_score is None or sync_conf == "low":
+        return {**visual_decision, "wav2lip_applied": False, "combined_reason": "wav2lip_skipped"}
+
+    out_of_sync = sync_interp == "out_of_sync"   # sync_score < 0.38
+    synced      = sync_interp == "synced"         # sync_score > 0.65
+
+    if visual_verdict == "FAKE":
+        if out_of_sync:
+            return {**visual_decision, "final_verdict": "FAKE",
+                    "wav2lip_applied": True,
+                    "combined_reason": "visual_fake_confirmed_by_audio_desync"}
+        elif synced:
+            return {**visual_decision, "final_verdict": "SUSPICIOUS",
+                    "confidence": "medium",
+                    "wav2lip_applied": True,
+                    "combined_reason": "visual_fake_but_audio_synced_conflicting"}
+        else:
+            return {**visual_decision, "final_verdict": "SUSPICIOUS",
+                    "confidence": "medium",
+                    "wav2lip_applied": True,
+                    "combined_reason": "visual_fake_audio_uncertain"}
+
+    if visual_verdict == "REAL":
+        if out_of_sync:
+            return {**visual_decision, "final_verdict": "SUSPICIOUS",
+                    "confidence": "medium",
+                    "wav2lip_applied": True,
+                    "combined_reason": "visual_real_but_audio_desync_detected"}
+        else:
+            return {**visual_decision, "wav2lip_applied": True,
+                    "combined_reason": "visual_real_audio_confirms"}
+
+    if visual_verdict == "SUSPICIOUS":
+        if out_of_sync:
+            return {**visual_decision, "final_verdict": "SUSPICIOUS",
+                    "confidence": "medium",
+                    "wav2lip_applied": True,
+                    "combined_reason": "suspicious_confirmed_by_audio_desync"}
+        else:
+            return {**visual_decision, "wav2lip_applied": True,
+                    "combined_reason": "suspicious_audio_not_conclusive"}
+
+    if visual_verdict == "INCONCLUSIVE":
+        if out_of_sync:
+            return {**visual_decision, "final_verdict": "SUSPICIOUS",
+                    "confidence": "low",
+                    "wav2lip_applied": True,
+                    "combined_reason": "inconclusive_visual_audio_desync_suggests_fake"}
+        elif synced:
+            return {**visual_decision, "final_verdict": "REAL",
+                    "confidence": "low",
+                    "wav2lip_applied": True,
+                    "combined_reason": "inconclusive_visual_audio_synced_suggests_real"}
+
+    return {**visual_decision, "wav2lip_applied": True,
+            "combined_reason": "no_combination_rule_matched"}
+
+
+@app.post("/api/analysis/video")
+async def video_analysis(
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    platform: Optional[str] = Form(None),
+    page_url: Optional[str] = Form(None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Accept a video file upload, run AltFreezing (visual) + Wav2Lip (audio-visual
+    sync) and return a combined deepfake verdict.
+    """
+    upload_dir = Path(__file__).resolve().parent / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── Save uploaded video to a temp file ────────────────────────────────────
+    suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
+    import tempfile as _tempfile
+    with _tempfile.NamedTemporaryFile(
+        dir=str(upload_dir), suffix=suffix, delete=False
+    ) as tmp:
+        video_tmp_path = tmp.name
+        tmp.write(await file.read())
+
+    meta_data: dict = {
+        "capture_mode": "video_upload",
+        "filename": file.filename,
+        "platform": platform,
+        "page_url": page_url,
+        "title": title,
+    }
+
+    analysis = MediaAnalysis(
+        user_id=current_user.id,
+        platform=platform,
+        page_url=page_url,
+        title=title,
+        capture_mode="video_upload",
+        meta=meta_data,
+        verdict="PENDING",
+        score=0.0,
+    )
+    db.add(analysis)
+    db.commit()
+    db.refresh(analysis)
+
+    try:
+        # ── Extract frames from video as JPEG bytes ────────────────────────────
+        import cv2 as _cv2
+        cap = _cv2.VideoCapture(video_tmp_path)
+        src_fps = cap.get(_cv2.CAP_PROP_FPS) or 25.0
+        from scripts.wav2lip_config import WAV2LIP_FPS as _TARGET_FPS
+        step = max(1, int(src_fps / _TARGET_FPS))
+        frames_for_cv = []
+        idx = 0
+        while cap.isOpened():
+            cap.set(_cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok:
+                break
+            ret, buf = _cv2.imencode(".jpg", frame, [_cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ret:
+                frames_for_cv.append((f"frame_{idx:06d}.jpg", bytes(buf)))
+            idx += step
+        cap.release()
+
+        if not frames_for_cv:
+            raise ValueError("no_frames_extracted_from_video")
+
+        # ── opencv_pipeline: face detection + quality gating ──────────────────
+        opencv_summary = process_frames_for_sequence(
+            analysis_id=analysis.id,
+            frames=frames_for_cv,
+            uploads_dir=str(upload_dir),
+            sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
+            save_crops=True,
+        )
+
+        per_frame   = opencv_summary.get("per_frame", []) if isinstance(opencv_summary, dict) else []
+        total_frames  = int(opencv_summary.get("frames_total", 0) or 0)
+        frames_with_face = int(opencv_summary.get("frames_with_face", 0) or 0)
+        seq_frames    = int(opencv_summary.get("sequence_frames_used", 0) or 0)
+
+        reject_reasons: dict = {}
+        blur_used:   list = []
+        bright_used: list = []
+        for pf in per_frame:
+            if not isinstance(pf, dict):
+                continue
+            if pf.get("used") is True:
+                if pf.get("blur_var") is not None:
+                    blur_used.append(float(pf["blur_var"]))
+                if pf.get("brightness") is not None:
+                    bright_used.append(float(pf["brightness"]))
+            else:
+                r = pf.get("reason") or "unknown"
+                reject_reasons[r] = reject_reasons.get(r, 0) + 1
+
+        avg_blur       = sum(blur_used) / len(blur_used) if blur_used else 0.0
+        avg_brightness = sum(bright_used) / len(bright_used) if bright_used else 0.0
+        usable_ratio   = (seq_frames / total_frames) if total_frames else 0.0
+
+        MIN_SEQUENCE_FRAMES = 6
+        MIN_USABLE_RATIO    = 0.10
+        MIN_AVG_BLUR        = 2.0
+        MIN_AVG_BRIGHTNESS  = 15.0
+
+        quality_pass = True
+        quality_fail_reasons = []
+        if seq_frames < MIN_SEQUENCE_FRAMES:
+            quality_pass = False
+            quality_fail_reasons.append(f"too_few_sequence_frames:{seq_frames}")
+        if usable_ratio < MIN_USABLE_RATIO:
+            quality_pass = False
+            quality_fail_reasons.append(f"usable_ratio_too_low:{usable_ratio:.2f}")
+        if avg_blur < MIN_AVG_BLUR:
+            quality_pass = False
+            quality_fail_reasons.append(f"avg_blur_too_low:{avg_blur:.2f}")
+        if avg_brightness < MIN_AVG_BRIGHTNESS:
+            quality_pass = False
+            quality_fail_reasons.append(f"avg_brightness_too_low:{avg_brightness:.2f}")
+
+        meta_data["opencv"] = opencv_summary
+        track_summary    = opencv_summary.get("track_summary", {}) if isinstance(opencv_summary, dict) else {}
+        stability_meta   = opencv_summary.get("stability", {}) if isinstance(opencv_summary, dict) else {}
+        track_gap_count  = int(track_summary.get("gap_count", 0) or 0)
+        geometry_rejected_count = sum(
+            v for k, v in reject_reasons.items()
+            if isinstance(k, str) and "geometry_rejected" in k
+        )
+        quality_gate = {
+            "pass":                   quality_pass,
+            "fail_reasons":           quality_fail_reasons,
+            "frames_total":           total_frames,
+            "frames_with_face":       frames_with_face,
+            "sequence_frames_used":   seq_frames,
+            "usable_ratio":           usable_ratio,
+            "avg_blur":               avg_blur,
+            "avg_brightness":         avg_brightness,
+            "reject_reasons":         reject_reasons,
+            "track_gap_count":        track_gap_count,
+            "geometry_rejected_count": geometry_rejected_count,
+            "sequence_stable":        stability_meta.get("stable", True),
+            "thresholds": {
+                "MIN_SEQUENCE_FRAMES": MIN_SEQUENCE_FRAMES,
+                "MIN_USABLE_RATIO":    MIN_USABLE_RATIO,
+                "MIN_AVG_BLUR":        MIN_AVG_BLUR,
+                "MIN_AVG_BRIGHTNESS":  MIN_AVG_BRIGHTNESS,
+            },
+        }
+        meta_data["quality_gate"] = quality_gate
+
+        # ── AltFreezing visual verdict ─────────────────────────────────────────
+        if not quality_pass:
+            alt_result = {
+                "ok": False, "error": "quality_gate_failed",
+                "video_score": None, "frames_used": seq_frames,
+                "sequence_length": opencv_summary.get("sequence_length", 16), "per_frame": [],
+            }
+        else:
+            alt_result = altfreezing_service.predict_from_sequence(
+                analysis_id=analysis.id,
+                uploads_dir=upload_dir,
+                sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
+                weights_path="checkpoints/model.pth",
+            )
+
+        alt_score = alt_result.get("video_score")
+        visual_decision = _decide_altfreezing_verdict(alt_score, quality_gate, alt_result)
+
+        # ── Wav2Lip audio-visual sync scoring ─────────────────────────────────
+        wav2lip_result = wav2lip_service.wav2lip_sync_score(
+            video_path=video_tmp_path,
+            weights_path="checkpoints/wav2lip_gan.pth",
+        )
+        meta_data["wav2lip"] = wav2lip_result
+
+        # ── Combined verdict ───────────────────────────────────────────────────
+        def _reasoning_meta(dp: dict, ar: dict) -> dict:
+            calibration = (ar or {}).get("calibration") or {}
+            return {
+                "verdict":            dp.get("final_verdict"),
+                "final_verdict":      dp.get("final_verdict"),
+                "score":              dp.get("score"),
+                "raw_score":          dp.get("raw_score"),
+                "confidence":         dp.get("confidence"),
+                "reason":             dp.get("reason"),
+                "quality_band":       dp.get("quality_band"),
+                "usable_frames":      seq_frames,
+                "usable_ratio":       usable_ratio,
+                "temporal_diversity": dp.get("temporal_diversity", calibration.get("temporal_diversity")),
+                "duplicate_frames":   reject_reasons.get("duplicate_frame", 0),
+                "stability":          stability_meta.get("stable"),
+                "drift":              stability_meta.get("max_centre_drift"),
+                "blur":               avg_blur,
+                "brightness":         avg_brightness,
+                "fail_reasons":       quality_fail_reasons,
+                "high_frame_count":   dp.get("high_frame_count", (ar or {}).get("high_frame_count")),
+                "score_std":          dp.get("score_std", (ar or {}).get("score_std")),
+                "total_windows":      dp.get("total_windows", (ar or {}).get("total_windows")),
+                "temporal_penalty":   dp.get("temporal_penalty"),
+                "evidence_quality":   dp.get("evidence_quality", calibration.get("evidence_quality")),
+                "evidence_strength":  dp.get("evidence_strength"),
+            }
+
+        combined_decision = _combine_verdicts(visual_decision, wav2lip_result)
+        combined_decision["final_explanation"] = generate_verdict_reason(
+            _reasoning_meta(combined_decision, alt_result)
+        )
+        combined_decision["verdict_reason"] = combined_decision["final_explanation"]
+
+        analysis.score   = float(combined_decision.get("score") or 0.0)
+        analysis.verdict = combined_decision["final_verdict"]
+        analysis.status  = "DONE"
+        analysis.completed_at = datetime.utcnow()
+
+        meta_data["altfreezing"] = alt_result
+        meta_data["decision"]    = combined_decision
+        analysis.meta = meta_data
+        db.commit()
+
+        try:
+            _maybe_insert_blocklist(analysis, db)
+        except Exception as e:
+            print(f"[Blocklist] Failed to auto-insert: {e}")
+
+        return {
+            "ok":          True,
+            "analysis_id": analysis.id,
+            "verdict":     analysis.verdict,
+            "score":       analysis.score,
+            "status":      analysis.status,
+            "sync_score":  wav2lip_result.get("sync_score"),
+            "sync_interpretation": wav2lip_result.get("interpretation"),
+            "combined_reason": combined_decision.get("combined_reason"),
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        analysis.verdict = "INCONCLUSIVE"
+        analysis.status  = "ERROR"
+        analysis.meta    = {**meta_data, "error": str(e)}
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Video analysis failed: {e}")
+
+    finally:
+        try:
+            os.remove(video_tmp_path)
+        except Exception:
+            pass
+
 
 @app.post("/api/analysis/capture")
 async def capture_analysis(

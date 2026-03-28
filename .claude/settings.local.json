@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"c:\\\\Users\\\\Admin\\\\Downloads\\\\FYP 25_26\\\\Implementation\\\\src\\\\backend\\\\requirements.txt\")",
+      "Bash(venv/Scripts/pip install:*)",
+      "Bash(venv/Scripts/python -c \"import main; print\\(''''Import OK''''\\)\")"
+    ]
+  }
+}
