@@ -312,7 +312,7 @@ btnDisconnectPortal.addEventListener("click", async () => {
 openDashboard.addEventListener("click", async (e) => {
   e.preventDefault();
   const { lastAnalysisId } = await chrome.storage.local.get(["lastAnalysisId"]);
-  await chrome.tabs.create({ url: lastAnalysisId ? `${MEDIA_ANALYSIS_URL}?analysis_id=${encodeURIComponent(lastAnalysisId)}` : DASHBOARD_URL });
+  await chrome.tabs.create({ url: lastAnalysisId ? `${MEDIA_ANALYSIS_URL}/${encodeURIComponent(lastAnalysisId)}` : DASHBOARD_URL });
 });
 
 chrome.runtime.onMessage.addListener((msg) => {

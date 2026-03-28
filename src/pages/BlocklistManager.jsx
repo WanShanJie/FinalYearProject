@@ -1,9 +1,9 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./BlocklistManager.module.css";
 import { blockControls, moderationRules, moderationWorkflow } from "../data/systemMockData";
-import { AlertIcon, CheckIcon, LockIcon, ShieldIcon, SyncIcon } from "../components/system/SystemIcons";
-import { useNavigate } from "react-router-dom";
+import { AlertIcon, LockIcon, ShieldIcon, SyncIcon } from "../components/system/SystemIcons";
 
 export default function BlocklistManager() {
   const navigate = useNavigate();
@@ -12,32 +12,93 @@ export default function BlocklistManager() {
   const [strictMode, setStrictMode] = useState(blockControls.strictMode);
   const [blockedItems, setBlockedItems] = useState([]);
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [syncMsg, setSyncMsg] = useState("");
+  const [refreshing, setRefreshing] = useState(false);
+  const [removingId, setRemovingId] = useState(null);
+  const [feedback, setFeedback] = useState(null);
 
-  async function fetchBlocklist() {
-    setLoading(true);
+  function resolveApiError(payload, fallbackMessage) {
+    if (typeof payload?.detail === "string") return payload.detail;
+    if (typeof payload?.message === "string") return payload.message;
+    return fallbackMessage;
+  }
+
+  async function fetchBlocklist({ quiet = false } = {}) {
+    if (quiet) setRefreshing(true);
+    else setLoading(true);
+
     try {
       const token = localStorage.getItem("token");
       const res = await fetch("http://localhost:8000/api/blocklist", {
         headers: { Authorization: `Bearer ${token}` }
       });
+
       if (res.status === 401) {
         localStorage.removeItem("token");
         localStorage.removeItem("user");
         navigate("/signin", { replace: true });
         return;
       }
+
       const json = await res.json();
-      if (json.ok) setBlockedItems(json.data);
+      if (json.ok) {
+        setBlockedItems(json.data || []);
+      }
     } catch (err) {
       console.error("Blocklist fetch error:", err);
+      if (quiet) {
+        setFeedback({ type: "error", text: "Unable to refresh the blocklist right now." });
+      }
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
   }
 
-  React.useEffect(() => { fetchBlocklist(); }, []);
+  useEffect(() => {
+    fetchBlocklist();
+  }, []);
+
+  async function removeFromBlocklist(entry) {
+    if (!entry?.id) return;
+    const confirmed = window.confirm(`Are you sure you want to remove "${entry.title || "this media item"}" from the blocklist?`);
+    if (!confirmed) return;
+
+    setRemovingId(entry.id);
+    setFeedback(null);
+
+    try {
+      const token = localStorage.getItem("token");
+      const res = await fetch(`http://localhost:8000/api/blocklist/${entry.id}`, {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+
+      if (res.status === 401) {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        navigate("/signin", { replace: true });
+        return;
+      }
+
+      const payload = await res.json().catch(() => ({}));
+      if (!res.ok || !payload.ok) {
+        throw new Error(resolveApiError(payload, "Unable to remove this media item from the blocklist."));
+      }
+
+      setBlockedItems((prev) => prev.filter((item) => item.id !== entry.id));
+      setFeedback({
+        type: "success",
+        text: payload.message || "Media removed from the blocklist."
+      });
+    } catch (err) {
+      setFeedback({
+        type: "error",
+        text: err.message || "Unable to remove this media item from the blocklist."
+      });
+    } finally {
+      setRemovingId(null);
+    }
+  }
 
   return (
     <div className={layout.page}>
@@ -45,7 +106,7 @@ export default function BlocklistManager() {
         <div>
           <div className={layout.pageTitle}>Blocklist Manager</div>
           <p className={layout.pageSub}>
-            Configure global blocking controls and manage moderation outcomes. This table shows media that was automatically or manually blocked based on your policies.
+            Configure blocking controls and remove blocked media when it should become accessible again. Active entries shown here are enforced by the backend and extension sync.
           </p>
         </div>
         <div className={layout.pill}>
@@ -53,6 +114,12 @@ export default function BlocklistManager() {
           <span>Policy-driven enforcement</span>
         </div>
       </section>
+
+      {feedback && (
+        <section className={feedback.type === "error" ? styles.feedbackError : styles.feedbackSuccess}>
+          {feedback.text}
+        </section>
+      )}
 
       <section className={styles.controlGrid}>
         <ControlCard
@@ -79,15 +146,15 @@ export default function BlocklistManager() {
       </section>
 
       <section className={layout.grid2}>
-        <article className={layout.ruleCard + " " + styles.rulesPanel}>
+        <article className={`${layout.ruleCard} ${styles.rulesPanel}`}>
           <div className={layout.panelHeader}>
             <div>
               <div className={layout.panelTitle}>Moderation Policies</div>
               <div className={layout.panelSub}>Active rules for automatic content enforcement</div>
             </div>
-            <button type="button" className={styles.syncButton}>
+            <button type="button" className={styles.syncButton} onClick={() => fetchBlocklist({ quiet: true })}>
               <SyncIcon className={styles.smallIcon} />
-              <span>Sync policies</span>
+              <span>{refreshing ? "Refreshing..." : "Refresh blocklist"}</span>
             </button>
           </div>
 
@@ -113,7 +180,7 @@ export default function BlocklistManager() {
           </div>
         </article>
 
-        <article className={layout.ruleCard + " " + styles.workflowPanel}>
+        <article className={`${layout.ruleCard} ${styles.workflowPanel}`}>
           <div className={layout.panelHeader}>
             <div>
               <div className={layout.panelTitle}>Moderation Workflow</div>
@@ -134,26 +201,26 @@ export default function BlocklistManager() {
           <div className={styles.infoBanner}>
             <LockIcon className={`${styles.smallIcon} ${layout.toneCyan}`} />
             <p>
-              Global database entries remain read-only. Your local settings determine the response to matching fingerprints.
+              Removing an entry here marks it unblocked in the backend, so future syncs stop restricting that media.
             </p>
           </div>
         </article>
       </section>
 
-      <section className={layout.tableCard + " " + styles.tableSection}>
+      <section className={`${layout.tableCard} ${styles.tableSection}`}>
         <div className={layout.panelHeader}>
           <div>
-            <div className={layout.panelTitle}>Global Blocklist</div>
-            <div className={layout.panelSub}>{blockedItems.length} high-risk items automatically added via policy</div>
+            <div className={layout.panelTitle}>Active Blocklist</div>
+            <div className={layout.panelSub}>{blockedItems.length} blocked media items currently enforced</div>
           </div>
           <span className={layout.pill}>Live protection</span>
         </div>
 
         <div className={styles.tableWrap}>
           {loading ? (
-            <div style={{padding: 40, textAlign: "center"}}>Loading blocklist...</div>
+            <div className={styles.emptyState}>Loading blocklist...</div>
           ) : blockedItems.length === 0 ? (
-            <div style={{padding: 40, textAlign: "center", opacity: 0.6}}>
+            <div className={styles.emptyState}>
               No blocked items yet. High-risk deepfake detections will appear here automatically.
             </div>
           ) : (
@@ -166,7 +233,7 @@ export default function BlocklistManager() {
                   <th>Verdict</th>
                   <th>Source Scan</th>
                   <th>Date Added</th>
-                  <th>Status</th>
+                  <th>Action</th>
                 </tr>
               </thead>
               <tbody>
@@ -175,18 +242,23 @@ export default function BlocklistManager() {
                     <td>
                       <div className={styles.thumbCell}>
                         <div className={styles.thumb}>{entry.platform?.[0]?.toUpperCase() || "?"}</div>
-                        <div>
+                        <div className={styles.itemMeta}>
                           <strong>{entry.title || "Untitled"}</strong>
                           <span>{entry.platform || "Unknown"}</span>
+                          {entry.source_url && (
+                            <a className={styles.sourceLink} href={entry.source_url} target="_blank" rel="noreferrer">
+                              View source
+                            </a>
+                          )}
                         </div>
                       </div>
                     </td>
                     <td className={styles.hashCell} title={entry.fingerprint_hash}>
-                      {entry.fingerprint_hash?.slice(0, 12)}…
+                      {entry.fingerprint_hash?.slice(0, 12)}...
                     </td>
                     <td>
                       <span className={`${layout.badge} ${entry.risk_score >= 70 ? layout.badgeRed : layout.badgeAmber}`}>
-                        {entry.risk_score}% · {entry.risk_level}
+                        {entry.risk_score}% - {entry.risk_level}
                       </span>
                     </td>
                     <td>
@@ -194,12 +266,17 @@ export default function BlocklistManager() {
                         <AlertIcon className={styles.smallIcon} /> {entry.verdict}
                       </span>
                     </td>
-                    <td>{entry.analysis_id ? `#${entry.analysis_id}` : "—"}</td>
-                    <td>{entry.created_at ? new Date(entry.created_at).toLocaleDateString() : "—"}</td>
+                    <td>{entry.analysis_id ? `#${entry.analysis_id}` : "-"}</td>
+                    <td>{entry.created_at ? new Date(entry.created_at).toLocaleDateString() : "-"}</td>
                     <td>
-                      <span className={`${layout.badge} ${entry.status === "active" ? layout.badgeBlue : layout.badgeAmber}`}>
-                        {entry.status === "active" ? "Active" : entry.status}
-                      </span>
+                      <button
+                        type="button"
+                        className={styles.actionButton}
+                        onClick={() => removeFromBlocklist(entry)}
+                        disabled={removingId === entry.id}
+                      >
+                        {removingId === entry.id ? "Removing..." : "Remove from Blocklist"}
+                      </button>
                     </td>
                   </tr>
                 ))}

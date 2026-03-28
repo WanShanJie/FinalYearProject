@@ -168,11 +168,121 @@ async function processMedia(el) {
 
 var _videoIdCache = new Map();
 
-async function _isBypassed(videoId) {
-  try {
-    const res = await chrome.runtime.sendMessage({ type: "CHECK_BYPASS", videoId });
-    return res?.bypassed === true;
-  } catch { return false; }
+/**
+ * Show a dismissible warning banner above the YouTube player on the watch page.
+ * The video is NOT paused — user can still watch.
+ */
+function addWatchPageWarning(entry) {
+  if (document.querySelector("[data-df-watch-warning]")) return;
+
+  const risk = entry?.risk_score != null ? `${entry.risk_score}%` : null;
+  const title = entry?.title ? `"${entry.title.slice(0, 70)}${entry.title.length > 70 ? "…" : ""}"` : null;
+
+  const banner = document.createElement("div");
+  banner.dataset.dfWatchWarning = "1";
+  banner.style.cssText = [
+    "width:100%",
+    "box-sizing:border-box",
+    "background:linear-gradient(135deg,#1c0000 0%,#3b0000 100%)",
+    "border:2px solid #ef4444",
+    "border-radius:10px",
+    "padding:14px 16px",
+    "margin-bottom:12px",
+    "display:flex",
+    "align-items:flex-start",
+    "gap:12px",
+    "font-family:system-ui,sans-serif",
+    "z-index:9999",
+    "position:relative",
+    "box-shadow:0 0 0 1px rgba(239,68,68,0.3),0 4px 20px rgba(239,68,68,0.25)",
+  ].join(";");
+
+  const iconEl = document.createElement("div");
+  iconEl.textContent = "⚠️";
+  iconEl.style.cssText = "font-size:2rem;flex-shrink:0;line-height:1;margin-top:2px;";
+
+  const textWrap = document.createElement("div");
+  textWrap.style.cssText = "flex:1;min-width:0;";
+
+  const headline = document.createElement("div");
+  headline.style.cssText = [
+    "color:#ef4444",
+    "font-weight:900",
+    "font-size:1rem",
+    "margin-bottom:4px",
+    "letter-spacing:0.03em",
+    "text-transform:uppercase",
+  ].join(";");
+  headline.textContent = "⚠ Suspected AI Deepfake" + (risk ? `  ·  Risk Score: ${risk}` : "");
+
+  const sub = document.createElement("div");
+  sub.style.cssText = [
+    "color:#fca5a5",
+    "font-size:0.82rem",
+    "line-height:1.5",
+    "margin-bottom:8px",
+  ].join(";");
+  sub.textContent = title
+    ? `${title} has been flagged as a potential deepfake by the A2U Deepfake Detection system. You can still watch, but please review this content critically.`
+    : "This video has been flagged as a potential deepfake by the A2U Deepfake Detection system. You can still watch, but please review this content critically.";
+
+  const detailRow = document.createElement("div");
+  detailRow.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;";
+
+  const pill = document.createElement("span");
+  pill.style.cssText = [
+    "background:rgba(239,68,68,0.15)",
+    "border:1px solid rgba(239,68,68,0.4)",
+    "color:#fca5a5",
+    "font-size:0.72rem",
+    "font-weight:700",
+    "padding:2px 8px",
+    "border-radius:999px",
+    "letter-spacing:0.04em",
+    "text-transform:uppercase",
+  ].join(";");
+  pill.textContent = "AI DETECTION ALERT";
+
+  const portal = document.createElement("span");
+  portal.style.cssText = "color:rgba(255,255,255,0.4);font-size:0.72rem;";
+  portal.textContent = "View full analysis in the A2U portal →";
+
+  detailRow.append(pill, portal);
+  textWrap.append(headline, sub, detailRow);
+
+  const dismissBtn = document.createElement("button");
+  dismissBtn.textContent = "✕";
+  dismissBtn.title = "Dismiss";
+  dismissBtn.style.cssText = [
+    "background:rgba(255,255,255,0.08)",
+    "border:1px solid rgba(255,255,255,0.2)",
+    "color:rgba(255,255,255,0.6)",
+    "font-size:0.9rem",
+    "cursor:pointer",
+    "padding:4px 8px",
+    "border-radius:6px",
+    "line-height:1",
+    "flex-shrink:0",
+    "margin-top:2px",
+  ].join(";");
+  dismissBtn.addEventListener("click", () => banner.remove());
+
+  banner.append(iconEl, textWrap, dismissBtn);
+
+  // Insert above the player — try several known YouTube DOM anchors
+  const insertTargets = [
+    () => document.querySelector("#above-the-fold"),
+    () => document.querySelector("ytd-watch-flexy #columns #primary"),
+    () => document.querySelector("#primary-inner"),
+    () => document.querySelector("#player-container"),
+    () => document.querySelector("ytd-watch-flexy"),
+  ];
+  for (const fn of insertTargets) {
+    const el = fn();
+    if (el) { el.insertBefore(banner, el.firstChild); return; }
+  }
+  // Fallback: prepend to body
+  document.body.insertBefore(banner, document.body.firstChild);
 }
 
 async function checkVideoIdOnPage() {
@@ -185,51 +295,48 @@ async function checkVideoIdOnPage() {
     else { try { videoId = new URL(url).searchParams.get("v"); } catch { } }
     if (!videoId) return;
 
-    // If the user clicked "Proceed anyway", don't redirect them back.
-    if (await _isBypassed(videoId)) return;
-
     if (_videoIdCache.has(videoId)) {
       const cached = _videoIdCache.get(videoId);
-      if (cached) _redirectToBlockedPage(videoId, url, cached);
+      if (cached) addWatchPageWarning(cached);
       return;
     }
 
     const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
     _videoIdCache.set(videoId, res?.ok && res?.entry ? res.entry : null);
     if (res?.ok && res?.entry) {
-      _redirectToBlockedPage(videoId, url, res.entry);
+      addWatchPageWarning(res.entry);
       await bumpCounter("blocked", 1);
       safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
     }
   } catch { }
 }
 
-function _redirectToBlockedPage(videoId, originalUrl, entry) {
-  // Pause and hide all video elements immediately while redirect is in flight.
-  document.querySelectorAll("video").forEach(v => { v.pause(); v.style.visibility = "hidden"; });
-  try {
-    const blockedPage = chrome.runtime.getURL("blocked.html");
-    const params = new URLSearchParams({
-      video_id:     videoId,
-      original_url: originalUrl,
-      title:        entry?.title     || "",
-      verdict:      entry?.verdict   || "FAKE",
-      risk_score:   String(entry?.risk_score ?? 100),
-    });
-    location.replace(`${blockedPage}?${params}`);
-  } catch { }
-}
-
 // ── YouTube card scanning (Layer A: exact video_id only) ──────────────────────
 
 var YT_CARD_SELECTORS = [
-  "ytd-rich-item-renderer", "ytd-video-renderer", "ytd-grid-video-renderer",
-  "ytd-compact-video-renderer", "ytd-reel-item-renderer",
+  "ytd-rich-item-renderer",          // Home feed grid card
+  "ytd-video-renderer",              // History, search results, playlists list
+  "ytd-grid-video-renderer",         // Channel page grid, playlists grid
+  "ytd-compact-video-renderer",      // Sidebar "Up next" / related videos
+  "ytd-reel-item-renderer",          // Shorts shelf item
+  "ytd-rich-grid-slim-media",        // Shorts shelf grid cell
+  "ytd-playlist-video-renderer",     // Watch Later, playlist detail page
+  "ytd-playlist-panel-video-renderer", // Playlist panel (side queue)
+  "yt-lockup-view-model",            // New YouTube UI card format
 ].join(", ");
 
 var _scannedCards = new WeakSet();
 
 function extractCardVideoId(card) {
+  // New YouTube UI lockup model stores video ID in a data attribute
+  const lockupId = card.getAttribute("data-video-id") || card.querySelector("[data-video-id]")?.getAttribute("data-video-id");
+  if (lockupId) return lockupId;
+
+  // Playlist panel video renderer has a different attribute
+  const panelId = card.getAttribute("video-id");
+  if (panelId) return panelId;
+
+  // Standard anchor href extraction for all other card types
   for (const a of card.querySelectorAll("a[href]")) {
     const href = a.getAttribute("href") || "";
     const s = href.match(/\/shorts\/([A-Za-z0-9_-]{6,20})/);
@@ -242,103 +349,179 @@ function extractCardVideoId(card) {
   return null;
 }
 
-// ── Non-blocking warning badge for feed cards ─────────────────────────────────
-// Attaches a visible warning directly to the thumbnail.
-// pointer-events:none on every element — the card remains fully clickable.
+function getYouTubeThumbnailHost(card) {
+  const candidates = [
+    card.querySelector("a#thumbnail"),
+    card.querySelector("a[href*='/watch'] ytd-thumbnail"),
+    card.querySelector("a[href*='/shorts/'] ytd-thumbnail"),
+    card.querySelector("ytd-thumbnail"),
+    card.querySelector("#thumbnail"),
+    card.querySelector("yt-image"),
+    card.querySelector("[id='thumbnail']"),
+  ].filter(Boolean);
 
-function addWarningBadge(card, thumbHost) {
-  if (card.dataset.deepfakeWarned === "1") return;
-  card.dataset.deepfakeWarned = "1";
+  const cardRect = card.getBoundingClientRect();
+  const maxReasonableWidth = cardRect.width ? Math.max(320, cardRect.width * 0.9) : 520;
 
-  if (!thumbHost) return;
-  if (getComputedStyle(thumbHost).position === "static") {
-    thumbHost.style.position = "relative";
+  for (const el of candidates) {
+    const rect = el.getBoundingClientRect();
+    if (rect.width >= 120 && rect.height >= 68 && rect.width <= maxReasonableWidth) {
+      return el;
+    }
   }
 
-  // Semi-transparent overlay on the thumbnail — visually prominent but
-  // pointer-events:none so every click falls through to the video link.
-  const ov = document.createElement("div");
-  ov.style.cssText = [
-    "position:absolute;inset:0;z-index:9999",
-    "background:rgba(0,0,0,0.58)",
-    "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px",
-    "pointer-events:none;user-select:none;border-radius:inherit",
-  ].join(";");
-  ov.innerHTML =
-    '<span style="font-size:2rem;line-height:1;">⚠️</span>' +
-    '<span style="color:#fff;font-weight:700;font-size:0.92rem;text-align:center;' +
-    'text-shadow:0 1px 6px rgba(0,0,0,0.9);padding:0 8px;line-height:1.3;">' +
-    'Deepfake Detected</span>';
-
-  // Pill badge at bottom-left — spec-compliant appearance.
-  const badge = document.createElement("div");
-  badge.style.cssText = [
-    "position:absolute;bottom:6px;left:6px;z-index:10000",
-    "display:inline-flex;align-items:center;gap:4px",
-    "padding:3px 7px",
-    "background:rgba(0,0,0,0.75)",
-    "border:2px solid #f59e0b",
-    "border-radius:4px",
-    "pointer-events:none;user-select:none",
-  ].join(";");
-  badge.innerHTML =
-    '<span style="font-size:0.8rem;line-height:1;">⚠️</span>' +
-    '<span style="color:#fff;font-size:0.72rem;font-weight:600;white-space:nowrap;">' +
-    'Deepfake Detected</span>';
-
-  thumbHost.appendChild(ov);
-  thumbHost.appendChild(badge);
+  return candidates[0] || card;
 }
 
-function _isFeedPage() {
-  const p = location.pathname;
-  return p.startsWith("/feed/") || p.startsWith("/playlist");
+/**
+ * Attach a bold, unmissable warning overlay to a flagged card thumbnail.
+ * Covers the thumbnail with a dimmed overlay + red border + large warning.
+ * Card link is still fully clickable via "Watch anyway" button.
+ */
+function addWarningBadge(card, entry) {
+  if (card.querySelector("[data-df-warning]")) return;
+
+  const thumbHost = getYouTubeThumbnailHost(card);
+
+  if (getComputedStyle(thumbHost).position === "static") {
+    thumbHost.style.setProperty("position", "relative", "important");
+  }
+  thumbHost.style.setProperty("overflow", "hidden", "important");
+
+  const risk = entry?.risk_score != null ? `${entry.risk_score}%` : null;
+
+  // Extract the video link so "Watch anyway" can navigate
+  const videoLink = card.querySelector("a[href*='/watch'], a[href*='/shorts/']");
+  const href = videoLink?.getAttribute("href") || null;
+
+  // Full-thumbnail overlay — dims the image and draws attention
+  const overlay = document.createElement("div");
+  overlay.dataset.dfWarning = "1";
+  overlay.style.cssText = [
+    "position:absolute",
+    "inset:0",
+    "z-index:20",
+    "background:rgba(10,0,0,0.78)",
+    "border:3px solid #ef4444",
+    "border-radius:inherit",
+    "box-sizing:border-box",
+    "display:flex",
+    "flex-direction:column",
+    "align-items:center",
+    "justify-content:center",
+    "gap:4px",
+    "padding:8px",
+    "cursor:default",
+    "pointer-events:auto",
+  ].join(";");
+
+  // Stop card link from firing when clicking the overlay itself
+  overlay.addEventListener("click", e => e.stopPropagation());
+
+  // Warning icon
+  const iconEl = document.createElement("div");
+  iconEl.textContent = "⚠️";
+  iconEl.style.cssText = "font-size:1.6rem;line-height:1;";
+
+  // "AI DEEPFAKE" label
+  const labelEl = document.createElement("div");
+  labelEl.style.cssText = [
+    "color:#ef4444",
+    "font-weight:900",
+    "font-size:0.78rem",
+    "font-family:system-ui,sans-serif",
+    "letter-spacing:0.08em",
+    "text-transform:uppercase",
+    "text-align:center",
+    "text-shadow:0 1px 4px rgba(0,0,0,0.8)",
+    "line-height:1.2",
+  ].join(";");
+  labelEl.textContent = risk ? `Deepfake · ${risk} risk` : "Suspected Deepfake";
+
+  // Button row
+  const btnRow = document.createElement("div");
+  btnRow.style.cssText = "display:flex;gap:4px;margin-top:4px;";
+
+  // Watch anyway button
+  if (href) {
+    const watchBtn = document.createElement("a");
+    watchBtn.href = href;
+    watchBtn.textContent = "Watch anyway";
+    watchBtn.style.cssText = [
+      "background:rgba(255,255,255,0.15)",
+      "border:1px solid rgba(255,255,255,0.4)",
+      "color:#fff",
+      "font-size:0.62rem",
+      "font-family:system-ui,sans-serif",
+      "font-weight:600",
+      "padding:3px 7px",
+      "border-radius:3px",
+      "cursor:pointer",
+      "text-decoration:none",
+      "white-space:nowrap",
+      "line-height:1.4",
+    ].join(";");
+    watchBtn.addEventListener("click", e => e.stopPropagation());
+    btnRow.appendChild(watchBtn);
+  }
+
+  // Dismiss button
+  const dismissBtn = document.createElement("button");
+  dismissBtn.textContent = "✕";
+  dismissBtn.title = "Dismiss";
+  dismissBtn.style.cssText = [
+    "background:rgba(255,255,255,0.1)",
+    "border:1px solid rgba(255,255,255,0.3)",
+    "color:rgba(255,255,255,0.8)",
+    "font-size:0.62rem",
+    "font-family:system-ui,sans-serif",
+    "padding:3px 6px",
+    "border-radius:3px",
+    "cursor:pointer",
+    "line-height:1.4",
+  ].join(";");
+  dismissBtn.addEventListener("click", e => {
+    e.preventDefault();
+    e.stopPropagation();
+    overlay.remove();
+    if (thumbHost.dataset.dfThumbGlow) {
+      thumbHost.style.boxShadow = "";
+      delete thumbHost.dataset.dfThumbGlow;
+    }
+  });
+  btnRow.appendChild(dismissBtn);
+
+  overlay.append(iconEl, labelEl, btnRow);
+  thumbHost.appendChild(overlay);
+
+  thumbHost.style.boxShadow = "0 0 0 2px #ef4444 inset";
+  thumbHost.dataset.dfThumbGlow = "1";
 }
 
 async function processYouTubeCard(card) {
   if (window.__captureInProgress) return;
-  // Already fully processed — badge applied or card hidden.
-  if (card.dataset.deepfakeWarned === "1") return;
-  // Already in the WeakSet with a confirmed video ID (not-in-blocklist result).
   if (_scannedCards.has(card)) return;
+  _scannedCards.add(card);
 
-  // Extract video ID BEFORE marking the card as scanned.
-  // If the href attributes are not yet rendered (YouTube lazy-renders them),
-  // we must NOT add the card to _scannedCards — the next scan pass will retry.
   const videoId = extractCardVideoId(card);
   if (!videoId) return;
 
-  // Mark scanned only once we have a valid video ID.
-  _scannedCards.add(card);
-
-  let entry;
+  // Cache hit
   if (_videoIdCache.has(videoId)) {
-    entry = _videoIdCache.get(videoId);
-  } else {
-    const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
-    entry = res?.ok && res?.entry ? res.entry : null;
-    _videoIdCache.set(videoId, entry);
+    const entry = _videoIdCache.get(videoId);
+    if (entry) addWarningBadge(card, entry);
+    return;
   }
 
-  if (!entry) return;
+  const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+  const entry = res?.ok && res?.entry ? res.entry : null;
+  _videoIdCache.set(videoId, entry);
 
-  if (_isFeedPage()) {
-    // Feed pages (history, playlists, watch later, liked videos):
-    // non-blocking warning badge — card stays fully clickable.
-    const thumbHost =
-      card.querySelector("a#thumbnail") ||
-      card.querySelector("#thumbnail")  ||
-      card.querySelector("ytd-thumbnail a") ||
-      card.querySelector("ytd-thumbnail");
-    addWarningBadge(card, thumbHost);
-  } else {
-    // Search / home / recommendations: hide the card entirely.
-    card.dataset.deepfakeWarned = "1";
-    card.style.display = "none";
+  if (entry) {
+    addWarningBadge(card, entry);
+    bumpCounter("blocked", 1).catch(() => { });
+    safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
   }
-
-  bumpCounter("blocked", 1).catch(() => { });
-  safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
 }
 
 function scanYouTubeCards(root = document) {
@@ -361,34 +544,53 @@ function scanExisting() {
 }
 
 var scanTimer = null;
+
+// YouTube fires "yt-navigate-finish" on every SPA page transition.
+// This is more reliable than watching addedNodes for URL changes.
+window.addEventListener("yt-navigate-finish", () => {
+  if (location.href === currentUrl) return;
+  currentUrl = location.href;
+  _videoIdCache.clear();
+  _scannedCards = new WeakSet();
+  document.querySelectorAll("[data-df-warning]").forEach(el => el.remove());
+  document.querySelectorAll("[data-df-watch-warning]").forEach(el => el.remove());
+  clearTimeout(scanTimer);
+  // History/Playlist pages render content lazily — wait 800ms before first scan,
+  // then scan again at 2s in case more cards loaded.
+  scanTimer = setTimeout(() => {
+    checkVideoIdOnPage().catch(() => { });
+    scanYouTubeCards(document);
+    setTimeout(() => scanYouTubeCards(document), 1500);
+  }, 800);
+});
+
 var mo = new MutationObserver((mutations) => {
   if (window.__captureInProgress) return;
-  let hasRelevant = false;
-  for (const m of mutations) {
-    if (m.addedNodes.length > 0) { hasRelevant = true; break; }
-  }
-  if (!hasRelevant) return;
 
-  // SPA navigation detection
+  // Always check for SPA navigation FIRST — YouTube sometimes pushes a URL
+  // change via history.pushState without immediately adding nodes, so checking
+  // addedNodes first would cause us to miss the navigation entirely.
   if (location.href !== currentUrl) {
     currentUrl = location.href;
     _videoIdCache.clear();
     _scannedCards = new WeakSet();
-    // Clear badge flags so cards are re-evaluated on the new page.
-    document.querySelectorAll("[data-deepfake-warned]").forEach(
-      el => delete el.dataset.deepfakeWarned
-    );
+    document.querySelectorAll("[data-df-warning]").forEach(el => el.remove());
+    document.querySelectorAll("[data-df-watch-warning]").forEach(el => el.remove());
     clearTimeout(scanTimer);
-    // First scan at 500ms; YouTube's history/playlist items are lazy-loaded
-    // so add two follow-up scans to catch items rendered after initial paint.
     scanTimer = setTimeout(() => {
       checkVideoIdOnPage().catch(() => { });
       scanYouTubeCards(document);
-      setTimeout(() => scanYouTubeCards(document), 1200);
-      setTimeout(() => scanYouTubeCards(document), 3000);
-    }, 500);
+      setTimeout(() => scanYouTubeCards(document), 1500);
+    }, 800);
     return;
   }
+
+  // Scan when new nodes appear (lazy-loaded cards, infinite scroll)
+  let hasAdded = false;
+  for (const m of mutations) {
+    if (m.addedNodes.length > 0) { hasAdded = true; break; }
+  }
+  if (!hasAdded) return;
 
   clearTimeout(scanTimer);
   scanTimer = setTimeout(() => scanYouTubeCards(document), 300);
@@ -753,14 +955,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "BLOCKLIST_UPDATED") {
       _videoIdCache.clear();
       _scannedCards = new WeakSet();
-      document.querySelectorAll("[data-deepfake-warned]").forEach(
-        el => delete el.dataset.deepfakeWarned
-      );
       if (!window.__captureInProgress) {
         checkVideoIdOnPage().catch(() => { });
         scanExisting();
-        // Re-scan again after a delay in case the page has lazy content.
-        setTimeout(() => scanYouTubeCards(document), 1500);
       }
       sendResponse({ ok: true });
       return;
@@ -777,6 +974,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 (async function init() {
   await loadMonitoringFlag();
   startObserver();
-  setTimeout(() => { if (!window.__captureInProgress) scanExisting(); }, 1000);
-  setTimeout(() => { if (!window.__captureInProgress) checkVideoIdOnPage().catch(() => { }); }, 2500);
+  // Initial scans — staggered because History/Playlist pages load cards lazily
+  setTimeout(() => { if (!window.__captureInProgress) scanExisting(); }, 800);
+  setTimeout(() => { if (!window.__captureInProgress) scanYouTubeCards(document); }, 2000);
+  setTimeout(() => { if (!window.__captureInProgress) { checkVideoIdOnPage().catch(() => { }); scanYouTubeCards(document); } }, 4000);
 })();

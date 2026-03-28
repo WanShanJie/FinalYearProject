@@ -278,7 +278,7 @@ export default function Dashboard() {
                     key={item.id}
                     type="button"
                     className={styles.feedCard}
-                    onClick={() => navigate(`/media-analysis?analysis_id=${item.id}`)}
+                    onClick={() => navigate(`/media-analysis/${item.id}`)}
                     title="Open this analysis"
                   >
                     <div className={styles.feedPreviewFrame}>
@@ -420,7 +420,7 @@ export default function Dashboard() {
                     key={item.id}
                     type="button"
                     className={styles.timelineRowButton}
-                    onClick={() => navigate(`/media-analysis?analysis_id=${item.id}`)}
+                    onClick={() => navigate(`/media-analysis/${item.id}`)}
                   >
                     <div className={styles.timelineRow}>
                       <div className={styles.timelinePreviewClip}>

@@ -5,7 +5,9 @@ ALTFREEZING_REPO_CANDIDATES = [
     Path(__file__).resolve().parents[1] / "third_party" / "AltFreezing",
     Path(__file__).resolve().parents[1] / "AltFreezing",
 ]
-SEQUENCE_LENGTH = 8
+SEQUENCE_LENGTH = 64
+WINDOW_STRIDE = 4
+MAX_WINDOWS = 6
 
 # AltFreezing uses 224×224 with ImageNet mean/std (same as demo.py)
 INPUT_SIZE = 224

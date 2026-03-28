@@ -8,6 +8,7 @@ import ResetPassword from "./pages/ResetPassword";
 import MfaVerify from "./pages/MfaVerify";
 import VerifyEmail from "./pages/VerifyEmail";
 import MediaAnalysis from "./pages/MediaAnalysis";
+import MediaAnalysisDetail from "./pages/MediaAnalysisDetail";
 import BlocklistManager from "./pages/BlocklistManager";
 import Settings from "./pages/Settings";
 import ExtensionConnect from "./pages/ExtensionConnect";
@@ -49,6 +50,7 @@ export default function App() {
       >
         <Route path="/dashboard" element={<Dashboard />} />
         <Route path="/media-analysis" element={<MediaAnalysis />} />
+        <Route path="/media-analysis/:analysisId" element={<MediaAnalysisDetail />} />
         <Route path="/blocklist-manager" element={<BlocklistManager />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/extension/connect" element={<ExtensionConnect />} />

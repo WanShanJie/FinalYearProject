@@ -3,12 +3,15 @@ import secrets
 import hashlib
 import hmac
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, Form, Header
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
@@ -29,6 +32,7 @@ import os as _os
 # Force UTF-8 output so AltFreezing's logger doesn't crash on Windows
 _os.environ.setdefault("PYTHONUTF8", "1")
 from scripts import altfreezing_service
+from scripts.altfreezing_config import SEQUENCE_LENGTH as ALT_ANALYSIS_SEQUENCE_LENGTH
 
 # Create tables (dev). For production, use Alembic migrations.
 Base.metadata.create_all(bind=engine)
@@ -167,6 +171,256 @@ def _pkce_challenge_for_verifier(code_verifier: str) -> str:
     return urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
 
 
+def _human_join(parts: List[str]) -> str:
+    clean = [str(part).strip() for part in parts if str(part).strip()]
+    if not clean:
+        return ""
+    if len(clean) == 1:
+        return clean[0]
+    if len(clean) == 2:
+        return f"{clean[0]} and {clean[1]}"
+    return f"{', '.join(clean[:-1])}, and {clean[-1]}"
+
+
+def _metadata_quality_band(metadata: dict) -> str:
+    band = str(metadata.get("quality_band") or "").strip().lower()
+    if band in {"weak", "moderate", "strong"}:
+        return band
+
+    usable_frames = int(metadata.get("usable_frames") or 0)
+    usable_ratio = float(metadata.get("usable_ratio") or 0.0)
+    blur = float(metadata.get("blur") or 0.0)
+    brightness = float(metadata.get("brightness") or 0.0)
+    stability = metadata.get("stability")
+
+    if usable_frames >= 24 and usable_ratio >= 0.65 and blur >= 20.0 and brightness >= 80.0 and stability is True:
+        return "strong"
+    if usable_frames >= 8 and usable_ratio >= 0.2 and blur >= 8.0 and brightness >= 25.0:
+        return "moderate"
+    return "weak"
+
+
+def _safe_float(value) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _describe_quality_failure(code: str) -> str:
+    key, _, raw_value = str(code or "").partition(":")
+    if key == "too_few_sequence_frames":
+        return f"only {raw_value or 'a few'} usable frames"
+    if key == "usable_ratio_too_low":
+        return "too little variation in usable frames"
+    if key == "avg_blur_too_low":
+        return "blurred visual evidence"
+    if key == "avg_brightness_too_low":
+        return "dark or poorly lit frames"
+    return key.replace("_", " ")
+
+
+def _evidence_strength_label(metadata: dict) -> str:
+    total_windows = int(metadata.get("total_windows") or 0)
+    score_std = _safe_float(metadata.get("score_std"))
+    temporal_diversity = _safe_float(metadata.get("temporal_diversity"))
+    high_frame_count = int(metadata.get("high_frame_count") or 0)
+    quality_band = _metadata_quality_band(metadata)
+    evidence_quality = _safe_float(metadata.get("evidence_quality"))
+
+    weak_markers = 0
+    strong_markers = 0
+
+    if total_windows < 3:
+        weak_markers += 1
+    else:
+        strong_markers += 1
+
+    if score_std is None or score_std < 0.01:
+        weak_markers += 1
+    elif score_std > 0.02:
+        strong_markers += 1
+
+    if temporal_diversity is None or temporal_diversity < 0.15:
+        weak_markers += 1
+    elif temporal_diversity > 0.20:
+        strong_markers += 1
+
+    if high_frame_count <= 1:
+        weak_markers += 1
+    elif high_frame_count >= 3:
+        strong_markers += 1
+
+    if quality_band == "weak":
+        weak_markers += 1
+    elif quality_band == "strong":
+        strong_markers += 1
+
+    if evidence_quality is not None:
+        if evidence_quality < 0.60:
+            weak_markers += 1
+        elif evidence_quality >= 0.75:
+            strong_markers += 1
+
+    if weak_markers >= 2 and strong_markers <= 1:
+        return "weak"
+    if strong_markers >= 4 and weak_markers == 0:
+        return "strong"
+    return "moderate"
+
+
+def generate_verdict_reason(metadata) -> str:
+    metadata = metadata or {}
+
+    verdict = str(metadata.get("verdict") or metadata.get("final_verdict") or "INCONCLUSIVE").upper()
+    score = _safe_float(metadata.get("score"))
+    raw_score = _safe_float(metadata.get("raw_score"))
+    score_pct = round(score * 100) if score is not None else None
+    raw_score_pct = round(raw_score * 100) if raw_score is not None else None
+    confidence = str(metadata.get("confidence") or "low").strip().lower()
+    quality_band = _metadata_quality_band(metadata)
+
+    usable_frames = int(metadata.get("usable_frames") or 0)
+    temporal_diversity = _safe_float(metadata.get("temporal_diversity"))
+    duplicate_frames = int(metadata.get("duplicate_frames") or 0)
+    stability = metadata.get("stability")
+    drift = _safe_float(metadata.get("drift"))
+    blur = _safe_float(metadata.get("blur"))
+    brightness = _safe_float(metadata.get("brightness"))
+    fail_reasons = list(metadata.get("fail_reasons") or [])
+    high_frame_count = int(metadata.get("high_frame_count") or 0)
+    evidence_quality = _safe_float(metadata.get("evidence_quality"))
+    score_std = _safe_float(metadata.get("score_std"))
+    total_windows = int(metadata.get("total_windows") or 0)
+    temporal_penalty = _safe_float(metadata.get("temporal_penalty")) or 1.0
+    evidence_strength = str(metadata.get("evidence_strength") or _evidence_strength_label(metadata)).lower()
+
+    evidence_bits: List[str] = []
+    if total_windows:
+        evidence_bits.append(f"{total_windows} analysis window{'s' if total_windows != 1 else ''}")
+    if temporal_diversity is not None:
+        if temporal_diversity > 0.20:
+            evidence_bits.append("good frame-to-frame variation")
+        elif temporal_diversity < 0.15:
+            evidence_bits.append("limited frame-to-frame variation")
+        else:
+            evidence_bits.append("moderate frame-to-frame variation")
+    if score_std is not None:
+        evidence_bits.append("meaningful score variation" if score_std > 0.02 else "very little score variation")
+    if high_frame_count:
+        evidence_bits.append(f"{high_frame_count} strong manipulation window{'s' if high_frame_count != 1 else ''}")
+
+    evidence_text = _human_join(evidence_bits[:3]) or "limited supporting evidence"
+
+    if verdict == "INCONCLUSIVE":
+        issues: List[str] = []
+        if fail_reasons:
+            issues.extend(_describe_quality_failure(reason) for reason in fail_reasons[:2])
+        if total_windows and total_windows < 3:
+            issues.append(f"only {total_windows} analysis window{'s' if total_windows != 1 else ''} were available")
+        if confidence == "low":
+            issues.append("low confidence")
+        if temporal_diversity is not None and temporal_diversity < 0.15:
+            issues.append("limited variation between frames")
+        if stability is False:
+            issues.append("unstable face tracking")
+        if duplicate_frames >= max(4, usable_frames // 2 if usable_frames else 4):
+            issues.append("too many repeated frames")
+        if quality_band == "weak":
+            issues.append("weak visual evidence")
+
+        issue_text = _human_join(issues[:3]) or "weak and mixed evidence"
+        follow_up = []
+        if usable_frames:
+            follow_up.append(f"Only {usable_frames} usable frames were available")
+        if raw_score_pct is not None and score_pct is not None and raw_score_pct != score_pct:
+            follow_up.append(f"the score was reduced from {raw_score_pct}% to {score_pct}% because the clip had limited variation")
+        if drift is not None and drift > 0.18:
+            follow_up.append("face alignment changed noticeably across the clip")
+        if blur is not None and blur < 8.0:
+            follow_up.append("the sequence was blurrier than the system prefers")
+        if brightness is not None and brightness < 25.0:
+            follow_up.append("the frames were darker than ideal")
+
+        second_sentence = _human_join(follow_up[:2])
+        base = f"The model score was {score_pct if score_pct is not None else 'not available'}%, but the evidence was {evidence_strength} because of {issue_text}."
+        if second_sentence:
+            return f"{base} {second_sentence[0].upper() + second_sentence[1:]}, so the system kept the result inconclusive."
+        return f"{base} The system kept the result inconclusive rather than making an absolute claim."
+
+    if verdict == "FAKE":
+        issues: List[str] = []
+        if high_frame_count > 0:
+            issues.append("repeated manipulation signals across frames")
+        if stability is False or (drift is not None and drift > 0.18):
+            issues.append("inconsistencies in facial movement and alignment")
+        if temporal_diversity is not None and temporal_diversity > 0.20:
+            issues.append("irregular frame-to-frame motion patterns")
+        if evidence_quality is not None and evidence_quality >= 0.75:
+            issues.append("strong supporting evidence")
+
+        issue_text = _human_join(issues[:3]) or "strong inconsistencies across the analyzed sequence"
+        return (
+            f"The final fake score was {score_pct if score_pct is not None else 'not available'}%, and the evidence was strong with {evidence_text}. "
+            f"The system classified this media as fake because it found {issue_text}."
+        )
+
+    if verdict == "REAL":
+        supports: List[str] = []
+        if stability is True:
+            supports.append("consistent face tracking")
+        if drift is not None and drift <= 0.10:
+            supports.append("stable facial movement")
+        if temporal_diversity is not None and temporal_diversity <= 0.20:
+            supports.append("natural variation between frames")
+        if confidence in {"medium", "high"}:
+            supports.append(f"{confidence} confidence")
+        if quality_band in {"moderate", "strong"}:
+            supports.append(f"{quality_band} visual evidence")
+
+        support_text = _human_join(supports[:3]) or "stable visual evidence"
+        tail = []
+        if score_pct is not None:
+            tail.append(f"the manipulation score remained low at {score_pct}%")
+        if usable_frames:
+            tail.append(f"{usable_frames} usable frames supported the decision")
+
+        tail_text = _human_join(tail[:2])
+        base = f"The final fake score remained low at {score_pct if score_pct is not None else 'not available'}%, and the evidence was {evidence_strength} with {support_text}."
+        if tail_text:
+            return f"{base} {tail_text[0].upper() + tail_text[1:]}, so the system treated the content as authentic."
+        return f"{base} The system treated the content as authentic."
+
+    mixed_signals: List[str] = []
+    if high_frame_count > 0 or (score is not None and score >= 0.5):
+        mixed_signals.append("some frame-level irregularities")
+    if stability is False or (drift is not None and drift > 0.12):
+        mixed_signals.append("partial instability in facial tracking")
+    if temporal_diversity is not None and temporal_diversity > 0.10:
+        mixed_signals.append("uneven motion patterns across frames")
+    if quality_band == "weak" or confidence == "low":
+        mixed_signals.append("evidence that was not strong enough for a definitive decision")
+    if score_std is not None and score_std < 0.01:
+        mixed_signals.append("very little variation across prediction windows")
+
+    signal_text = _human_join(mixed_signals[:3]) or "mixed signals"
+    tail = []
+    if score_pct is not None:
+        tail.append(f"the score reached {score_pct}%")
+    if usable_frames:
+        tail.append(f"only {usable_frames} usable frames were retained" if quality_band == "weak" else f"{usable_frames} usable frames were reviewed")
+    if temporal_penalty < 1.0 and raw_score_pct is not None and score_pct is not None:
+        tail.append(f"the score was reduced from {raw_score_pct}% to {score_pct}% because frame variation was limited")
+
+    tail_text = _human_join(tail[:2])
+    base = f"The model score was {score_pct if score_pct is not None else 'not available'}%, but the evidence was {evidence_strength} because of {signal_text}."
+    if tail_text:
+        return f"{base} In this case, {tail_text}, so the system used a suspicious verdict instead of an absolute one."
+    return f"{base} The system used a suspicious verdict instead of an absolute one."
+
+
 def _serialize_analysis(analysis: MediaAnalysis) -> dict:
     return {
         "id": analysis.id,
@@ -195,6 +449,133 @@ def _serialize_linked_extension(device: LinkedExtension) -> dict:
         "is_active": bool(device.is_active and device.revoked_at is None),
         "revoked_at": device.revoked_at.isoformat() if device.revoked_at else None,
     }
+
+
+def _serialize_blocklist_entry(entry: GlobalBlocklist) -> dict:
+    return {
+        "id": entry.id,
+        "fingerprint_hash": entry.fingerprint_hash,
+        "video_id": entry.video_id,
+        "source_url": entry.source_url,
+        "platform": entry.platform,
+        "title": entry.title,
+        "verdict": entry.verdict,
+        "risk_score": entry.risk_score,
+        "risk_level": entry.risk_level,
+        "analysis_id": entry.analysis_id,
+        "status": entry.status,
+        "created_at": entry.created_at.isoformat() if entry.created_at else None,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+def _uploads_root() -> Path:
+    return Path(__file__).resolve().parent / "uploads"
+
+
+def _iter_analysis_upload_paths(analysis_id: int) -> list[Path]:
+    upload_root = _uploads_root().resolve()
+    if not upload_root.exists():
+        return []
+
+    paths: list[Path] = []
+    for candidate in upload_root.glob(f"{analysis_id}_*"):
+        try:
+            resolved = candidate.resolve()
+        except FileNotFoundError:
+            continue
+        if resolved.parent != upload_root:
+            continue
+        paths.append(resolved)
+    return paths
+
+
+def _cleanup_analysis_uploads(analysis_id: int) -> int:
+    removed_count = 0
+    for path in _iter_analysis_upload_paths(analysis_id):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed_count += 1
+        elif path.exists():
+            path.unlink()
+            removed_count += 1
+    return removed_count
+
+
+def _get_user_analysis_or_404(db: Session, user_id: int, analysis_id: int) -> MediaAnalysis:
+    analysis = (
+        db.query(MediaAnalysis)
+        .filter(
+            MediaAnalysis.id == analysis_id,
+            MediaAnalysis.user_id == user_id,
+        )
+        .first()
+    )
+    if not analysis:
+        raise HTTPException(status_code=404, detail="Analysis not found")
+    return analysis
+
+
+def _find_active_blocklist_entry_for_analysis(db: Session, analysis: MediaAnalysis) -> Optional[GlobalBlocklist]:
+    match_clauses = [GlobalBlocklist.analysis_id == analysis.id]
+
+    if analysis.video_id:
+        match_clauses.append(GlobalBlocklist.video_id == analysis.video_id)
+
+    source_urls = sorted({url for url in [analysis.page_url, analysis.content_url] if url})
+    if source_urls:
+        match_clauses.append(GlobalBlocklist.source_url.in_(source_urls))
+
+    return (
+        db.query(GlobalBlocklist)
+        .filter(
+            GlobalBlocklist.status == "active",
+            or_(*match_clauses),
+        )
+        .order_by(GlobalBlocklist.created_at.desc())
+        .first()
+    )
+
+
+def _ensure_analysis_media_accessible(db: Session, analysis: MediaAnalysis) -> None:
+    blocked_entry = _find_active_blocklist_entry_for_analysis(db, analysis)
+    if blocked_entry:
+        raise HTTPException(
+            status_code=403,
+            detail="Media access denied because this item is currently on the blocklist.",
+        )
+
+
+def _delete_analysis_records(db: Session, analyses: List[MediaAnalysis], user_id: int) -> tuple[int, int]:
+    analysis_ids = [int(analysis.id) for analysis in analyses]
+    if not analysis_ids:
+        return 0, 0
+
+    files_removed = 0
+    try:
+        for analysis_id in analysis_ids:
+            files_removed += _cleanup_analysis_uploads(analysis_id)
+
+        db.query(GlobalBlocklist).filter(
+            GlobalBlocklist.analysis_id.in_(analysis_ids)
+        ).update(
+            {GlobalBlocklist.analysis_id: None},
+            synchronize_session=False,
+        )
+
+        deleted_count = (
+            db.query(MediaAnalysis)
+            .filter(
+                MediaAnalysis.user_id == user_id,
+                MediaAnalysis.id.in_(analysis_ids),
+            )
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return deleted_count, files_removed
+    except Exception:
+        db.rollback()
+        raise
 
 def _issue_user_token(user: User) -> dict:
     token = create_token(user.id, user.email)
@@ -755,126 +1136,251 @@ def revoke_current_extension_device(
 
 
 def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_result: dict) -> dict:
-    if score is None:
+    def _decision_payload(
+        *,
+        final_verdict: str,
+        model_verdict: str,
+        reason: str,
+        confidence: str,
+        quality_band: str,
+        high_frame_count: int,
+        score_std: Optional[float],
+        score: Optional[float],
+        raw_score: Optional[float],
+        total_windows: int,
+        temporal_diversity: float,
+        temporal_penalty: float,
+        evidence_quality: float,
+        evidence_strength: str,
+    ) -> dict:
         return {
-            "final_verdict": "INCONCLUSIVE",
-            "model_verdict": "INCONCLUSIVE",
-            "reason": alt_result.get("error") or "no_score",
-            "confidence": "low",
-            "quality_band": "weak",
-            "high_frame_count": 0,
-            "score_std": None,
-            "score": None,
-            "raw_score": None,
+            "final_verdict": final_verdict,
+            "model_verdict": model_verdict,
+            "reason": reason,
+            "confidence": confidence,
+            "quality_band": quality_band,
+            "high_frame_count": high_frame_count,
+            "score_std": score_std,
+            "score": score,
+            "raw_score": raw_score,
+            "total_windows": total_windows,
+            "temporal_diversity": temporal_diversity,
+            "temporal_penalty": temporal_penalty,
+            "evidence_quality": evidence_quality,
+            "evidence_strength": evidence_strength,
         }
+
+    if score is None:
+        return _decision_payload(
+            final_verdict="INCONCLUSIVE",
+            model_verdict="INCONCLUSIVE",
+            reason=alt_result.get("error") or "no_score",
+            confidence="low",
+            quality_band="weak",
+            high_frame_count=0,
+            score_std=None,
+            score=None,
+            raw_score=None,
+            total_windows=int(alt_result.get("total_windows") or 0),
+            temporal_diversity=0.0,
+            temporal_penalty=1.0,
+            evidence_quality=0.0,
+            evidence_strength="weak",
+        )
 
     avg_blur = float(quality_gate.get("avg_blur") or 0.0)
     avg_brightness = float(quality_gate.get("avg_brightness") or 0.0)
     usable_ratio = float(quality_gate.get("usable_ratio") or 0.0)
     seq_frames = int(quality_gate.get("sequence_frames_used") or 0)
 
-    score_std = alt_result.get("score_std")
+    score_std = _safe_float(alt_result.get("score_std"))
     high_frame_count = int(alt_result.get("high_frame_count") or 0)
     raw_score = float(alt_result.get("raw_video_score", score))
+    total_windows = int(
+        alt_result.get("total_windows")
+        or len(alt_result.get("per_frame") or [])
+        or (1 if score is not None else 0)
+    )
 
     calibration = alt_result.get("calibration") or {}
     evidence_quality = float(calibration.get("evidence_quality") or 0.0)
-    diversity_quality = float(calibration.get("diversity_quality") or 0.0)
     temporal_diversity = float(calibration.get("temporal_diversity") or 0.0)
 
-    quality_band = "strong" if (avg_blur >= 20.0 and usable_ratio >= 0.65 and seq_frames >= 24) else "weak"
+    if avg_blur >= 20.0 and usable_ratio >= 0.65 and seq_frames >= 24 and avg_brightness >= 80.0:
+        quality_band = "strong"
+    elif avg_blur >= 8.0 and usable_ratio >= 0.20 and seq_frames >= 8:
+        quality_band = "moderate"
+    else:
+        quality_band = "weak"
+
+    temporal_penalty = 1.0
+    if temporal_diversity < 0.08:
+        temporal_penalty = 0.70
+    elif temporal_diversity < 0.15:
+        temporal_penalty = 0.80
+
+    adjusted_score = max(0.0, min(1.0, float(score) * temporal_penalty))
+    weak_confidence_for_fake = (
+        total_windows < 3
+        or score_std is None
+        or score_std < 0.01
+        or high_frame_count <= 1
+    )
+    strong_fake_evidence = (
+        adjusted_score > 0.95
+        and score_std is not None
+        and score_std > 0.02
+        and temporal_diversity > 0.20
+        and high_frame_count >= 3
+        and total_windows >= 3
+    )
+
+    evidence_strength = _evidence_strength_label(
+        {
+            "quality_band": quality_band,
+            "total_windows": total_windows,
+            "score_std": score_std,
+            "temporal_diversity": temporal_diversity,
+            "high_frame_count": high_frame_count,
+            "evidence_quality": evidence_quality,
+        }
+    )
+
+    if total_windows < 3:
+        return _decision_payload(
+            final_verdict="INCONCLUSIVE",
+            model_verdict="INCONCLUSIVE",
+            reason="insufficient_prediction_windows",
+            confidence="low",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength="weak",
+        )
 
     # Stable bright talking-head override.
     # Real interview/news clips can get inflated raw scores from the pretrained model.
     if (
-        quality_band == "strong"
+        quality_band in {"moderate", "strong"}
         and avg_brightness >= 80.0
         and evidence_quality >= 0.82
         and seq_frames >= 24
         and temporal_diversity <= 0.08
         and raw_score < 0.97
+        and adjusted_score <= 0.55
     ):
-        return {
-            "final_verdict": "REAL",
-            "model_verdict": "REAL",
-            "reason": "stable_bright_talking_head_override",
-            "confidence": "medium",
-            "quality_band": quality_band,
-            "high_frame_count": high_frame_count,
-            "score_std": score_std,
-            "score": score,
-            "raw_score": raw_score,
-        }
+        return _decision_payload(
+            final_verdict="REAL",
+            model_verdict="REAL",
+            reason="stable_bright_talking_head_override",
+            confidence="medium",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
 
-    # Very high raw score on a strong sequence -> FAKE.
-    if (
-        raw_score >= 0.97
-        and quality_band == "strong"
-        and evidence_quality >= 0.75
-        and seq_frames >= 24
-    ):
-        return {
-            "final_verdict": "FAKE",
-            "model_verdict": "FAKE",
-            "reason": "very_high_raw_fake_score_on_strong_sequence",
-            "confidence": "high",
-            "quality_band": quality_band,
-            "high_frame_count": high_frame_count,
-            "score_std": score_std,
-            "score": score,
-            "raw_score": raw_score,
-        }
+    if strong_fake_evidence and quality_band in {"moderate", "strong"} and evidence_quality >= 0.75 and seq_frames >= 24:
+        return _decision_payload(
+            final_verdict="FAKE",
+            model_verdict="FAKE",
+            reason="strong_consistent_fake_signal",
+            confidence="high",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength="strong",
+        )
 
-    if score <= 0.20 and quality_band == "strong":
-        return {
-            "final_verdict": "REAL",
-            "model_verdict": "REAL",
-            "reason": "low_fake_score_with_strong_quality",
-            "confidence": "medium",
-            "quality_band": quality_band,
-            "high_frame_count": high_frame_count,
-            "score_std": score_std,
-            "score": score,
-            "raw_score": raw_score,
-        }
+    if adjusted_score <= 0.20 and quality_band in {"moderate", "strong"} and temporal_diversity >= 0.08:
+        return _decision_payload(
+            final_verdict="REAL",
+            model_verdict="REAL",
+            reason="low_fake_score_with_strong_quality",
+            confidence="high" if evidence_strength == "strong" else "medium",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
 
-    if score >= 0.90 or raw_score >= 0.90:
-        return {
-            "final_verdict": "SUSPICIOUS",
-            "model_verdict": "FAKE",
-            "reason": "high_score_downgraded_to_suspicious",
-            "confidence": "medium" if quality_band == "strong" else "low",
-            "quality_band": quality_band,
-            "high_frame_count": high_frame_count,
-            "score_std": score_std,
-            "score": score,
-            "raw_score": raw_score,
-        }
+    if raw_score >= 0.90 or adjusted_score >= 0.90:
+        downgrade_reason = "high_score_but_weak_evidence" if weak_confidence_for_fake or temporal_diversity < 0.20 else "high_score_downgraded_to_suspicious"
+        return _decision_payload(
+            final_verdict="SUSPICIOUS",
+            model_verdict="FAKE",
+            reason=downgrade_reason,
+            confidence="medium" if evidence_strength != "weak" else "low",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
 
-    if quality_band == "weak" and score >= 0.15:
-        return {
-            "final_verdict": "SUSPICIOUS",
-            "model_verdict": "FAKE",
-            "reason": "anomaly_detected_on_weak_quality_sequence",
-            "confidence": "low",
-            "quality_band": quality_band,
-            "high_frame_count": high_frame_count,
-            "score_std": score_std,
-            "score": score,
-            "raw_score": raw_score,
-        }
+    if quality_band == "weak" and adjusted_score >= 0.15:
+        return _decision_payload(
+            final_verdict="SUSPICIOUS",
+            model_verdict="FAKE",
+            reason="anomaly_detected_on_weak_quality_sequence",
+            confidence="low",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
 
-    return {
-        "final_verdict": "INCONCLUSIVE",
-        "model_verdict": "INCONCLUSIVE",
-        "reason": "score_in_uncertain_band",
-        "confidence": "low",
-        "quality_band": quality_band,
-        "high_frame_count": high_frame_count,
-        "score_std": score_std,
-        "score": score,
-        "raw_score": raw_score,
-    }
+    return _decision_payload(
+        final_verdict="INCONCLUSIVE",
+        model_verdict="INCONCLUSIVE",
+        reason="score_in_uncertain_band",
+        confidence="low",
+        quality_band=quality_band,
+        high_frame_count=high_frame_count,
+        score_std=score_std,
+        score=adjusted_score,
+        raw_score=raw_score,
+        total_windows=total_windows,
+        temporal_diversity=temporal_diversity,
+        temporal_penalty=temporal_penalty,
+        evidence_quality=evidence_quality,
+        evidence_strength=evidence_strength,
+    )
 
 @app.post("/api/analysis/capture")
 async def capture_analysis(
@@ -963,7 +1469,7 @@ async def capture_analysis(
         analysis_id=analysis.id,
         frames=frames_for_cv,
         uploads_dir=str(upload_dir),
-        sequence_length=32,   # matches AltFreezing clip_size and DEFAULT_SEQUENCE_LENGTH
+        sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
         save_crops=True,
     )
 
@@ -1030,6 +1536,35 @@ async def capture_analysis(
         },
     }
 
+    stability_meta = opencv_summary.get("stability", {}) if isinstance(opencv_summary, dict) else {}
+
+    def _reasoning_metadata_for(decision_payload: dict, alt_payload: dict) -> dict:
+        calibration = (alt_payload or {}).get("calibration") or {}
+        return {
+            "verdict": decision_payload.get("final_verdict"),
+            "final_verdict": decision_payload.get("final_verdict"),
+            "score": decision_payload.get("score"),
+            "raw_score": decision_payload.get("raw_score"),
+            "confidence": decision_payload.get("confidence"),
+            "reason": decision_payload.get("reason"),
+            "quality_band": decision_payload.get("quality_band"),
+            "usable_frames": seq_frames,
+            "usable_ratio": usable_ratio,
+            "temporal_diversity": decision_payload.get("temporal_diversity", calibration.get("temporal_diversity")),
+            "duplicate_frames": reject_reasons.get("duplicate_frame", 0),
+            "stability": stability_meta.get("stable"),
+            "drift": stability_meta.get("max_centre_drift"),
+            "blur": avg_blur,
+            "brightness": avg_brightness,
+            "fail_reasons": quality_fail_reasons,
+            "high_frame_count": decision_payload.get("high_frame_count", (alt_payload or {}).get("high_frame_count")),
+            "score_std": decision_payload.get("score_std", (alt_payload or {}).get("score_std")),
+            "total_windows": decision_payload.get("total_windows", (alt_payload or {}).get("total_windows")),
+            "temporal_penalty": decision_payload.get("temporal_penalty"),
+            "evidence_quality": decision_payload.get("evidence_quality", calibration.get("evidence_quality")),
+            "evidence_strength": decision_payload.get("evidence_strength"),
+        }
+
     if not quality_pass:
         alt_result = {
             "ok": False,
@@ -1040,6 +1575,8 @@ async def capture_analysis(
             "per_frame": [],
         }
         decision = _decide_altfreezing_verdict(None, meta_data["quality_gate"], alt_result)
+        decision["final_explanation"] = generate_verdict_reason(_reasoning_metadata_for(decision, alt_result))
+        decision["verdict_reason"] = decision["final_explanation"]
         analysis.score = 0.0
         analysis.verdict = decision["final_verdict"]
         analysis.status = "DONE"
@@ -1053,14 +1590,16 @@ async def capture_analysis(
     alt_result = altfreezing_service.predict_from_sequence(
         analysis_id=analysis.id,
         uploads_dir=upload_dir,
-        sequence_length=16,
+        sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
         weights_path="checkpoints/model.pth",
     )
 
     score = alt_result.get("video_score")
     decision = _decide_altfreezing_verdict(score, meta_data["quality_gate"], alt_result)
+    decision["final_explanation"] = generate_verdict_reason(_reasoning_metadata_for(decision, alt_result))
+    decision["verdict_reason"] = decision["final_explanation"]
 
-    analysis.score = float(score) if score is not None else 0.0
+    analysis.score = float(decision.get("score")) if decision.get("score") is not None else 0.0
     analysis.verdict = decision["final_verdict"]
     analysis.status = "DONE"
     analysis.completed_at = datetime.utcnow()
@@ -1126,6 +1665,7 @@ def _maybe_insert_blocklist(analysis: MediaAnalysis, db: Session):
     db.add(entry)
     db.commit()
 
+@app.get("/api/history")
 @app.get("/api/analysis")
 def list_user_analyses(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     analyses = (
@@ -1160,44 +1700,55 @@ def get_user_analysis_stats(db: Session = Depends(get_db), current_user: User = 
     }
 
 
+@app.delete("/api/history/clear")
+def clear_user_history(db: Session = Depends(get_db), current_user: User = Depends(get_portal_user)):
+    analyses = (
+        db.query(MediaAnalysis)
+        .filter(MediaAnalysis.user_id == current_user.id)
+        .all()
+    )
+
+    deleted_count, files_removed = _delete_analysis_records(db, analyses, current_user.id)
+    return {
+        "ok": True,
+        "deleted": deleted_count,
+        "files_removed": files_removed,
+        "message": "Detection history cleared." if deleted_count else "Detection history is already empty.",
+    }
+
+
+@app.delete("/api/history/{analysis_id}")
+@app.delete("/api/analysis/{analysis_id}")
+def delete_user_history_item(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_portal_user)):
+    analysis = _get_user_analysis_or_404(db, current_user.id, analysis_id)
+    deleted_count, files_removed = _delete_analysis_records(db, [analysis], current_user.id)
+    return {
+        "ok": True,
+        "deleted": deleted_count,
+        "files_removed": files_removed,
+        "message": "Detection record deleted.",
+    }
+
+
 @app.get("/api/analysis/{analysis_id}")
 def get_user_analysis(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    analysis = (
-        db.query(MediaAnalysis)
-        .filter(
-            MediaAnalysis.id == analysis_id,
-            MediaAnalysis.user_id == current_user.id,
-        )
-        .first()
-    )
-    if not analysis:
-        raise HTTPException(status_code=404, detail="Analysis not found")
+    analysis = _get_user_analysis_or_404(db, current_user.id, analysis_id)
     return {"ok": True, "data": _serialize_analysis(analysis)}
 
 @app.get("/api/analysis/{analysis_id}/preview")
 def get_user_analysis_preview(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    from fastapi.responses import FileResponse
-    analysis = (
-        db.query(MediaAnalysis)
-        .filter(
-            MediaAnalysis.id == analysis_id,
-            MediaAnalysis.user_id == current_user.id,
-        )
-        .first()
-    )
-    if not analysis:
-        raise HTTPException(status_code=404, detail="Analysis not found")
-        
-    upload_dir = Path(__file__).resolve().parent / "uploads"
+    analysis = _get_user_analysis_or_404(db, current_user.id, analysis_id)
+
+    upload_dir = _uploads_root()
     raw_dir = upload_dir / f"{analysis.id}_raw"
-    
+
     if raw_dir.exists() and raw_dir.is_dir():
         files = list(raw_dir.glob("*.jpg"))
         if files:
             # Sort to ensure we get frame_0 / frame_000
             files.sort()
             return FileResponse(files[0])
-            
+
     raise HTTPException(status_code=404, detail="Preview image not available")
 
 
@@ -1238,28 +1789,38 @@ def list_blocklist(db: Session = Depends(get_db), current_user: User = Depends(g
     """Portal-facing authenticated endpoint: full blocklist with analysis source info."""
     entries = (
         db.query(GlobalBlocklist)
+        .filter(GlobalBlocklist.status == "active")
         .order_by(GlobalBlocklist.created_at.desc())
         .all()
     )
     return {
         "ok": True,
-        "data": [
-            {
-                "id": e.id,
-                "fingerprint_hash": e.fingerprint_hash,
-                "video_id": e.video_id,
-                "source_url": e.source_url,
-                "platform": e.platform,
-                "title": e.title,
-                "verdict": e.verdict,
-                "risk_score": e.risk_score,
-                "risk_level": e.risk_level,
-                "analysis_id": e.analysis_id,
-                "status": e.status,
-                "created_at": e.created_at.isoformat() if e.created_at else None,
-            }
-            for e in entries
-        ]
+        "data": [_serialize_blocklist_entry(e) for e in entries]
+    }
+
+
+@app.delete("/api/blocklist/{entry_id}")
+def remove_blocklist_entry(entry_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_portal_user)):
+    entry = (
+        db.query(GlobalBlocklist)
+        .filter(
+            GlobalBlocklist.id == entry_id,
+            GlobalBlocklist.status == "active",
+        )
+        .first()
+    )
+    if not entry:
+        raise HTTPException(status_code=404, detail="Blocklist entry not found")
+
+    entry.status = "unblocked"
+    entry.updated_at = _utcnow()
+    db.commit()
+    db.refresh(entry)
+
+    return {
+        "ok": True,
+        "message": "Media removed from the blocklist.",
+        "data": _serialize_blocklist_entry(entry),
     }
 
 

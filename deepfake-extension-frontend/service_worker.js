@@ -12,11 +12,12 @@ const FRONTEND_BASE = "http://localhost:5173";
 const PORTAL_ANALYSIS_URL = `${FRONTEND_BASE}/media-analysis`;
 
 const FRAME_COUNT = 48;
-const CAPTURE_INTERVAL_MS = 100;
+const CAPTURE_INTERVAL_MS = 200;
 const JPEG_QUALITY = 80;
 const READY_TIMEOUT_MS = 12000;
 const BLANK_FALLBACK_THRESHOLD = 0.7;
 const OFFSCREEN_URL = "offscreen.html";
+const BLOCKLIST_SYNC_MIN_INTERVAL_MS = 10_000;
 
 let isCapturing = false;
 
@@ -24,6 +25,8 @@ let isCapturing = false;
 // In-memory Set of blocked video IDs for O(1) lookup without IDB round-trips.
 // Rebuilt on SW startup and after every blocklist sync.
 let blockedVideoIdSet = new Set();
+let lastBlocklistSyncAt = 0;
+let blocklistSyncPromise = null;
 
 // Short-lived bypass Map: videoId → expiry timestamp (ms).
 // Stored in-memory so the SW can check it synchronously with zero latency.
@@ -61,6 +64,20 @@ async function rebuildBlockedSet() {
   }
 }
 
+async function maybeSyncBlocklist({ force = false } = {}) {
+  const now = Date.now();
+  if (!force && now - lastBlocklistSyncAt < BLOCKLIST_SYNC_MIN_INTERVAL_MS) return;
+  if (blocklistSyncPromise) return blocklistSyncPromise;
+
+  blocklistSyncPromise = syncBlocklist()
+    .catch(() => { })
+    .finally(() => {
+      blocklistSyncPromise = null;
+    });
+
+  return blocklistSyncPromise;
+}
+
 async function handleNavigation(details) {
   // Only intercept main-frame navigations.
   if (details.frameId !== 0) return;
@@ -71,7 +88,9 @@ async function handleNavigation(details) {
   if (url.startsWith(BLOCKED_PAGE)) return;
 
   const videoId = _extractVideoId(url);
-  if (!videoId || !blockedVideoIdSet.has(videoId)) return;
+  if (!videoId) return;
+  await maybeSyncBlocklist();
+  if (!blockedVideoIdSet.has(videoId)) return;
 
   // Check if the user explicitly chose to proceed for this video ID.
   const bypassExpiry = _bypassMap.get(videoId);
@@ -98,12 +117,12 @@ async function handleNavigation(details) {
   } catch { }
 
   const params = new URLSearchParams({
-    video_id:     videoId,
+    video_id: videoId,
     original_url: url,
     referrer_url: referrerUrl,
-    title:        entry?.title      || "",
-    verdict:      entry?.verdict    || "FAKE",
-    risk_score:   String(entry?.risk_score ?? 100),
+    title: entry?.title || "",
+    verdict: entry?.verdict || "FAKE",
+    risk_score: String(entry?.risk_score ?? 100),
   });
 
   try {
@@ -323,7 +342,7 @@ async function handleCaptureSuccess(out, meta) {
     lastAnalysisStatus: out?.status ?? null,
     lastAnalysisMeta: meta ?? null,
     lastPortalUrl: out?.analysis_id
-      ? `${PORTAL_ANALYSIS_URL}?analysis_id=${encodeURIComponent(out.analysis_id)}`
+      ? `${PORTAL_ANALYSIS_URL}/${encodeURIComponent(out.analysis_id)}`
       : PORTAL_ANALYSIS_URL,
     extensionLinkError: "",
   });
@@ -347,6 +366,7 @@ async function syncBlocklist() {
     const json = await res.json();
     if (!json.ok || !Array.isArray(json.entries)) return;
     await self.DeepfakeIDB.idbBulkSync(json.entries);
+    lastBlocklistSyncAt = Date.now();
     await chrome.storage.local.set({ blocklistCount: json.entries.length, blocklistSyncedAt: Date.now() });
     console.log(`[Blocklist] Synced ${json.entries.length} entries.`);
     // Rebuild navigation block set immediately so new blocks take effect.
@@ -401,6 +421,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         if (!self.DeepfakeIDB) throw new Error("IDB not loaded");
+        await maybeSyncBlocklist();
         const entry = await self.DeepfakeIDB.idbGetByVideoId(msg.videoId);
         sendResponse({ ok: true, entry: entry || null });
       } catch (err) { sendResponse({ ok: false, error: err.message }); }
@@ -412,6 +433,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     (async () => {
       try {
         if (!self.DeepfakeIDB) throw new Error("IDB not loaded");
+        await maybeSyncBlocklist();
         const entry = await self.DeepfakeIDB.idbGetEntry(msg.hash);
         sendResponse({ ok: true, entry: entry || null });
       } catch (err) { sendResponse({ ok: false, error: err.message }); }
