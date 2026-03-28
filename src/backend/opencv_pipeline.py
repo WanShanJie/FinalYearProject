@@ -40,7 +40,7 @@ TRACK_MAX_CENTRE_JUMP  = 0.40   # max centre movement as fraction of frame diago
 TRACK_MIN_AREA_RATIO   = 0.35   # candidate area / prev area must exceed this
 
 # ── Track-break policy (Fix 2) ───────────────────────────────────────────────
-TRACK_MAX_MISS = 2   # consecutive misses before we stop the sequence
+TRACK_MAX_MISS = 2   # consecutive misses before tracker resets and re-anchors
 
 # ── Warm-up skip (Fix 4) ─────────────────────────────────────────────────────
 WARMUP_SKIP_FRAMES = 2   # drop this many frames from the start of every capture
@@ -57,7 +57,7 @@ DUP_BLUR_RATIO  = 0.08   # max relative blur change
 DUP_BRIGHT_DIFF = 5.0    # max brightness delta (grey levels)
 
 # ── Sequence length ───────────────────────────────────────────────────────────
-DEFAULT_SEQUENCE_LENGTH = 32
+DEFAULT_SEQUENCE_LENGTH = 40
 
 # ── YuNet detector (module-level singleton) ───────────────────────────────────
 face_detector      = None
@@ -260,7 +260,12 @@ def _track_primary_face(
     frame_diag: float,
 ) -> Tuple[List[Dict], Dict]:
     """
-    Single-pass strict tracker.
+    Single-pass gap-tolerant tracker.
+
+    When TRACK_MAX_MISS consecutive frames are missed the tracker resets
+    (prev_bbox = None) so it re-anchors on the next valid face rather than
+    discarding all remaining frames.  This preserves face crops from later
+    segments of a video where the subject momentarily left the frame.
 
     Returns
     -------
@@ -268,10 +273,10 @@ def _track_primary_face(
                    `selected` is None for missed / geometry-rejected frames.
     tracker_meta : summary dict
     """
-    prev_bbox:     Optional[Dict] = None
-    miss_streak:   int            = 0
-    track_items:   List[Dict]     = []
-    broken_at_idx: Optional[int]  = None
+    prev_bbox:   Optional[Dict] = None
+    miss_streak: int            = 0
+    track_items: List[Dict]     = []
+    gap_count:   int            = 0
 
     for item in frame_candidates:
         idx        = item["idx"]
@@ -283,17 +288,17 @@ def _track_primary_face(
             out["track_reject"] = "no_candidate"
         else:
             if prev_bbox is None:
-                # Anchor: pick the largest, most-centred face
+                # Anchor (or re-anchor after a gap): pick the largest, most-centred face
                 best = max(
                     candidates,
                     key=lambda c: (c["bbox"]["w"] * c["bbox"]["h"],
                                    c["center_score"],
                                    c["blur_var"]),
                 )
-                out["selected"]    = best
+                out["selected"]     = best
                 out["track_reject"] = None
-                prev_bbox          = best["bbox"]
-                miss_streak        = 0
+                prev_bbox           = best["bbox"]
+                miss_streak         = 0
             else:
                 # Try to find a geometrically consistent candidate
                 consistent_candidates = []
@@ -309,10 +314,10 @@ def _track_primary_face(
                                        c["center_score"],
                                        c["blur_var"]),
                     )
-                    out["selected"]    = best
+                    out["selected"]     = best
                     out["track_reject"] = None
-                    prev_bbox          = best["bbox"]
-                    miss_streak        = 0
+                    prev_bbox           = best["bbox"]
+                    miss_streak         = 0
                 else:
                     # All candidates failed the geometry guard
                     miss_streak += 1
@@ -322,19 +327,19 @@ def _track_primary_face(
                         reasons.append(r)
                     out["track_reject"] = "geometry_rejected: " + " | ".join(reasons)
 
-        # Fix 2 ─ stop the sequence when the track breaks
-        if miss_streak > TRACK_MAX_MISS and broken_at_idx is None:
-            broken_at_idx = idx
+        # Fix 2 ─ reset tracker after too many consecutive misses so frames
+        # after the gap are still collected (gap-tolerant behaviour).
+        if miss_streak > TRACK_MAX_MISS:
+            prev_bbox   = None
+            miss_streak = 0
+            gap_count  += 1
 
         track_items.append(out)
 
-    # Trim everything after the first track break
-    if broken_at_idx is not None:
-        track_items = [t for t in track_items if t["idx"] < broken_at_idx]
-
     meta = {
-        "broken_at_idx": broken_at_idx,
-        "track_break": broken_at_idx is not None,
+        "broken_at_idx": None,
+        "track_break": False,
+        "gap_count": gap_count,
         "frames_considered": len(frame_candidates),
         "frames_after_trim": len(track_items),
     }
@@ -516,7 +521,6 @@ def process_frames_for_sequence(
     sequence_ok = (
         used_counter >= max(4, min(sequence_length, 8))
         and stability["stable"]
-        and not tracker_meta["track_break"]
     )
 
     return {

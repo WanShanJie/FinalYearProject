@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Context-Aware Deepfake Verification",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Realtime fingerprint monitoring (local) + Analyze button that captures screen and sends to backend for deepfake analysis.",
   "action": {
     "default_title": "Context-Aware Deepfake Verification",
@@ -15,7 +15,9 @@
     "windows",
     "tabCapture",
     "offscreen",
-    "alarms"
+    "alarms",
+    "webNavigation",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "<all_urls>",
@@ -42,7 +44,13 @@
         "idb.js",
         "content.js"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["blocked.html"],
+      "matches": ["<all_urls>"]
     }
   ]
 }

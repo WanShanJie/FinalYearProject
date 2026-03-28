@@ -20,6 +20,109 @@ const OFFSCREEN_URL = "offscreen.html";
 
 let isCapturing = false;
 
+// ── Navigation blocking ───────────────────────────────────────────────────────
+// In-memory Set of blocked video IDs for O(1) lookup without IDB round-trips.
+// Rebuilt on SW startup and after every blocklist sync.
+let blockedVideoIdSet = new Set();
+
+// Short-lived bypass Map: videoId → expiry timestamp (ms).
+// Stored in-memory so the SW can check it synchronously with zero latency.
+// Content scripts query it via the CHECK_BYPASS message.
+const _bypassMap = new Map();
+
+const BLOCKED_PAGE = chrome.runtime.getURL("blocked.html");
+
+function _extractVideoId(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes("youtube.com")) {
+      const v = u.searchParams.get("v");
+      if (v) return v;
+      const m = u.pathname.match(/\/shorts\/([^/?#]+)/);
+      if (m?.[1]) return m[1];
+    }
+    if (u.hostname.includes("youtu.be")) {
+      return u.pathname.split("/").filter(Boolean)[0] || null;
+    }
+  } catch { }
+  return null;
+}
+
+async function rebuildBlockedSet() {
+  if (!self.DeepfakeIDB) return;
+  try {
+    const entries = await self.DeepfakeIDB.idbGetAllActive();
+    blockedVideoIdSet = new Set(
+      entries.filter(e => e.video_id).map(e => e.video_id)
+    );
+    console.log(`[BlockNav] Blocked set: ${blockedVideoIdSet.size} video IDs`);
+  } catch (e) {
+    console.warn("[BlockNav] rebuildBlockedSet failed:", e);
+  }
+}
+
+async function handleNavigation(details) {
+  // Only intercept main-frame navigations.
+  if (details.frameId !== 0) return;
+
+  const url = details.url || "";
+
+  // Skip the blocked page itself.
+  if (url.startsWith(BLOCKED_PAGE)) return;
+
+  const videoId = _extractVideoId(url);
+  if (!videoId || !blockedVideoIdSet.has(videoId)) return;
+
+  // Check if the user explicitly chose to proceed for this video ID.
+  const bypassExpiry = _bypassMap.get(videoId);
+  if (bypassExpiry) {
+    if (Date.now() < bypassExpiry) return;  // still within the bypass window
+    _bypassMap.delete(videoId);
+  }
+
+  // Capture the tab's current URL as the "back" destination before redirecting.
+  let referrerUrl = "";
+  try {
+    const tab = await chrome.tabs.get(details.tabId);
+    referrerUrl = tab?.url || "";
+    // Don't use the blocked page itself or the video being blocked as a referrer.
+    if (referrerUrl.startsWith(BLOCKED_PAGE) || _extractVideoId(referrerUrl) === videoId) {
+      referrerUrl = "https://www.youtube.com/";
+    }
+  } catch { }
+
+  // Fetch full entry so we can show title/verdict on the blocked page.
+  let entry = null;
+  try {
+    if (self.DeepfakeIDB) entry = await self.DeepfakeIDB.idbGetByVideoId(videoId);
+  } catch { }
+
+  const params = new URLSearchParams({
+    video_id:     videoId,
+    original_url: url,
+    referrer_url: referrerUrl,
+    title:        entry?.title      || "",
+    verdict:      entry?.verdict    || "FAKE",
+    risk_score:   String(entry?.risk_score ?? 100),
+  });
+
+  try {
+    await chrome.tabs.update(details.tabId, { url: `${BLOCKED_PAGE}?${params}` });
+  } catch (e) {
+    console.warn("[BlockNav] Redirect failed:", e);
+  }
+}
+
+// Primary: fires before the renderer starts loading the page.
+chrome.webNavigation.onBeforeNavigate.addListener(handleNavigation, {
+  url: [{ hostContains: "youtube.com" }, { hostContains: "youtu.be" }],
+});
+
+// Secondary: catches YouTube SPA navigation (history.pushState / ?v= changes).
+chrome.webNavigation.onHistoryStateUpdated.addListener(handleNavigation, {
+  url: [{ hostContains: "youtube.com" }],
+});
+
 chrome.runtime.onInstalled.addListener(async () => {
   const st = await chrome.storage.local.get(["monitoringEnabled", "scanned", "blocked"]);
   await chrome.storage.local.set({
@@ -32,6 +135,12 @@ chrome.runtime.onInstalled.addListener(async () => {
   syncBlocklist().catch(() => { });
   chrome.alarms.create("blocklist_sync", { periodInMinutes: 30 });
 });
+
+// Re-populate the in-memory set whenever the SW wakes up after being killed.
+chrome.runtime.onStartup.addListener(() => {
+  rebuildBlockedSet().catch(() => { });
+});
+rebuildBlockedSet().catch(() => { });
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -240,6 +349,8 @@ async function syncBlocklist() {
     await self.DeepfakeIDB.idbBulkSync(json.entries);
     await chrome.storage.local.set({ blocklistCount: json.entries.length, blocklistSyncedAt: Date.now() });
     console.log(`[Blocklist] Synced ${json.entries.length} entries.`);
+    // Rebuild navigation block set immediately so new blocks take effect.
+    await rebuildBlockedSet();
     const tabs = await chrome.tabs.query({});
     for (const tab of tabs) {
       chrome.tabs.sendMessage(tab.id, { type: "BLOCKLIST_UPDATED" }).catch(() => { });
@@ -257,6 +368,24 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 // ── Message handler ───────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+
+  if (msg?.type === "ALLOW_BYPASS") {
+    // Synchronously write to the in-memory bypass map, then respond.
+    // No async storage involved — the map is readable by handleNavigation
+    // the instant this function returns.
+    if (msg.videoId) _bypassMap.set(msg.videoId, Date.now() + 60_000);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg?.type === "CHECK_BYPASS") {
+    // Content scripts ask the SW whether a video ID is currently bypassed.
+    const expiry = _bypassMap.get(msg.videoId);
+    const bypassed = !!expiry && Date.now() < expiry;
+    if (expiry && !bypassed) _bypassMap.delete(msg.videoId);
+    sendResponse({ bypassed });
+    return true;
+  }
 
   if (msg?.type === "DISCONNECT_EXTENSION") {
     (async () => {

@@ -168,6 +168,13 @@ async function processMedia(el) {
 
 var _videoIdCache = new Map();
 
+async function _isBypassed(videoId) {
+  try {
+    const res = await chrome.runtime.sendMessage({ type: "CHECK_BYPASS", videoId });
+    return res?.bypassed === true;
+  } catch { return false; }
+}
+
 async function checkVideoIdOnPage() {
   if (window.__captureInProgress) return;
   try {
@@ -178,19 +185,38 @@ async function checkVideoIdOnPage() {
     else { try { videoId = new URL(url).searchParams.get("v"); } catch { } }
     if (!videoId) return;
 
+    // If the user clicked "Proceed anyway", don't redirect them back.
+    if (await _isBypassed(videoId)) return;
+
     if (_videoIdCache.has(videoId)) {
       const cached = _videoIdCache.get(videoId);
-      if (cached) document.querySelectorAll("video").forEach(v => blockElement(v, cached));
+      if (cached) _redirectToBlockedPage(videoId, url, cached);
       return;
     }
 
     const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
     _videoIdCache.set(videoId, res?.ok && res?.entry ? res.entry : null);
     if (res?.ok && res?.entry) {
-      document.querySelectorAll("video").forEach(v => blockElement(v, res.entry));
+      _redirectToBlockedPage(videoId, url, res.entry);
       await bumpCounter("blocked", 1);
       safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
     }
+  } catch { }
+}
+
+function _redirectToBlockedPage(videoId, originalUrl, entry) {
+  // Pause and hide all video elements immediately while redirect is in flight.
+  document.querySelectorAll("video").forEach(v => { v.pause(); v.style.visibility = "hidden"; });
+  try {
+    const blockedPage = chrome.runtime.getURL("blocked.html");
+    const params = new URLSearchParams({
+      video_id:     videoId,
+      original_url: originalUrl,
+      title:        entry?.title     || "",
+      verdict:      entry?.verdict   || "FAKE",
+      risk_score:   String(entry?.risk_score ?? 100),
+    });
+    location.replace(`${blockedPage}?${params}`);
   } catch { }
 }
 
@@ -216,39 +242,103 @@ function extractCardVideoId(card) {
   return null;
 }
 
+// ── Non-blocking warning badge for feed cards ─────────────────────────────────
+// Attaches a visible warning directly to the thumbnail.
+// pointer-events:none on every element — the card remains fully clickable.
+
+function addWarningBadge(card, thumbHost) {
+  if (card.dataset.deepfakeWarned === "1") return;
+  card.dataset.deepfakeWarned = "1";
+
+  if (!thumbHost) return;
+  if (getComputedStyle(thumbHost).position === "static") {
+    thumbHost.style.position = "relative";
+  }
+
+  // Semi-transparent overlay on the thumbnail — visually prominent but
+  // pointer-events:none so every click falls through to the video link.
+  const ov = document.createElement("div");
+  ov.style.cssText = [
+    "position:absolute;inset:0;z-index:9999",
+    "background:rgba(0,0,0,0.58)",
+    "display:flex;flex-direction:column;align-items:center;justify-content:center;gap:5px",
+    "pointer-events:none;user-select:none;border-radius:inherit",
+  ].join(";");
+  ov.innerHTML =
+    '<span style="font-size:2rem;line-height:1;">⚠️</span>' +
+    '<span style="color:#fff;font-weight:700;font-size:0.92rem;text-align:center;' +
+    'text-shadow:0 1px 6px rgba(0,0,0,0.9);padding:0 8px;line-height:1.3;">' +
+    'Deepfake Detected</span>';
+
+  // Pill badge at bottom-left — spec-compliant appearance.
+  const badge = document.createElement("div");
+  badge.style.cssText = [
+    "position:absolute;bottom:6px;left:6px;z-index:10000",
+    "display:inline-flex;align-items:center;gap:4px",
+    "padding:3px 7px",
+    "background:rgba(0,0,0,0.75)",
+    "border:2px solid #f59e0b",
+    "border-radius:4px",
+    "pointer-events:none;user-select:none",
+  ].join(";");
+  badge.innerHTML =
+    '<span style="font-size:0.8rem;line-height:1;">⚠️</span>' +
+    '<span style="color:#fff;font-size:0.72rem;font-weight:600;white-space:nowrap;">' +
+    'Deepfake Detected</span>';
+
+  thumbHost.appendChild(ov);
+  thumbHost.appendChild(badge);
+}
+
+function _isFeedPage() {
+  const p = location.pathname;
+  return p.startsWith("/feed/") || p.startsWith("/playlist");
+}
+
 async function processYouTubeCard(card) {
   if (window.__captureInProgress) return;
+  // Already fully processed — badge applied or card hidden.
+  if (card.dataset.deepfakeWarned === "1") return;
+  // Already in the WeakSet with a confirmed video ID (not-in-blocklist result).
   if (_scannedCards.has(card)) return;
-  _scannedCards.add(card);
 
+  // Extract video ID BEFORE marking the card as scanned.
+  // If the href attributes are not yet rendered (YouTube lazy-renders them),
+  // we must NOT add the card to _scannedCards — the next scan pass will retry.
   const videoId = extractCardVideoId(card);
   if (!videoId) return;
 
+  // Mark scanned only once we have a valid video ID.
+  _scannedCards.add(card);
+
+  let entry;
   if (_videoIdCache.has(videoId)) {
-    const entry = _videoIdCache.get(videoId);
-    if (entry) {
-      if (getComputedStyle(card).position === "static") card.style.position = "relative";
-      const overlay = document.createElement("div");
-      overlay.style.cssText = "position:absolute;inset:0;background:rgba(15,15,20,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;border-radius:6px;";
-      overlay.innerHTML = '<span style="color:#ef4444;font-weight:700;font-size:0.85rem;">🚫 Blocked</span>';
-      card.appendChild(overlay);
-    }
-    return;
+    entry = _videoIdCache.get(videoId);
+  } else {
+    const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+    entry = res?.ok && res?.entry ? res.entry : null;
+    _videoIdCache.set(videoId, entry);
   }
 
-  const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
-  const entry = res?.ok && res?.entry ? res.entry : null;
-  _videoIdCache.set(videoId, entry);
+  if (!entry) return;
 
-  if (entry) {
-    if (getComputedStyle(card).position === "static") card.style.position = "relative";
-    const overlay = document.createElement("div");
-    overlay.style.cssText = "position:absolute;inset:0;background:rgba(15,15,20,0.85);z-index:9999;display:flex;align-items:center;justify-content:center;border-radius:6px;";
-    overlay.innerHTML = '<span style="color:#ef4444;font-weight:700;font-size:0.85rem;">🚫 Blocked</span>';
-    card.appendChild(overlay);
-    bumpCounter("blocked", 1).catch(() => { });
-    safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
+  if (_isFeedPage()) {
+    // Feed pages (history, playlists, watch later, liked videos):
+    // non-blocking warning badge — card stays fully clickable.
+    const thumbHost =
+      card.querySelector("a#thumbnail") ||
+      card.querySelector("#thumbnail")  ||
+      card.querySelector("ytd-thumbnail a") ||
+      card.querySelector("ytd-thumbnail");
+    addWarningBadge(card, thumbHost);
+  } else {
+    // Search / home / recommendations: hide the card entirely.
+    card.dataset.deepfakeWarned = "1";
+    card.style.display = "none";
   }
+
+  bumpCounter("blocked", 1).catch(() => { });
+  safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
 }
 
 function scanYouTubeCards(root = document) {
@@ -284,8 +374,19 @@ var mo = new MutationObserver((mutations) => {
     currentUrl = location.href;
     _videoIdCache.clear();
     _scannedCards = new WeakSet();
+    // Clear badge flags so cards are re-evaluated on the new page.
+    document.querySelectorAll("[data-deepfake-warned]").forEach(
+      el => delete el.dataset.deepfakeWarned
+    );
     clearTimeout(scanTimer);
-    scanTimer = setTimeout(() => { checkVideoIdOnPage().catch(() => { }); scanYouTubeCards(document); }, 300);
+    // First scan at 500ms; YouTube's history/playlist items are lazy-loaded
+    // so add two follow-up scans to catch items rendered after initial paint.
+    scanTimer = setTimeout(() => {
+      checkVideoIdOnPage().catch(() => { });
+      scanYouTubeCards(document);
+      setTimeout(() => scanYouTubeCards(document), 1200);
+      setTimeout(() => scanYouTubeCards(document), 3000);
+    }, 500);
     return;
   }
 
@@ -652,9 +753,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "BLOCKLIST_UPDATED") {
       _videoIdCache.clear();
       _scannedCards = new WeakSet();
+      document.querySelectorAll("[data-deepfake-warned]").forEach(
+        el => delete el.dataset.deepfakeWarned
+      );
       if (!window.__captureInProgress) {
         checkVideoIdOnPage().catch(() => { });
         scanExisting();
+        // Re-scan again after a delay in case the page has lazy content.
+        setTimeout(() => scanYouTubeCards(document), 1500);
       }
       sendResponse({ ok: true });
       return;

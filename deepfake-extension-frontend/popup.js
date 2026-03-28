@@ -174,8 +174,10 @@ function updateResultUI(verdictRaw, rawScore, meta) {
   const sourceId = meta?.video_id || meta?.current_video_id || "...";
   document.getElementById("idtMediaType").textContent = mediaType;
   document.getElementById("idtPlatform").textContent = platform.charAt(0).toUpperCase() + platform.slice(1);
+  document.getElementById("idtTitle").textContent = meta?.title || "Unknown";
   document.getElementById("idtSource").textContent = sourceId;
   document.getElementById("idtSource").title = meta?.canonical_url || meta?.page_url || "";
+  document.getElementById("idtVideoId").textContent = meta?.video_id || meta?.locked_video_id || "...";
 
   if (displayVerdict === "REAL") resReason.textContent = "No significant evidence of digital manipulation.";
   else if (displayVerdict === "FAKE") resReason.textContent = "Strong indicators of digital manipulation detected.";
