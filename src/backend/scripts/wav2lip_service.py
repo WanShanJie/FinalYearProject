@@ -134,58 +134,79 @@ class _Wav2LipModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
 
+        # Architecture reverse-engineered from wav2lip_gan.pth checkpoint weights.
         self.face_encoder_blocks = nn.ModuleList([
-            nn.Sequential(_Conv2d(6,   16,  7, 1, 3)),                          # 96×96
-            nn.Sequential(_Conv2d(16,  32,  3, 2, 1),                           # 48×48
+            nn.Sequential(_Conv2d(6,   16,  7, 1, 3)),                           # 96×96
+            nn.Sequential(_Conv2d(16,  32,  3, 2, 1),                            # 48×48
                           _Conv2d(32,  32,  3, 1, 1, residual=True),
                           _Conv2d(32,  32,  3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2d(32,  64,  3, 2, 1),                           # 24×24
+            nn.Sequential(_Conv2d(32,  64,  3, 2, 1),                            # 24×24
                           _Conv2d(64,  64,  3, 1, 1, residual=True),
-                          _Conv2d(64,  64,  3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2d(64,  128, 3, 2, 1),                           # 12×12
+                          _Conv2d(64,  64,  3, 1, 1, residual=True),
+                          _Conv2d(64,  64,  3, 1, 1, residual=True)),             # ← extra residual
+            nn.Sequential(_Conv2d(64,  128, 3, 2, 1),                            # 12×12
                           _Conv2d(128, 128, 3, 1, 1, residual=True),
                           _Conv2d(128, 128, 3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2d(128, 256, 3, 2, 1),                           #  6×6
+            nn.Sequential(_Conv2d(128, 256, 3, 2, 1),                            #  6×6
                           _Conv2d(256, 256, 3, 1, 1, residual=True),
                           _Conv2d(256, 256, 3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2d(256, 512, 3, 2, 1),                           #  3×3
+            nn.Sequential(_Conv2d(256, 512, 3, 2, 1),                            #  3×3
                           _Conv2d(512, 512, 3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2d(512, 512, 3, 1, 0),                           #  1×1
+            nn.Sequential(_Conv2d(512, 512, 3, 1, 0),                            #  1×1
                           _Conv2d(512, 512, 1, 1, 0)),
         ])
 
+        # 13-layer audio encoder matching checkpoint channel progression
         self.audio_encoder = nn.Sequential(
-            _Conv2d(1,   32,  3, 1,      1),
-            _Conv2d(32,  32,  3, 1,      1, residual=True),
-            _Conv2d(32,  64,  3, (3, 1), 1),
-            _Conv2d(64,  64,  3, 1,      1, residual=True),
-            _Conv2d(64,  128, 3, 3,      1),
-            _Conv2d(128, 128, 3, 1,      1, residual=True),
-            _Conv2d(128, 256, 3, (3, 2), 1),
-            _Conv2d(256, 256, 3, 1,      1, residual=True),
-            _Conv2d(256, 512, 3, 1,      0),
-            _Conv2d(512, 512, 1, 1,      0),
+            _Conv2d(1,   32,  3, 1,      1),                 # layer 0
+            _Conv2d(32,  32,  3, 1,      1, residual=True),  # layer 1
+            _Conv2d(32,  32,  3, (3, 1), 1),                 # layer 2  stride=(3,1), same ch
+            _Conv2d(32,  64,  3, 1,      1),                 # layer 3  channel expand
+            _Conv2d(64,  64,  3, 3,      1),                 # layer 4
+            _Conv2d(64,  64,  3, 1,      1, residual=True),  # layer 5
+            _Conv2d(64,  128, 3, (3, 2), 1),                 # layer 6
+            _Conv2d(128, 128, 3, 1,      1, residual=True),  # layer 7
+            _Conv2d(128, 128, 3, 1,      0),                 # layer 8  no pad → (3,3)→(1,1)
+            _Conv2d(128, 256, 3, 1,      1),                 # layer 9
+            _Conv2d(256, 256, 3, 1,      1, residual=True),  # layer 10
+            _Conv2d(256, 512, 3, 1,      1),                 # layer 11
+            _Conv2d(512, 512, 1, 1,      0),                 # layer 12
         )
 
+        # Decoder channel sizes match skip-connection dimensions from face encoder:
+        #   after each decoder block output is cat'd with face encoder skip → new width
+        #   dec0: 512 → cat(fe6=512) → 1024
+        #   dec1: 1024→512 → cat(fe5=512) → 1024
+        #   dec2: 1024→512 → cat(fe4=256) → 768
+        #   dec3: 768→384  → cat(fe3=128) → 512
+        #   dec4: 512→256  → cat(fe2=64)  → 320
+        #   dec5: 320→128  → cat(fe1=32)  → 160
+        #   dec6: 160→64   → cat(fe0=16)  → 80   → output_block
         self.face_decoder_blocks = nn.ModuleList([
             nn.Sequential(_Conv2dTranspose(512,  512, 1, 1, 0)),
             nn.Sequential(_Conv2dTranspose(1024, 512, 3, 1, 0),
                           _Conv2d(512, 512, 3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2dTranspose(1024, 256, 3, 2, 1, output_padding=1),
+            nn.Sequential(_Conv2dTranspose(1024, 512, 3, 2, 1, output_padding=1),
+                          _Conv2d(512, 512, 3, 1, 1, residual=True),
+                          _Conv2d(512, 512, 3, 1, 1, residual=True)),
+            nn.Sequential(_Conv2dTranspose(768,  384, 3, 2, 1, output_padding=1),
+                          _Conv2d(384, 384, 3, 1, 1, residual=True),
+                          _Conv2d(384, 384, 3, 1, 1, residual=True)),
+            nn.Sequential(_Conv2dTranspose(512,  256, 3, 2, 1, output_padding=1),
+                          _Conv2d(256, 256, 3, 1, 1, residual=True),
                           _Conv2d(256, 256, 3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2dTranspose(512,  128, 3, 2, 1, output_padding=1),
+            nn.Sequential(_Conv2dTranspose(320,  128, 3, 2, 1, output_padding=1),
+                          _Conv2d(128, 128, 3, 1, 1, residual=True),
                           _Conv2d(128, 128, 3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2dTranspose(256,   64, 3, 2, 1, output_padding=1),
+            nn.Sequential(_Conv2dTranspose(160,   64, 3, 2, 1, output_padding=1),
+                          _Conv2d(64,  64,  3, 1, 1, residual=True),
                           _Conv2d(64,  64,  3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2dTranspose(128,   32, 3, 2, 1, output_padding=1),
-                          _Conv2d(32,  32,  3, 1, 1, residual=True)),
-            nn.Sequential(_Conv2dTranspose(64,    16, 3, 2, 1, output_padding=1),
-                          _Conv2d(16,  16,  3, 1, 1, residual=True)),
         ])
 
+        # Input is 80ch after final cat (dec6_out=64 + fe_block0=16)
         self.output_block = nn.Sequential(
-            _Conv2d(32, 16, 3, 1, 1),
-            nn.Conv2d(16, 3, 1, 1, 0),
+            _Conv2d(80, 32, 3, 1, 1),
+            nn.Conv2d(32, 3, 1, 1, 0),
             nn.Sigmoid(),
         )
 

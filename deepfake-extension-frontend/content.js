@@ -770,6 +770,28 @@ async function extractLiveFramesFromVideo(video, {
   canvas.height = video.videoHeight || 360;
   const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
+  // ── Audio recording from the video element (for Wav2Lip) ──────────────────
+  // captureStream() gives us the raw audio from the YouTube player without
+  // needing tabCapture or any extra permissions.
+  let audioRecorder = null;
+  const audioChunks = [];
+  try {
+    const stream = video.captureStream ? video.captureStream() : null;
+    const audioTracks = stream ? stream.getAudioTracks() : [];
+    if (audioTracks.length > 0) {
+      const audioStream = new MediaStream(audioTracks);
+      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+        ? "audio/webm;codecs=opus" : "audio/webm";
+      audioRecorder = new MediaRecorder(audioStream, { mimeType });
+      audioRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+      audioRecorder.start();
+    }
+  } catch (e) {
+    console.warn("[Capture] Audio recorder start failed:", e);
+    audioRecorder = null;
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   const startedAt = Date.now();
   const frames = [], tsMs = [], perFrame = [];
   let blankCount = 0;
@@ -814,8 +836,32 @@ async function extractLiveFramesFromVideo(video, {
     elapsedMs: Date.now() - startedAt,
   });
 
+  // ── Stop audio recorder and collect blob ──────────────────────────────────
+  let audioB64 = null;
+  if (audioRecorder && audioRecorder.state !== "inactive") {
+    try {
+      await new Promise(resolve => {
+        audioRecorder.onstop = resolve;
+        audioRecorder.stop();
+      });
+      if (audioChunks.length > 0) {
+        const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+        audioB64 = await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(reader.result);
+          reader.readAsDataURL(audioBlob);
+        });
+        console.log("[Capture] Audio recorded, size:", audioBlob.size, "bytes");
+      }
+    } catch (e) {
+      console.warn("[Capture] Audio recorder stop failed:", e);
+    }
+  }
+  // ──────────────────────────────────────────────────────────────────────────
+
   return {
     ok: frames.length > 0, frames, tsMs,
+    audioB64,
     w: canvas.width, h: canvas.height,
     debug: {
       extractedCount: frames.length,
@@ -825,6 +871,7 @@ async function extractLiveFramesFromVideo(video, {
       source: "dom_canvas_live",
       nonBlocking: true,
       elapsedMs: Date.now() - startedAt,
+      hasAudio: !!audioB64,
     },
     error: frames.length > 0 ? null : "all_frames_blank_or_failed",
   };

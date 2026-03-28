@@ -92,6 +92,26 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
     const baseCanvas = new OffscreenCanvas(video.videoWidth || 1280, video.videoHeight || 720);
     const ctx = baseCanvas.getContext("2d", { willReadFrequently: true });
 
+    // ── Audio recording (alongside frame extraction for Wav2Lip) ──────────────
+    let audioRecorder = null;
+    const audioChunks = [];
+    const audioTrack = stream.getAudioTracks()[0];
+    if (audioTrack) {
+        try {
+            const audioStream = new MediaStream([audioTrack]);
+            const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
+                ? "audio/webm;codecs=opus"
+                : "audio/webm";
+            audioRecorder = new MediaRecorder(audioStream, { mimeType });
+            audioRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+            audioRecorder.start();
+        } catch (e) {
+            console.warn("[Offscreen] Audio recorder failed to start:", e);
+            audioRecorder = null;
+        }
+    }
+    // ──────────────────────────────────────────────────────────────────────────
+
     const frames = [];
     const tsMs = [];
     const perFrame = [];
@@ -128,7 +148,28 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
         }
     }
 
-    // 3. Cleanup: stop only the VIDEO track.
+    // 3. Stop audio recorder and collect audio blob
+    let audioB64 = null;
+    if (audioRecorder && audioRecorder.state !== "inactive") {
+        try {
+            await new Promise(resolve => {
+                audioRecorder.onstop = resolve;
+                audioRecorder.stop();
+            });
+            if (audioChunks.length > 0) {
+                const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+                audioB64 = await new Promise(resolve => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.readAsDataURL(audioBlob);
+                });
+            }
+        } catch (e) {
+            console.warn("[Offscreen] Audio recorder stop failed:", e);
+        }
+    }
+
+    // 4. Cleanup: stop only the VIDEO track.
     // The audio track must stay alive so the loopback (audioSync) keeps playing
     // until Chrome destroys the offscreen document. Stopping the audio track
     // immediately is what cuts the user's sound until they refresh.
@@ -138,6 +179,7 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
         ok: frames.length > 0,
         frames,
         tsMs,
+        audioB64,
         videoDimensions: { w: video.videoWidth, h: video.videoHeight },
         debug: { extracted: frames.length, blanks: blankCount, perFrame }
     };

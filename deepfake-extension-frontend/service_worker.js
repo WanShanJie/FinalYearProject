@@ -258,7 +258,7 @@ async function waitUntilReady(tabId, lockedVideoId) {
   return false;
 }
 
-async function postToBackend(meta, blobs) {
+async function postToBackend(meta, blobs, audioBlob = null) {
   const { extensionToken } = await chrome.storage.local.get(["extensionToken"]);
   if (!extensionToken) throw new Error("Connect the extension to the portal first.");
   const fd = new FormData();
@@ -267,7 +267,12 @@ async function postToBackend(meta, blobs) {
     const b = blobs[i];
     fd.append("files", b, b.__filename || `frame_${String(i).padStart(3, "0")}.jpg`);
   }
-  console.log("[SW] Uploading", blobs.length, "frames to backend");
+  if (audioBlob) {
+    fd.append("audio", audioBlob, audioBlob.__filename || "audio.webm");
+    console.log("[SW] Uploading", blobs.length, "frames + audio to backend");
+  } else {
+    console.log("[SW] Uploading", blobs.length, "frames (no audio) to backend");
+  }
   const res = await fetch(`${API_BASE}/api/analysis/capture`, {
     method: "POST",
     headers: { Authorization: `Bearer ${extensionToken}` },
@@ -306,7 +311,13 @@ async function captureViaOffscreenTab(tabId) {
     blob.__filename = `frame_${String(i).padStart(3, "0")}.jpg`;
     blobs.push(blob);
   }
-  return { blobs, tsMs: response.tsMs || [], videoDimensions: response.videoDimensions || null };
+  // Forward audio blob if offscreen recorded it
+  let audioBlob = null;
+  if (response.audioB64) {
+    audioBlob = dataUrlToBlob(response.audioB64);
+    audioBlob.__filename = "audio.webm";
+  }
+  return { blobs, tsMs: response.tsMs || [], videoDimensions: response.videoDimensions || null, audioBlob };
 }
 
 async function clearExtensionLinkState({ keepCounts = true } = {}) {
@@ -485,6 +496,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const ready = await waitUntilReady(tabId, lockedVideoId);
       if (!ready) console.warn("[SW] Ready check timed out — attempting capture anyway.");
 
+      // ── Canvas capture (primary) + audio from content script ─────────────────
       const nativeRes = await chrome.tabs.sendMessage(tabId, {
         type: "EXTRACT_FRAMES_LIVE",
         frameCount: FRAME_COUNT,
@@ -494,7 +506,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         lockedVideoId,
       }).catch(() => null);
 
-      let blobs = [], tsMs = [];
       const captureMethod = "content_script_canvas_live_jpeg";
       const captureDebug = nativeRes?.debug || null;
       const videoDimensions = nativeRes ? { w: nativeRes.w || null, h: nativeRes.h || null } : null;
@@ -505,20 +516,29 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const shouldFallback = !nativeRes?.ok || !Array.isArray(nativeRes.frames) ||
         nativeRes.frames.length === 0 || nativeBlankRatio >= BLANK_FALLBACK_THRESHOLD;
 
-      if (!shouldFallback) {
-        for (let i = 0; i < nativeRes.frames.length; i++) {
-          const blob = dataUrlToBlob(nativeRes.frames[i]);
-          blob.__filename = `frame_${String(i).padStart(3, "0")}.jpg`;
-          blobs.push(blob);
-        }
-        tsMs = nativeRes.tsMs || [];
-      } else {
+      if (shouldFallback) {
         sendResponse({
           ok: false, error: "live_capture_insufficient_frames",
           detail: `Got ${nativeRes?.frames?.length ?? 0} frames (blank ratio: ${nativeBlankRatio.toFixed(2)}).`,
           capture_debug: captureDebug,
         });
         return;
+      }
+
+      const blobs = [];
+      for (let i = 0; i < nativeRes.frames.length; i++) {
+        const blob = dataUrlToBlob(nativeRes.frames[i]);
+        blob.__filename = `frame_${String(i).padStart(3, "0")}.jpg`;
+        blobs.push(blob);
+      }
+      const tsMs = nativeRes.tsMs || [];
+
+      // Audio blob recorded by content script alongside frames (for Wav2Lip)
+      let audioBlob = null;
+      if (nativeRes.audioB64) {
+        audioBlob = dataUrlToBlob(nativeRes.audioB64);
+        audioBlob.__filename = "audio.webm";
+        console.log("[SW] Audio captured from video element, size:", audioBlob.size);
       }
 
       const meta = {
@@ -532,9 +552,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         capture_debug: captureDebug, frame_count: blobs.length,
         frame_interval_ms: CAPTURE_INTERVAL_MS, frame_timestamps_ms: tsMs,
         video_dimensions: videoDimensions,
+        has_audio: !!audioBlob,
       };
 
-      const out = await postToBackend(meta, blobs);
+      const out = await postToBackend(meta, blobs, audioBlob);
       await handleCaptureSuccess(out, meta);
       sendResponse({ ok: true, ...out, capture_method: captureMethod, analysis_meta: meta });
 

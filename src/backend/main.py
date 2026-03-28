@@ -503,6 +503,30 @@ def _cleanup_analysis_uploads(analysis_id: int) -> int:
     return removed_count
 
 
+def _prune_analysis_uploads(analysis_id: int) -> None:
+    """
+    After analysis is complete, reduce disk usage:
+    - Keep only the first (thumbnail) frame in  uploads/{id}_raw/
+    - Delete the entire  uploads/{id}_seq/  directory (face crops no longer needed)
+    """
+    upload_root = _uploads_root()
+
+    # ── _seq: delete entirely (AltFreezing already ran) ──────────────────────
+    seq_dir = upload_root / f"{analysis_id}_seq"
+    if seq_dir.exists():
+        shutil.rmtree(seq_dir, ignore_errors=True)
+
+    # ── _raw: keep only the first sorted frame for the thumbnail ─────────────
+    raw_dir = upload_root / f"{analysis_id}_raw"
+    if raw_dir.exists() and raw_dir.is_dir():
+        frames = sorted(raw_dir.glob("*.jpg"))
+        for f in frames[1:]:   # delete everything except frames[0]
+            try:
+                f.unlink()
+            except Exception:
+                pass
+
+
 def _get_user_analysis_or_404(db: Session, user_id: int, analysis_id: int) -> MediaAnalysis:
     analysis = (
         db.query(MediaAnalysis)
@@ -1795,6 +1819,8 @@ async def video_analysis(
         except Exception as e:
             print(f"[Blocklist] Failed to auto-insert: {e}")
 
+        _prune_analysis_uploads(analysis.id)
+
         return {
             "ok":          True,
             "analysis_id": analysis.id,
@@ -1837,6 +1863,9 @@ async def capture_analysis(
 
     if not files:
         raise HTTPException(status_code=400, detail="No media files uploaded")
+
+    # Optional audio blob sent by the extension when it uses offscreen capture
+    audio_upload = form_data.get("audio")
 
     try:
         meta_data = json.loads(meta)
@@ -2046,8 +2075,36 @@ async def capture_analysis(
         weights_path="checkpoints/model.pth",
     )
 
+    # ── Wav2Lip audio-visual sync (only when extension sent audio) ────────────
+    wav2lip_result = {"ok": False, "error": "no_audio_uploaded", "sync_score": None, "interpretation": "unavailable"}
+    if audio_upload is not None:
+        import tempfile as _tempfile
+        audio_content = await audio_upload.read()
+        audio_tmp_path = None
+        try:
+            with _tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+                f.write(audio_content)
+                audio_tmp_path = f.name
+            seq_dir = upload_dir / f"{analysis.id}_seq"
+            wav2lip_result = wav2lip_service.wav2lip_sync_score(
+                frames_dir=str(seq_dir),
+                audio_path=audio_tmp_path,
+                weights_path="checkpoints/wav2lip_gan.pth",
+            )
+        except Exception as _e:
+            wav2lip_result = {"ok": False, "error": f"wav2lip_error:{_e}", "sync_score": None, "interpretation": "unavailable"}
+        finally:
+            if audio_tmp_path:
+                try:
+                    os.remove(audio_tmp_path)
+                except Exception:
+                    pass
+    meta_data["wav2lip"] = wav2lip_result
+
+    # ── Combine visual + sync verdicts ────────────────────────────────────────
     score = alt_result.get("video_score")
-    decision = _decide_altfreezing_verdict(score, meta_data["quality_gate"], alt_result)
+    visual_decision = _decide_altfreezing_verdict(score, meta_data["quality_gate"], alt_result)
+    decision = _combine_verdicts(visual_decision, wav2lip_result)
     decision["final_explanation"] = generate_verdict_reason(_reasoning_metadata_for(decision, alt_result))
     decision["verdict_reason"] = decision["final_explanation"]
 
@@ -2067,12 +2124,17 @@ async def capture_analysis(
     except Exception as e:
         print(f"[Blocklist] Failed to auto-insert: {e}")
 
+    _prune_analysis_uploads(analysis.id)
+
     return {
         "ok": True,
         "analysis_id": analysis.id,
         "verdict": analysis.verdict,
         "score": analysis.score,
         "status": analysis.status,
+        "sync_score": wav2lip_result.get("sync_score"),
+        "sync_interpretation": wav2lip_result.get("interpretation"),
+        "combined_reason": decision.get("combined_reason"),
     }
 
 
