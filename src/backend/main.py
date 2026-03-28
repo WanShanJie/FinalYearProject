@@ -1206,20 +1206,42 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
     evidence_quality = float(calibration.get("evidence_quality") or 0.0)
     temporal_diversity = float(calibration.get("temporal_diversity") or 0.0)
 
-    if avg_blur >= 20.0 and usable_ratio >= 0.65 and seq_frames >= 24 and avg_brightness >= 80.0:
+    # ── Quality band ─────────────────────────────────────────────────────────
+    # "moderate" threshold matches the quality gate (MIN_AVG_BLUR=2.0, MIN_USABLE_RATIO=0.10)
+    # so that browser JPEG captures (typically blur 2–5) are not downgraded to "weak".
+    if avg_blur >= 8.0 and usable_ratio >= 0.40 and seq_frames >= 16 and avg_brightness >= 40.0:
         quality_band = "strong"
-    elif avg_blur >= 8.0 and usable_ratio >= 0.20 and seq_frames >= 8:
+    elif avg_blur >= 2.0 and usable_ratio >= 0.10 and seq_frames >= 6:
         quality_band = "moderate"
     else:
         quality_band = "weak"
 
+    # ── opencv track-stability signals ────────────────────────────────────────
+    # These come from the face tracker in opencv_pipeline. A track gap (the face
+    # disappears for several frames then reappears at a very different position)
+    # is a key deepfake artefact — face-swap compositing often causes the
+    # substituted face to jump spatially when the underlying actor moves their
+    # head. Geometry-rejected frames (IoU=0.00) also indicate sudden face jumps.
+    track_gap_count = int(quality_gate.get("track_gap_count") or 0)
+    geometry_rejected_count = int(quality_gate.get("geometry_rejected_count") or 0)
+    # Sequence-level stability from opencv (avg_iou, drift, size_consistency).
+    # A sequence can have geometry-rejected frames in isolation but still be
+    # globally stable — only flag instability when BOTH the tracker detected a
+    # gap+jump AND the sequence-level metrics confirm the track is actually bad.
+    sequence_stable = bool(quality_gate.get("sequence_stable", True))
+    track_instability = (track_gap_count >= 1 and geometry_rejected_count >= 3 and not sequence_stable)
+    # Stable tracking: no gaps, no jumps, face found throughout
+    track_stable = (track_gap_count == 0 and geometry_rejected_count == 0)
+
+    # ── Temporal penalty — shrink toward 0.5 (uncertainty), NOT toward 0 ─────
     temporal_penalty = 1.0
-    if temporal_diversity < 0.08:
-        temporal_penalty = 0.70
-    elif temporal_diversity < 0.15:
+    if temporal_diversity < 0.04:
+        temporal_penalty = 0.60
+    elif temporal_diversity < 0.08:
         temporal_penalty = 0.80
 
-    adjusted_score = max(0.0, min(1.0, float(score) * temporal_penalty))
+    adjusted_score = max(0.0, min(1.0, 0.5 + (float(score) - 0.5) * temporal_penalty))
+
     weak_confidence_for_fake = (
         total_windows < 3
         or score_std is None
@@ -1227,10 +1249,10 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
         or high_frame_count <= 1
     )
     strong_fake_evidence = (
-        adjusted_score > 0.95
+        adjusted_score > 0.90
         and score_std is not None
         and score_std > 0.02
-        and temporal_diversity > 0.20
+        and temporal_diversity > 0.15
         and high_frame_count >= 3
         and total_windows >= 3
     )
@@ -1246,6 +1268,77 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
         }
     )
 
+    # ── Rule 0: very low raw score → REAL (model's actual threshold is ~0.04) ──
+    # The AltFreezing model's optimal_threshold in demo.py is 0.04, meaning raw
+    # scores below ~0.10 strongly indicate real content regardless of other signals.
+    # Using 0.15 gives a comfortable safety margin above the 0.04 model threshold.
+    if raw_score < 0.15 and seq_frames >= 6:
+        return _decision_payload(
+            final_verdict="REAL",
+            model_verdict="REAL",
+            reason="very_low_fake_score",
+            confidence="high" if raw_score < 0.05 else "medium",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
+
+    # ── Rule 1: track instability — SUSPICIOUS regardless of model score ──────
+    # The AltFreezing model scores pixel-level face swap artefacts. It does NOT
+    # detect geometric inconsistency (face jumping position between frames).
+    # When the opencv tracker detects a gap+jump, that IS a deepfake signal
+    # even if the raw model score is low.
+    # Conditions: gap occurred, ≥3 geometry-rejected frames, ≥6 crops retained.
+    if track_instability and seq_frames >= 6:
+        return _decision_payload(
+            final_verdict="SUSPICIOUS",
+            model_verdict="FAKE",
+            reason="track_instability_face_jump_detected",
+            confidence="medium",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
+
+    # ── Rule 2: stable tracking + low model score → REAL ─────────────────────
+    # Continuous face track (no gaps, no geometry rejections) AND low model
+    # score means both the pixel-level detector and the geometric tracker agree
+    # the video is authentic. Apply from single-window captures onwards.
+    if track_stable and adjusted_score <= 0.40 and seq_frames >= 6:
+        return _decision_payload(
+            final_verdict="REAL",
+            model_verdict="REAL",
+            reason="stable_track_low_model_score",
+            confidence="medium" if total_windows >= 2 else "low",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
+
+    # ── Rule 3: insufficient windows → INCONCLUSIVE ───────────────────────────
+    # Only fall through to this if track signals were ambiguous (gap=0 but score
+    # is not clearly low, or gap>0 but too few crops to be confident).
     if total_windows < 3:
         return _decision_payload(
             final_verdict="INCONCLUSIVE",
@@ -1264,35 +1357,8 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
             evidence_strength="weak",
         )
 
-    # Stable bright talking-head override.
-    # Real interview/news clips can get inflated raw scores from the pretrained model.
-    if (
-        quality_band in {"moderate", "strong"}
-        and avg_brightness >= 80.0
-        and evidence_quality >= 0.82
-        and seq_frames >= 24
-        and temporal_diversity <= 0.08
-        and raw_score < 0.97
-        and adjusted_score <= 0.55
-    ):
-        return _decision_payload(
-            final_verdict="REAL",
-            model_verdict="REAL",
-            reason="stable_bright_talking_head_override",
-            confidence="medium",
-            quality_band=quality_band,
-            high_frame_count=high_frame_count,
-            score_std=score_std,
-            score=adjusted_score,
-            raw_score=raw_score,
-            total_windows=total_windows,
-            temporal_diversity=temporal_diversity,
-            temporal_penalty=temporal_penalty,
-            evidence_quality=evidence_quality,
-            evidence_strength=evidence_strength,
-        )
-
-    if strong_fake_evidence and quality_band in {"moderate", "strong"} and evidence_quality >= 0.75 and seq_frames >= 24:
+    # ── Rule 4: strong pixel-level FAKE signal ───────────────────────────────
+    if strong_fake_evidence and quality_band in {"moderate", "strong"} and evidence_quality >= 0.65 and seq_frames >= 12:
         return _decision_payload(
             final_verdict="FAKE",
             model_verdict="FAKE",
@@ -1310,11 +1376,41 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
             evidence_strength="strong",
         )
 
-    if adjusted_score <= 0.20 and quality_band in {"moderate", "strong"} and temporal_diversity >= 0.08:
+    # ── Rule 5: talking-head / interview REAL override ───────────────────────
+    # adj_score ceiling raised from 0.65 to 0.72 and quality_band requirement
+    # removed: browser JPEG crops produce scores systematically higher than
+    # the face-aligned crops the model was trained on, so "moderate" quality
+    # is less meaningful for this rule.
+    is_talking_head = (
+        temporal_diversity <= 0.12
+        and adjusted_score <= 0.72
+        and raw_score < 0.90
+        and seq_frames >= 8
+    )
+    if is_talking_head:
         return _decision_payload(
             final_verdict="REAL",
             model_verdict="REAL",
-            reason="low_fake_score_with_strong_quality",
+            reason="stable_talking_head_real_override",
+            confidence="medium",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
+
+    # ── Rule 6: low score on decent quality → REAL ───────────────────────────
+    if adjusted_score <= 0.30 and quality_band in {"moderate", "strong"}:
+        return _decision_payload(
+            final_verdict="REAL",
+            model_verdict="REAL",
+            reason="low_fake_score_with_good_quality",
             confidence="high" if evidence_strength == "strong" else "medium",
             quality_band=quality_band,
             high_frame_count=high_frame_count,
@@ -1328,8 +1424,13 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
             evidence_strength=evidence_strength,
         )
 
-    if raw_score >= 0.90 or adjusted_score >= 0.90:
-        downgrade_reason = "high_score_but_weak_evidence" if weak_confidence_for_fake or temporal_diversity < 0.20 else "high_score_downgraded_to_suspicious"
+    # ── Rule 7: very high score → SUSPICIOUS ────────────────────────────────
+    if raw_score >= 0.90 or adjusted_score >= 0.85:
+        downgrade_reason = (
+            "high_score_but_weak_evidence"
+            if weak_confidence_for_fake or temporal_diversity < 0.15
+            else "high_score_downgraded_to_suspicious"
+        )
         return _decision_payload(
             final_verdict="SUSPICIOUS",
             model_verdict="FAKE",
@@ -1347,11 +1448,14 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
             evidence_strength=evidence_strength,
         )
 
-    if quality_band == "weak" and adjusted_score >= 0.15:
+    # ── Rule 8: weak quality + high score ────────────────────────────────────
+    # Threshold raised from 0.65 to 0.80: browser JPEG crops score higher than
+    # face-aligned crops, so a modest 0.65 score on weak quality is not reliable.
+    if quality_band == "weak" and adjusted_score >= 0.80:
         return _decision_payload(
             final_verdict="SUSPICIOUS",
             model_verdict="FAKE",
-            reason="anomaly_detected_on_weak_quality_sequence",
+            reason="elevated_score_on_weak_quality_sequence",
             confidence="low",
             quality_band=quality_band,
             high_frame_count=high_frame_count,
@@ -1365,6 +1469,7 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
             evidence_strength=evidence_strength,
         )
 
+    # ── Rule 9: fallback ────────────────────────────────────────────────────
     return _decision_payload(
         final_verdict="INCONCLUSIVE",
         model_verdict="INCONCLUSIVE",
@@ -1497,10 +1602,14 @@ async def capture_analysis(
     avg_brightness = sum(bright_used) / len(bright_used) if bright_used else 0.0
     usable_ratio = (seq_frames / total_frames) if total_frames else 0.0
 
-    MIN_SEQUENCE_FRAMES = 8
-    MIN_USABLE_RATIO = 0.2
-    MIN_AVG_BLUR = 8.0
-    MIN_AVG_BRIGHTNESS = 25.0
+    # Quality gate — lowered thresholds for browser canvas JPEG captures.
+    # Original values (MIN_AVG_BLUR=8, MIN_AVG_BRIGHTNESS=25) were calibrated
+    # for clean video files. Browser captures at JPEG quality 0.8 have lower
+    # Laplacian variance and can have lower brightness on dark-background sets.
+    MIN_SEQUENCE_FRAMES = 6     # was 8  — let short captures through
+    MIN_USABLE_RATIO    = 0.10  # was 0.2 — 10% usable frames is enough to try
+    MIN_AVG_BLUR        = 2.0   # was 8.0 — browser JPEG reduces sharpness
+    MIN_AVG_BRIGHTNESS  = 15.0  # was 25.0 — dark studio lighting is common
 
     quality_pass = True
     quality_fail_reasons = []
@@ -1518,6 +1627,13 @@ async def capture_analysis(
         quality_fail_reasons.append(f"avg_brightness_too_low:{avg_brightness:.2f}")
 
     meta_data["opencv"] = opencv_summary
+    track_summary = opencv_summary.get("track_summary", {}) if isinstance(opencv_summary, dict) else {}
+    stability_meta = opencv_summary.get("stability", {}) if isinstance(opencv_summary, dict) else {}
+    track_gap_count = int(track_summary.get("gap_count", 0) or 0)
+    geometry_rejected_count = sum(
+        v for k, v in reject_reasons.items()
+        if isinstance(k, str) and "geometry_rejected" in k
+    )
     meta_data["quality_gate"] = {
         "pass": quality_pass,
         "fail_reasons": quality_fail_reasons,
@@ -1528,6 +1644,9 @@ async def capture_analysis(
         "avg_blur": avg_blur,
         "avg_brightness": avg_brightness,
         "reject_reasons": reject_reasons,
+        "track_gap_count": track_gap_count,
+        "geometry_rejected_count": geometry_rejected_count,
+        "sequence_stable": stability_meta.get("stable", True),
         "thresholds": {
             "MIN_SEQUENCE_FRAMES": MIN_SEQUENCE_FRAMES,
             "MIN_USABLE_RATIO": MIN_USABLE_RATIO,
@@ -1535,8 +1654,6 @@ async def capture_analysis(
             "MIN_AVG_BRIGHTNESS": MIN_AVG_BRIGHTNESS,
         },
     }
-
-    stability_meta = opencv_summary.get("stability", {}) if isinstance(opencv_summary, dict) else {}
 
     def _reasoning_metadata_for(decision_payload: dict, alt_payload: dict) -> dict:
         calibration = (alt_payload or {}).get("calibration") or {}

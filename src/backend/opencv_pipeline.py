@@ -29,32 +29,40 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 YUNET_MODEL_PATH = os.path.join(_THIS_DIR, "face_detection_yunet_2023mar.onnx")
 
 # ── Per-face quality thresholds ───────────────────────────────────────────────
-MIN_FACE_SIZE       = 80     # px — faces smaller than this are discarded
-MIN_BRIGHTNESS      = 20.0   # mean grey value of face crop
-HARD_MIN_BLUR       = 4.0    # Laplacian variance — below this = too blurry
-CROP_MARGIN         = 0.35   # padding fraction around detected bbox
+MIN_FACE_SIZE       = 40     # px — was 80; browser JPEG crops can appear smaller
+MIN_BRIGHTNESS      = 10.0   # was 20.0; dark-background interview setups
+HARD_MIN_BLUR       = 1.5    # was 4.0; talking-head motion reduces sharpness
+CROP_MARGIN         = 0.35   # padding fraction around detected bbox (unchanged)
 
 # ── Tracker geometry thresholds (Fix 1) ──────────────────────────────────────
-TRACK_MIN_IOU          = 0.20   # candidate must overlap prev bbox by at least this
-TRACK_MAX_CENTRE_JUMP  = 0.40   # max centre movement as fraction of frame diagonal
-TRACK_MIN_AREA_RATIO   = 0.35   # candidate area / prev area must exceed this
+TRACK_MIN_IOU          = 0.10   # was 0.20; allow more inter-frame movement
+TRACK_MAX_CENTRE_JUMP  = 0.40   # unchanged
+TRACK_MIN_AREA_RATIO   = 0.25   # was 0.35; head tilt changes bbox area
 
 # ── Track-break policy (Fix 2) ───────────────────────────────────────────────
-TRACK_MAX_MISS = 2   # consecutive misses before tracker resets and re-anchors
+TRACK_MAX_MISS = 5   # was 2; with WARMUP_SKIP=1 a streak of 2 killed the sequence
 
 # ── Warm-up skip (Fix 4) ─────────────────────────────────────────────────────
-WARMUP_SKIP_FRAMES = 2   # drop this many frames from the start of every capture
+WARMUP_SKIP_FRAMES = 1   # was 2; browser captures are stable by the 2nd frame
 
 # ── Sequence-level stability thresholds (Fix 3) ──────────────────────────────
-SEQ_MIN_AVG_IOU          = 0.30   # mean IoU between adjacent accepted frames
-SEQ_MAX_CENTRE_DRIFT     = 0.35   # max normalised centre drift allowed
-SEQ_MIN_SIZE_CONSISTENCY = 0.40   # min (min_area / max_area) ratio across sequence
+SEQ_MIN_AVG_IOU          = 0.20   # was 0.30; interview heads move slightly
+SEQ_MAX_CENTRE_DRIFT     = 0.50   # was 0.35; natural head movement
+SEQ_MIN_SIZE_CONSISTENCY = 0.20   # was 0.40; face size varies with tilt
 
 # ── Duplicate-frame tolerance (Fix 5) ────────────────────────────────────────
-DUP_CENTRE_PX   = 6.0    # max centre pixel drift to be considered duplicate
-DUP_SIZE_RATIO  = 0.06   # max relative size change to be considered duplicate
-DUP_BLUR_RATIO  = 0.08   # max relative blur change
-DUP_BRIGHT_DIFF = 5.0    # max brightness delta (grey levels)
+# With the original DUP_CENTRE_PX=6.0 almost every frame of a talking-head
+# interview was deduplicated (drift is 2-5px), leaving 1-2 crops in _seq/.
+# The verdict logic then falls into total_windows<3 → quality_band="weak" → SUSPICIOUS.
+DUP_CENTRE_PX   = 20.0   # was 6.0;  up to 20px centre drift between frames
+DUP_SIZE_RATIO  = 0.15   # was 0.06; allow 15% face-size change
+DUP_BLUR_RATIO  = 0.30   # was 0.08; mouth movement changes blur
+DUP_BRIGHT_DIFF = 15.0   # was 5.0;  mouth open/close changes brightness
+
+# Minimum frames we want to pass to the model after deduplication.
+# If dedup would leave fewer than this, skip it entirely — temporal uniform
+# subsampling (below) provides adequate frame variety for the model.
+MIN_SEQ_BEFORE_MODEL = 24
 
 # ── Sequence length ───────────────────────────────────────────────────────────
 DEFAULT_SEQUENCE_LENGTH = 40
@@ -79,7 +87,7 @@ def _init_yunet(w: int, h: int):
                 model=YUNET_MODEL_PATH,
                 config="",
                 input_size=(int(w), int(h)),
-                score_threshold=0.65,
+                score_threshold=0.45,  # was 0.65; browser canvas JPEG artifacts reduce confidence
                 nms_threshold=0.3,
                 top_k=5000,
             )
@@ -443,7 +451,12 @@ def process_frames_for_sequence(
     frames_with_face = len(selected_items)
 
     # ── Fix 5 – Deduplicate consecutive identical frames ─────────────────────
+    # Deduplication is skipped when the result would leave fewer than
+    # MIN_SEQ_BEFORE_MODEL frames — a common case for talking-head content
+    # where the face barely moves.  Temporal uniform subsampling (below)
+    # handles variety selection instead.
     deduped: List[Dict] = []
+    dup_rejected_recs: List[Dict] = []
     prev_sel = None
     for t in selected_items:
         sel = t["selected"]
@@ -454,12 +467,19 @@ def process_frames_for_sequence(
             "brightness": sel["brightness"],
         }
         if prev_sel is not None and _is_duplicate(rec, prev_sel):
-            per_frame.append({**rec, "used": False, "reason": "duplicate_frame"})
+            dup_rejected_recs.append(rec)
             continue
         deduped.append(t)
         prev_sel = rec
 
-    selected_items = deduped
+    if len(deduped) < MIN_SEQ_BEFORE_MODEL and len(selected_items) > len(deduped):
+        # Dedup would remove too many frames — keep all tracked frames so the
+        # model has enough temporal signal.  No duplicate_frame records added.
+        pass  # selected_items stays unchanged
+    else:
+        for rec in dup_rejected_recs:
+            per_frame.append({**rec, "used": False, "reason": "duplicate_frame"})
+        selected_items = deduped
 
     # ── Fix 3 – Sequence stability check ─────────────────────────────────────
     stability_input = [

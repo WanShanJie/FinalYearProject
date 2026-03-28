@@ -229,9 +229,13 @@ def _coverage_quality(unique_frames: int, model_clip: int) -> float:
 
 
 def _diversity_quality(diversity: float) -> float:
-    # Typical adjacent-difference values are small; map into [0.25,1.0].
-    q = diversity / 0.08
-    return max(0.25, min(1.0, q))
+    # Map adjacent-frame diversity into [0.35, 1.0].
+    # Interview/talking-head videos have naturally low diversity (~0.03-0.06)
+    # because the subject barely moves. This is a property of real content, NOT
+    # a sign of poor evidence. Calibrating against 0.03 means real interviews
+    # score ~0.6-1.0 instead of being penalised as low-quality.
+    q = diversity / 0.03
+    return max(0.35, min(1.0, q))
 
 
 def _calibrate_score(raw_score: float, unique_frames: int, model_clip: int, diversity: float) -> Tuple[float, Dict[str, float]]:
