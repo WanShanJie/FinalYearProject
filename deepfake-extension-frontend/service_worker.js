@@ -269,9 +269,20 @@ async function postToBackend(meta, blobs, audioBlob = null) {
   }
   if (audioBlob) {
     fd.append("audio", audioBlob, audioBlob.__filename || "audio.webm");
-    console.log("[SW] Uploading", blobs.length, "frames + audio to backend");
+    console.log("[SW] Uploading", blobs.length, "frames + audio to backend", {
+      name: audioBlob.__filename || "audio.webm",
+      size: audioBlob.size,
+      type: audioBlob.type,
+    });
   } else {
     console.log("[SW] Uploading", blobs.length, "frames (no audio) to backend");
+  }
+  for (const [key, value] of fd.entries()) {
+    if (value instanceof Blob) {
+      console.log("[SW][FormData]", key, { size: value.size, type: value.type });
+    } else {
+      console.log("[SW][FormData]", key, typeof value === "string" ? value.slice(0, 160) : value);
+    }
   }
   const res = await fetch(`${API_BASE}/api/analysis/capture`, {
     method: "POST",
@@ -318,6 +329,28 @@ async function captureViaOffscreenTab(tabId) {
     audioBlob.__filename = "audio.webm";
   }
   return { blobs, tsMs: response.tsMs || [], videoDimensions: response.videoDimensions || null, audioBlob };
+}
+
+async function captureAudioViaOffscreenTab(tabId, audioDurationMs = 4000) {
+  await ensureOffscreenDocument();
+  const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tabId });
+  const response = await chrome.runtime.sendMessage({
+    type: "OFFSCREEN_CAPTURE_AUDIO_ONLY",
+    streamId,
+    audioDurationMs,
+  });
+  if (!response?.ok) throw new Error(response?.error || "offscreen_audio_capture_failed");
+
+  let audioBlob = null;
+  if (response.audioB64) {
+    audioBlob = dataUrlToBlob(response.audioB64);
+    audioBlob.__filename = "audio.webm";
+  }
+
+  return {
+    audioBlob,
+    debug: response.debug || null,
+  };
 }
 
 async function clearExtensionLinkState({ keepCounts = true } = {}) {
@@ -539,6 +572,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         audioBlob = dataUrlToBlob(nativeRes.audioB64);
         audioBlob.__filename = "audio.webm";
         console.log("[SW] Audio captured from video element, size:", audioBlob.size);
+      } else {
+        console.warn("[SW] Content-script capture returned no audio. Trying offscreen tab audio fallback.", {
+          captureDebug,
+        });
+        try {
+          const fallbackAudio = await captureAudioViaOffscreenTab(tabId, 4000);
+          if (fallbackAudio.audioBlob) {
+            audioBlob = fallbackAudio.audioBlob;
+            meta0.offscreen_audio_debug = fallbackAudio.debug;
+            console.log("[SW] Offscreen audio fallback captured audio:", {
+              size: audioBlob.size,
+              type: audioBlob.type,
+            });
+          } else {
+            console.warn("[SW] Offscreen audio fallback completed without an audio blob.", fallbackAudio.debug);
+          }
+        } catch (audioErr) {
+          console.warn("[SW] Offscreen audio fallback failed:", audioErr);
+        }
       }
 
       const meta = {

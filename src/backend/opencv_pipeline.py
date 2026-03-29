@@ -65,7 +65,7 @@ DUP_BRIGHT_DIFF = 15.0   # was 5.0;  mouth open/close changes brightness
 MIN_SEQ_BEFORE_MODEL = 24
 
 # ── Sequence length ───────────────────────────────────────────────────────────
-DEFAULT_SEQUENCE_LENGTH = 40
+DEFAULT_SEQUENCE_LENGTH = 32
 
 # ── YuNet detector (module-level singleton) ───────────────────────────────────
 face_detector      = None

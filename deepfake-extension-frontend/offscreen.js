@@ -57,6 +57,22 @@ function frameStatsFromCanvas(canvas, sampleStep = 32) {
  * Main capture function: Loops audio back to user and extracts frames.
  */
 async function captureTabStream({ streamId, frameCount, intervalMs, quality, rect }) {
+    return captureTabStreamInternal({ streamId, frameCount, intervalMs, quality, rect, audioOnly: false });
+}
+
+async function captureTabAudioOnly({ streamId, audioDurationMs }) {
+    return captureTabStreamInternal({
+        streamId,
+        frameCount: 0,
+        intervalMs: 250,
+        quality: 0.8,
+        rect: null,
+        audioOnly: true,
+        audioDurationMs,
+    });
+}
+
+async function captureTabStreamInternal({ streamId, frameCount, intervalMs, quality, rect, audioOnly = false, audioDurationMs = 4000 }) {
     console.log("[Offscreen] Initiating capture for stream:", streamId);
 
     // 1. Capture the tab stream (Audio MUST be true to allow loopback)
@@ -96,19 +112,45 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
     let audioRecorder = null;
     const audioChunks = [];
     const audioTrack = stream.getAudioTracks()[0];
+    const audioDebug = {
+        audioTrackPresent: !!audioTrack,
+        recorderStarted: false,
+        recorderMimeType: null,
+        chunkCount: 0,
+        blobSize: 0,
+        error: null,
+        audioOnly,
+    };
     if (audioTrack) {
         try {
             const audioStream = new MediaStream([audioTrack]);
             const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
                 ? "audio/webm;codecs=opus"
                 : "audio/webm";
+            audioDebug.recorderMimeType = mimeType;
             audioRecorder = new MediaRecorder(audioStream, { mimeType });
-            audioRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+            audioRecorder.ondataavailable = e => {
+                if (e.data.size > 0) {
+                    audioChunks.push(e.data);
+                    audioDebug.chunkCount += 1;
+                    console.log("[Offscreen][Audio] chunk:", e.data.size);
+                }
+            };
+            audioRecorder.onerror = e => {
+                audioDebug.error = e?.error?.message || "media_recorder_error";
+                console.warn("[Offscreen][Audio] recorder error:", e);
+            };
             audioRecorder.start();
+            audioDebug.recorderStarted = true;
+            console.log("[Offscreen][Audio] recorder started with mime:", mimeType);
         } catch (e) {
             console.warn("[Offscreen] Audio recorder failed to start:", e);
+            audioDebug.error = e?.message || String(e);
             audioRecorder = null;
         }
+    } else {
+        audioDebug.error = "no_tab_audio_track";
+        console.warn("[Offscreen][Audio] No audio track was available from tab capture.");
     }
     // ──────────────────────────────────────────────────────────────────────────
 
@@ -118,34 +160,38 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
     let blankCount = 0;
 
     // 2. Extraction Loop (Live Sampling)
-    for (let i = 0; i < frameCount; i++) {
-        ctx.drawImage(video, 0, 0, baseCanvas.width, baseCanvas.height);
-        const cropped = cropCanvasFromRect(baseCanvas, rect);
-        const stats = frameStatsFromCanvas(cropped);
+    if (!audioOnly) {
+        for (let i = 0; i < frameCount; i++) {
+            ctx.drawImage(video, 0, 0, baseCanvas.width, baseCanvas.height);
+            const cropped = cropCanvasFromRect(baseCanvas, rect);
+            const stats = frameStatsFromCanvas(cropped);
 
-        if (!stats.isMostlyBlack) {
-            const blob = await cropped.convertToBlob({ type: "image/jpeg", quality: quality || 0.8 });
+            if (!stats.isMostlyBlack) {
+                const blob = await cropped.convertToBlob({ type: "image/jpeg", quality: quality || 0.8 });
 
-            // Convert to Base64 using FileReader (more robust than btoa for blobs)
-            const base64 = await new Promise((resolve) => {
-                const reader = new FileReader();
-                reader.onloadend = () => resolve(reader.result);
-                reader.readAsDataURL(blob);
-            });
+                // Convert to Base64 using FileReader (more robust than btoa for blobs)
+                const base64 = await new Promise((resolve) => {
+                    const reader = new FileReader();
+                    reader.onloadend = () => resolve(reader.result);
+                    reader.readAsDataURL(blob);
+                });
 
-            frames.push(base64);
-            perFrame.push({ idx: i, ok: true, avgLuma: stats.avgLuma });
-        } else {
-            blankCount += 1;
-            perFrame.push({ idx: i, ok: false, reason: "blank_frame" });
+                frames.push(base64);
+                perFrame.push({ idx: i, ok: true, avgLuma: stats.avgLuma });
+            } else {
+                blankCount += 1;
+                perFrame.push({ idx: i, ok: false, reason: "blank_frame" });
+            }
+
+            tsMs.push(Date.now());
+
+            if (i < frameCount - 1) {
+                await wait(Math.max(250, intervalMs || 1000));
+            }
         }
-
+    } else {
+        await wait(Math.max(1500, Number(audioDurationMs || 4000)));
         tsMs.push(Date.now());
-
-        // Wait for the next sampling interval while the video plays naturally
-        if (i < frameCount - 1) {
-            await wait(Math.max(250, intervalMs || 1000));
-        }
     }
 
     // 3. Stop audio recorder and collect audio blob
@@ -158,14 +204,20 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
             });
             if (audioChunks.length > 0) {
                 const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+                audioDebug.blobSize = audioBlob.size;
                 audioB64 = await new Promise(resolve => {
                     const reader = new FileReader();
                     reader.onloadend = () => resolve(reader.result);
                     reader.readAsDataURL(audioBlob);
                 });
+                console.log("[Offscreen][Audio] Audio recorded, size:", audioBlob.size, "bytes");
+            } else {
+                audioDebug.error = audioDebug.error || "audio_blob_empty";
+                console.warn("[Offscreen][Audio] Recorder stopped but produced no audio chunks.");
             }
         } catch (e) {
             console.warn("[Offscreen] Audio recorder stop failed:", e);
+            audioDebug.error = e?.message || String(e);
         }
     }
 
@@ -176,12 +228,12 @@ async function captureTabStream({ streamId, frameCount, intervalMs, quality, rec
     stream.getVideoTracks().forEach(t => t.stop());
 
     return {
-        ok: frames.length > 0,
+        ok: audioOnly ? !!audioB64 : frames.length > 0,
         frames,
         tsMs,
         audioB64,
         videoDimensions: { w: video.videoWidth, h: video.videoHeight },
-        debug: { extracted: frames.length, blanks: blankCount, perFrame }
+        debug: { extracted: frames.length, blanks: blankCount, perFrame, hasAudio: !!audioB64, audio: audioDebug }
     };
 }
 
@@ -195,5 +247,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             .then(sendResponse)
             .catch(e => sendResponse({ ok: false, error: String(e.message || e) }));
         return true; // Keep channel open for async response
+    }
+    if (msg?.type === "OFFSCREEN_CAPTURE_AUDIO_ONLY") {
+        captureTabAudioOnly(msg)
+            .then(sendResponse)
+            .catch(e => sendResponse({ ok: false, error: String(e.message || e) }));
+        return true;
     }
 });

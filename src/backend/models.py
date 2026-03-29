@@ -118,6 +118,27 @@ class MediaAnalysis(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     status = Column(String(30), default="PENDING")
     user = relationship("User")
+    model_runs = relationship("ModelRun", back_populates="analysis", cascade="all, delete-orphan")
+
+
+class ModelRun(Base):
+    __tablename__ = "model_runs"
+
+    id = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True, index=True)
+    analysis_id = Column(BIGINT(unsigned=True), ForeignKey("media_analysis.id", ondelete="CASCADE"), nullable=False, index=True)
+    model_name = Column(String(50), nullable=False, index=True)
+    model_version = Column(String(255), nullable=True)
+    status = Column(String(30), nullable=False, server_default=text("'PENDING'"))
+    score = Column(Float, nullable=True)
+    confidence = Column(String(30), nullable=True)
+    verdict = Column(String(30), nullable=True)
+    reason = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    run_meta = Column(JSON, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    analysis = relationship("MediaAnalysis", back_populates="model_runs")
 
 
 class ExtensionLinkRequest(Base):

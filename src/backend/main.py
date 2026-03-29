@@ -18,7 +18,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from jose import jwt, JWTError
 
 from db import SessionLocal, engine, Base
-from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ExtensionLinkRequest, LinkedExtension, GlobalBlocklist
+from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ModelRun, ExtensionLinkRequest, LinkedExtension, GlobalBlocklist
 from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn
 from auth import hash_password, verify_password, create_token, create_extension_token
 from oauth_routes import router as oauth_router
@@ -34,6 +34,8 @@ _os.environ.setdefault("PYTHONUTF8", "1")
 from scripts import altfreezing_service
 from scripts.altfreezing_config import SEQUENCE_LENGTH as ALT_ANALYSIS_SEQUENCE_LENGTH
 from scripts import wav2lip_service
+from scripts import vit_service
+from scripts import xception_service
 
 # Create tables (dev). For production, use Alembic migrations.
 Base.metadata.create_all(bind=engine)
@@ -297,6 +299,9 @@ def generate_verdict_reason(metadata) -> str:
     total_windows = int(metadata.get("total_windows") or 0)
     temporal_penalty = _safe_float(metadata.get("temporal_penalty")) or 1.0
     evidence_strength = str(metadata.get("evidence_strength") or _evidence_strength_label(metadata)).lower()
+    vit_score = _safe_float(metadata.get("vit_score"))
+    wav2lip_score = _safe_float(metadata.get("wav2lip_score"))
+    disagreement_flag = bool(metadata.get("disagreement_flag"))
 
     evidence_bits: List[str] = []
     if total_windows:
@@ -312,8 +317,20 @@ def generate_verdict_reason(metadata) -> str:
         evidence_bits.append("meaningful score variation" if score_std > 0.02 else "very little score variation")
     if high_frame_count:
         evidence_bits.append(f"{high_frame_count} strong manipulation window{'s' if high_frame_count != 1 else ''}")
+    if vit_score is not None:
+        evidence_bits.append(f"ViT score {round(vit_score * 100)}%")
+    if wav2lip_score is not None:
+        evidence_bits.append(f"Wav2Lip risk {round(wav2lip_score * 100)}%")
 
     evidence_text = _human_join(evidence_bits[:3]) or "limited supporting evidence"
+    fusion_bits: List[str] = []
+    if vit_score is not None:
+        fusion_bits.append(f"ViT {round(vit_score * 100)}%")
+    if wav2lip_score is not None:
+        fusion_bits.append(f"Wav2Lip risk {round(wav2lip_score * 100)}%")
+    if disagreement_flag:
+        fusion_bits.append("the visual models disagreed")
+    fusion_text = _human_join(fusion_bits[:3])
 
     if verdict == "INCONCLUSIVE":
         issues: List[str] = []
@@ -346,7 +363,9 @@ def generate_verdict_reason(metadata) -> str:
             follow_up.append("the frames were darker than ideal")
 
         second_sentence = _human_join(follow_up[:2])
-        base = f"The model score was {score_pct if score_pct is not None else 'not available'}%, but the evidence was {evidence_strength} because of {issue_text}."
+        base = f"The final fake score was {score_pct if score_pct is not None else 'not available'}%, but the evidence was {evidence_strength} because of {issue_text}."
+        if fusion_text:
+            base += f" Supporting signals were {fusion_text}."
         if second_sentence:
             return f"{base} {second_sentence[0].upper() + second_sentence[1:]}, so the system kept the result inconclusive."
         return f"{base} The system kept the result inconclusive rather than making an absolute claim."
@@ -365,7 +384,8 @@ def generate_verdict_reason(metadata) -> str:
         issue_text = _human_join(issues[:3]) or "strong inconsistencies across the analyzed sequence"
         return (
             f"The final fake score was {score_pct if score_pct is not None else 'not available'}%, and the evidence was strong with {evidence_text}. "
-            f"The system classified this media as fake because it found {issue_text}."
+            f"The system classified this media as fake because it found {issue_text}"
+            + (f", with {fusion_text} supporting the result." if fusion_text else ".")
         )
 
     if verdict == "REAL":
@@ -390,6 +410,8 @@ def generate_verdict_reason(metadata) -> str:
 
         tail_text = _human_join(tail[:2])
         base = f"The final fake score remained low at {score_pct if score_pct is not None else 'not available'}%, and the evidence was {evidence_strength} with {support_text}."
+        if fusion_text:
+            base += f" Supporting signals were {fusion_text}."
         if tail_text:
             return f"{base} {tail_text[0].upper() + tail_text[1:]}, so the system treated the content as authentic."
         return f"{base} The system treated the content as authentic."
@@ -397,6 +419,8 @@ def generate_verdict_reason(metadata) -> str:
     mixed_signals: List[str] = []
     if high_frame_count > 0 or (score is not None and score >= 0.5):
         mixed_signals.append("some frame-level irregularities")
+    if disagreement_flag:
+        mixed_signals.append("disagreement between the temporal and spatial checks")
     if stability is False or (drift is not None and drift > 0.12):
         mixed_signals.append("partial instability in facial tracking")
     if temporal_diversity is not None and temporal_diversity > 0.10:
@@ -416,14 +440,363 @@ def generate_verdict_reason(metadata) -> str:
         tail.append(f"the score was reduced from {raw_score_pct}% to {score_pct}% because frame variation was limited")
 
     tail_text = _human_join(tail[:2])
-    base = f"The model score was {score_pct if score_pct is not None else 'not available'}%, but the evidence was {evidence_strength} because of {signal_text}."
+    base = f"The final fake score was {score_pct if score_pct is not None else 'not available'}%, but the evidence was {evidence_strength} because of {signal_text}."
+    if fusion_text:
+        base += f" Supporting signals were {fusion_text}."
     if tail_text:
         return f"{base} In this case, {tail_text}, so the system used a suspicious verdict instead of an absolute one."
     return f"{base} The system used a suspicious verdict instead of an absolute one."
 
 
-def _serialize_analysis(analysis: MediaAnalysis) -> dict:
+def _clamp01(value) -> Optional[float]:
+    safe = _safe_float(value)
+    if safe is None:
+        return None
+    return max(0.0, min(1.0, safe))
+
+
+def _wav2lip_fake_likelihood(wav2lip_result: dict) -> Optional[float]:
+    if not isinstance(wav2lip_result, dict) or not wav2lip_result.get("ok"):
+        return None
+    if str(wav2lip_result.get("confidence") or "").lower() == "low":
+        return None
+    sync_score = _clamp01(wav2lip_result.get("sync_score"))
+    if sync_score is None:
+        return None
+    return max(0.0, min(1.0, 1.0 - sync_score))
+
+
+def _score_stance(score: Optional[float]) -> str:
+    safe = _clamp01(score)
+    if safe is None:
+        return "unknown"
+    if safe >= 0.75:
+        return "fake"
+    if safe <= 0.35:
+        return "real"
+    return "suspicious"
+
+
+def fuse_decision(
+    altfreezing_score,
+    altfreezing_std,
+    temporal_diversity,
+    wav2lip_sync,
+    vit_fake_score,
+    xception_fake_score=None,
+    vit_score_std=None,
+):
+    alt_score = _clamp01(altfreezing_score)
+    vit_score = _clamp01(vit_fake_score)
+    xception_score = _clamp01(xception_fake_score)
+    alt_std = _safe_float(altfreezing_std)
+    vit_std = _safe_float(vit_score_std)
+
+    # Base weights: AltFreezing is the most reliable temporal model for face-swaps.
+    # Wav2Lip is only useful for lip-sync attacks — face-swaps keep original audio so
+    # a "synced" reading carries no exculpatory value.
+    alt_weight = 0.45
+    wav_weight = 0.05
+    vit_weight = 0.20
+    xception_weight = 0.30
+
+    # Wav2Lip: only treat OUT-OF-SYNC as a positive manipulation signal.
+    # A synced result is neutral, not evidence of real — face-swap deepfakes always
+    # sync because the audio is unmodified.
+    wav_signal = 0.5  # neutral default
+    if wav2lip_sync is False:
+        wav_signal = 1.0  # out-of-sync: clear evidence of lip-sync manipulation
+
+    # Disqualify ViT when its per-frame variance is too high (near-random predictions).
+    # std > 0.35 means ViT saw some frames as near-0% fake and others as near-100%,
+    # indicating it is confused by lighting/compression artefacts rather than deepfake cues.
+    vit_disqualified = vit_std is not None and vit_std > 0.35
+    if vit_disqualified:
+        vit_weight = 0.0
+
+    # AltFreezing is only unreliable when it produces completely flat predictions
+    # (all frames score identically).  Low temporal diversity alone is normal for
+    # slow-moving talking-head footage — do NOT penalise AltFreezing for it.
+    alt_unreliable = alt_std is not None and alt_std == 0.0
+    if alt_unreliable:
+        # Redistribute AltFreezing weight to Xception (spatial model)
+        alt_weight = 0.30
+        xception_weight += 0.15
+
+    # When models disagree and AltFreezing is the sole high-fake signal while spatial
+    # models say real, trust AltFreezing — it is the most reliable detector for
+    # temporal face-swap artefacts that spatial models routinely miss.
+    active_other_scores = [
+        s for s in [vit_score if not vit_disqualified else None, xception_score]
+        if s is not None
+    ]
+    others_avg = sum(active_other_scores) / len(active_other_scores) if active_other_scores else None
+    disagreement_boost = (
+        alt_score is not None
+        and alt_score >= 0.65
+        and others_avg is not None
+        and others_avg < 0.50
+    )
+    if disagreement_boost:
+        alt_weight = min(0.65, alt_weight + 0.10)
+
+    # Normalise weights so they always sum to 1.0
+    weight_sum = alt_weight + wav_weight + vit_weight + xception_weight
+    if weight_sum > 0:
+        alt_weight /= weight_sum
+        wav_weight /= weight_sum
+        vit_weight /= weight_sum
+        xception_weight /= weight_sum
+
+    alt_component = alt_weight * (alt_score if alt_score is not None else 0.5)
+    wav_component = wav_weight * wav_signal
+    vit_component = vit_weight * (vit_score if vit_score is not None else 0.5)
+    xception_component = xception_weight * (xception_score if xception_score is not None else 0.5)
+    final_score = max(0.0, min(1.0, alt_component + wav_component + vit_component + xception_component))
+
+    if final_score >= 0.75:
+        verdict = "FAKE"
+    elif final_score <= 0.35:
+        verdict = "REAL"
+    else:
+        verdict = "SUSPICIOUS"
+
+    disagreement_flag = (
+        len(
+            [
+                pair
+                for pair in [
+                    (alt_score, vit_score),
+                    (alt_score, xception_score),
+                    (vit_score, xception_score),
+                ]
+                if pair[0] is not None and pair[1] is not None and abs(pair[0] - pair[1]) > 0.30
+            ]
+        ) > 0
+    )
+
+    alt_stance = _score_stance(alt_score)
+    vit_stance = _score_stance(vit_score)
+    xception_stance = _score_stance(xception_score)
+    wav_stance = "fake" if wav2lip_sync is False else "unknown"
+    stances = [stance for stance in [alt_stance, wav_stance, vit_stance, xception_stance] if stance != "unknown"]
+
+    confidence = "low"
+    if len(stances) >= 3 and len(set(stances)) == 1 and stances[0] in {"fake", "real"}:
+        confidence = "high"
+    elif any(stances.count(label) == max(len(stances) - 1, 2) for label in {"fake", "real", "suspicious"}):
+        confidence = "medium"
+
+    contribution_total = alt_component + wav_component + vit_component + xception_component
+    if contribution_total > 0:
+        alt_contrib_pct = round((alt_component / contribution_total) * 100)
+        wav_contrib_pct = round((wav_component / contribution_total) * 100)
+        vit_contrib_pct = round((vit_component / contribution_total) * 100)
+        xception_contrib_pct = max(0, 100 - alt_contrib_pct - wav_contrib_pct - vit_contrib_pct)
+    else:
+        alt_contrib_pct = wav_contrib_pct = vit_contrib_pct = xception_contrib_pct = 0
+
+    explanation_parts: List[str] = []
+    if alt_score is not None:
+        explanation_parts.append(f"AltFreezing indicated {round(alt_score * 100)}% manipulation probability")
+    else:
+        explanation_parts.append("AltFreezing did not provide a usable score")
+    if wav2lip_sync is False:
+        explanation_parts.append("Wav2Lip detected lip-sync mismatch")
+    elif wav2lip_sync is True:
+        explanation_parts.append("Wav2Lip found no lip-sync mismatch (neutral — face-swaps retain original audio)")
+    else:
+        explanation_parts.append("Wav2Lip was unavailable")
+    if vit_disqualified:
+        explanation_parts.append(f"ViT was excluded due to high frame-level variance (std={round(vit_std, 3) if vit_std is not None else '?'})")
+    elif vit_score is not None:
+        explanation_parts.append(f"ViT estimated {round(vit_score * 100)}% fake likelihood")
+    else:
+        explanation_parts.append("ViT was unavailable")
+    if xception_score is not None:
+        explanation_parts.append(f"Xception estimated {round(xception_score * 100)}% fake likelihood")
+    else:
+        explanation_parts.append("Xception was unavailable")
+
+    explanation = f"{_human_join(explanation_parts)}."
+    follow_up: List[str] = []
+    if alt_unreliable:
+        follow_up.append("AltFreezing received a lower weight because its frame predictions were completely flat")
+    if disagreement_boost:
+        follow_up.append("AltFreezing received a higher weight because it was the sole high-fake signal and is the most reliable temporal model")
+    elif disagreement_flag:
+        follow_up.append("the models disagree")
+    follow_up.append(
+        f"weighted contributions were AltFreezing {alt_contrib_pct}%, Wav2Lip {wav_contrib_pct}%, ViT {vit_contrib_pct}%, and Xception {xception_contrib_pct}%"
+    )
+    follow_up.append(f"so the final verdict is {verdict.lower()} at {round(final_score * 100)}%")
+    explanation = f"{explanation} {', '.join(follow_up[:-1]) + (', ' if len(follow_up) > 1 else '') + follow_up[-1]}."
+
     return {
+        "final_score": final_score,
+        "verdict": verdict,
+        "confidence": confidence,
+        "explanation": explanation,
+        "weights_used": {
+            "altfreezing": alt_weight,
+            "wav2lip": wav_weight,
+            "vit": vit_weight,
+            "xception": xception_weight,
+        },
+        "signals": {
+            "altfreezing": alt_score,
+            "wav2lip": wav_signal,
+            "vit": vit_score,
+            "xception": xception_score,
+        },
+        "disagreement": disagreement_flag,
+        "alt_unreliable": alt_unreliable,
+        "vit_disqualified": vit_disqualified,
+        "disagreement_boost": disagreement_boost,
+    }
+
+
+def _serialize_model_run(run: ModelRun) -> dict:
+    return {
+        "id": run.id,
+        "analysis_id": run.analysis_id,
+        "model_name": run.model_name,
+        "model_version": run.model_version,
+        "status": run.status,
+        "score": run.score,
+        "confidence": run.confidence,
+        "verdict": run.verdict,
+        "reason": run.reason,
+        "error_message": run.error_message,
+        "run_meta": run.run_meta or {},
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
+
+
+def _persist_model_runs(
+    db: Session,
+    analysis: MediaAnalysis,
+    *,
+    alt_result: Optional[dict] = None,
+    visual_decision: Optional[dict] = None,
+    vit_result: Optional[dict] = None,
+    xception_result: Optional[dict] = None,
+    wav2lip_result: Optional[dict] = None,
+) -> None:
+    db.query(ModelRun).filter(ModelRun.analysis_id == analysis.id).delete(synchronize_session=False)
+
+    completed_at = analysis.completed_at or _utcnow()
+    runs: List[ModelRun] = []
+
+    def _run_status(ok: bool, error: Optional[str]) -> str:
+        if ok:
+            return "DONE"
+        if str(error or "") in {"quality_gate_failed", "no_sequence_crops", "no_audio_uploaded", "empty_audio_uploaded", "skipped_due_to_quality_gate"}:
+            return "SKIPPED"
+        return "FAILED"
+
+    if alt_result is not None or visual_decision is not None:
+        alt_payload = alt_result or {}
+        visual_payload = visual_decision or {}
+        runs.append(
+            ModelRun(
+                analysis_id=analysis.id,
+                model_name="altfreezing",
+                model_version=str(alt_payload.get("loaded_from") or alt_payload.get("weights_path") or "checkpoints/model.pth"),
+                status=_run_status(bool(alt_payload.get("ok") or visual_payload), alt_payload.get("error")),
+                score=_safe_float(visual_payload.get("score", alt_payload.get("video_score"))),
+                confidence=visual_payload.get("confidence"),
+                verdict=visual_payload.get("final_verdict") or visual_payload.get("model_verdict"),
+                reason=visual_payload.get("reason") or alt_payload.get("error"),
+                error_message=None if alt_payload.get("ok") or visual_payload else alt_payload.get("error"),
+                run_meta={
+                    "raw_score": _safe_float(visual_payload.get("raw_score", alt_payload.get("raw_video_score"))),
+                    "score_std": _safe_float(visual_payload.get("score_std", alt_payload.get("score_std"))),
+                    "total_windows": int(visual_payload.get("total_windows") or alt_payload.get("total_windows") or 0),
+                    "high_frame_count": int(visual_payload.get("high_frame_count") or alt_payload.get("high_frame_count") or 0),
+                    "temporal_diversity": _safe_float(visual_payload.get("temporal_diversity", (alt_payload.get("calibration") or {}).get("temporal_diversity"))),
+                    "evidence_strength": visual_payload.get("evidence_strength"),
+                },
+                completed_at=completed_at,
+            )
+        )
+
+    if vit_result is not None:
+        vit_ok = bool(vit_result.get("ok"))
+        runs.append(
+            ModelRun(
+                analysis_id=analysis.id,
+                model_name="vit",
+                model_version=str(vit_result.get("loaded_from") or vit_result.get("model_name") or "huggingface"),
+                status=_run_status(vit_ok, vit_result.get("error")),
+                score=_safe_float(vit_result.get("video_score")),
+                confidence="medium" if vit_ok else "low",
+                verdict=None,
+                reason="spatial_validation_complete" if vit_ok else vit_result.get("error"),
+                error_message=None if vit_ok else vit_result.get("error"),
+                run_meta={
+                    "frames_used": int(vit_result.get("frames_used") or 0),
+                    "score_std": _safe_float(vit_result.get("score_std")),
+                    "high_frame_count": int(vit_result.get("high_frame_count") or 0),
+                    "fake_label": vit_result.get("fake_label"),
+                    "real_label": vit_result.get("real_label"),
+                },
+                completed_at=completed_at,
+            )
+        )
+
+    if xception_result is not None:
+        xception_ok = bool(xception_result.get("ok"))
+        runs.append(
+            ModelRun(
+                analysis_id=analysis.id,
+                model_name="xception",
+                model_version=str(xception_result.get("loaded_from") or "checkpoints/xception_best.pth"),
+                status=_run_status(xception_ok, xception_result.get("error")),
+                score=_safe_float(xception_result.get("video_score")),
+                confidence="medium" if xception_ok else "low",
+                verdict=None,
+                reason="spatial_validation_complete" if xception_ok else xception_result.get("error"),
+                error_message=None if xception_ok else xception_result.get("error"),
+                run_meta={
+                    "frames_used": int(xception_result.get("frames_used") or 0),
+                    "score_std": _safe_float(xception_result.get("score_std")),
+                    "high_frame_count": int(xception_result.get("high_frame_count") or 0),
+                    "aggregation": xception_result.get("agg"),
+                    "prediction": xception_result.get("prediction"),
+                },
+                completed_at=completed_at,
+            )
+        )
+
+    if wav2lip_result is not None:
+        wav_ok = bool(wav2lip_result.get("ok"))
+        runs.append(
+            ModelRun(
+                analysis_id=analysis.id,
+                model_name="wav2lip",
+                model_version="checkpoints/wav2lip_gan.pth",
+                status=_run_status(wav_ok, wav2lip_result.get("error")),
+                score=_wav2lip_fake_likelihood(wav2lip_result),
+                confidence=wav2lip_result.get("confidence"),
+                verdict=None,
+                reason=wav2lip_result.get("interpretation") or wav2lip_result.get("error"),
+                error_message=None if wav_ok else wav2lip_result.get("error"),
+                run_meta={
+                    "sync_score": _safe_float(wav2lip_result.get("sync_score")),
+                    "interpretation": wav2lip_result.get("interpretation"),
+                },
+                completed_at=completed_at,
+            )
+        )
+
+    if runs:
+        db.add_all(runs)
+
+
+def _serialize_analysis(analysis: MediaAnalysis, include_model_runs: bool = False) -> dict:
+    payload = {
         "id": analysis.id,
         "title": analysis.title or "Unknown Media",
         "platform": analysis.platform,
@@ -438,6 +811,10 @@ def _serialize_analysis(analysis: MediaAnalysis) -> dict:
         "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
         "meta": analysis.meta or {},
     }
+    if include_model_runs:
+        runs = sorted(list(getattr(analysis, "model_runs", []) or []), key=lambda run: (run.created_at or datetime.min, run.id or 0))
+        payload["model_runs"] = [_serialize_model_run(run) for run in runs]
+    return payload
 
 
 def _serialize_linked_extension(device: LinkedExtension) -> dict:
@@ -587,6 +964,10 @@ def _delete_analysis_records(db: Session, analyses: List[MediaAnalysis], user_id
             {GlobalBlocklist.analysis_id: None},
             synchronize_session=False,
         )
+
+        db.query(ModelRun).filter(
+            ModelRun.analysis_id.in_(analysis_ids)
+        ).delete(synchronize_session=False)
 
         deleted_count = (
             db.query(MediaAnalysis)
@@ -1592,6 +1973,146 @@ def _combine_verdicts(visual_decision: dict, wav2lip_result: dict) -> dict:
             "combined_reason": "no_combination_rule_matched"}
 
 
+def _combine_model_signals(
+    visual_decision: dict,
+    alt_result: dict,
+    vit_result: dict,
+    xception_result: dict,
+    wav2lip_result: dict,
+    quality_gate: dict,
+) -> dict:
+    calibration = (alt_result or {}).get("calibration") or {}
+
+    alt_score = _clamp01(
+        visual_decision.get("score")
+        if visual_decision.get("score") is not None
+        else (alt_result or {}).get("video_score")
+    )
+    vit_score = _clamp01((vit_result or {}).get("video_score")) if (vit_result or {}).get("ok") else None
+    xception_score = _clamp01((xception_result or {}).get("video_score")) if (xception_result or {}).get("ok") else None
+    wav2lip_risk = _wav2lip_fake_likelihood(wav2lip_result or {})
+
+    raw_score = _clamp01(
+        visual_decision.get("raw_score")
+        if visual_decision.get("raw_score") is not None
+        else (alt_result or {}).get("raw_video_score")
+    )
+    score_std = _safe_float(
+        visual_decision.get("score_std")
+        if visual_decision.get("score_std") is not None
+        else (alt_result or {}).get("score_std")
+    )
+    total_windows = int(
+        visual_decision.get("total_windows")
+        or (alt_result or {}).get("total_windows")
+        or len((alt_result or {}).get("per_frame") or [])
+        or 0
+    )
+    temporal_diversity = _safe_float(
+        visual_decision.get("temporal_diversity")
+        if visual_decision.get("temporal_diversity") is not None
+        else calibration.get("temporal_diversity")
+    )
+    temporal_penalty = _safe_float(visual_decision.get("temporal_penalty")) or 1.0
+    quality_band = str(visual_decision.get("quality_band") or _metadata_quality_band(quality_gate or {})).lower()
+    evidence_quality = _safe_float(
+        visual_decision.get("evidence_quality")
+        if visual_decision.get("evidence_quality") is not None
+        else calibration.get("evidence_quality")
+    )
+    if evidence_quality is None:
+        evidence_quality = 0.0
+
+    usable_frames = int((quality_gate or {}).get("sequence_frames_used") or 0)
+    high_frame_count = int(
+        visual_decision.get("high_frame_count")
+        or (alt_result or {}).get("high_frame_count")
+        or 0
+    )
+    wav_sync_available = bool(wav2lip_result.get("ok")) and str(wav2lip_result.get("confidence") or "").lower() != "low"
+    wav2lip_sync = None
+    if wav_sync_available:
+        interpretation = str(wav2lip_result.get("interpretation") or "").strip().lower()
+        if interpretation == "synced":
+            wav2lip_sync = True
+        elif interpretation == "out_of_sync":
+            wav2lip_sync = False
+        elif wav2lip_risk is not None:
+            wav2lip_sync = wav2lip_risk <= 0.35
+
+    vit_score_std = _safe_float((vit_result or {}).get("score_std"))
+
+    fused = fuse_decision(
+        altfreezing_score=alt_score,
+        altfreezing_std=score_std,
+        temporal_diversity=temporal_diversity,
+        wav2lip_sync=wav2lip_sync,
+        vit_fake_score=vit_score,
+        xception_fake_score=xception_score,
+        vit_score_std=vit_score_std,
+    )
+
+    low_temporal_diversity = temporal_diversity is not None and temporal_diversity < 0.10
+    single_window = total_windows <= 1
+    flat_alt_predictions = score_std is None or score_std == 0.0
+    insufficient_data = alt_score is None or usable_frames < 6
+
+    verdict = fused["verdict"]
+    combined_reason = "weighted_fusion"
+    if insufficient_data:
+        verdict = "INCONCLUSIVE"
+        combined_reason = "weighted_fusion_insufficient_data"
+    elif low_temporal_diversity:
+        combined_reason = "weighted_fusion_low_temporal_diversity"
+    elif single_window or flat_alt_predictions:
+        combined_reason = "weighted_fusion_weak_alt_evidence"
+    elif fused["disagreement"]:
+        combined_reason = "weighted_fusion_model_disagreement"
+
+    evidence_strength = _evidence_strength_label(
+        {
+            "quality_band": quality_band,
+            "total_windows": total_windows,
+            "score_std": score_std,
+            "temporal_diversity": temporal_diversity,
+            "high_frame_count": high_frame_count,
+            "evidence_quality": evidence_quality,
+        }
+    )
+
+    return {
+        **visual_decision,
+        "final_verdict": verdict,
+        "model_verdict": visual_decision.get("model_verdict", verdict),
+        "score": 0.0 if verdict == "INCONCLUSIVE" else fused["final_score"],
+        "final_score": 0.0 if verdict == "INCONCLUSIVE" else fused["final_score"],
+        "raw_score": raw_score,
+        "confidence": "low" if verdict == "INCONCLUSIVE" else fused["confidence"],
+        "reason": combined_reason,
+        "combined_reason": combined_reason,
+        "explanation": fused["explanation"],
+        "signals": {
+            "altfreezing": alt_score,
+            "vit": vit_score,
+            "xception": xception_score,
+            "wav2lip": wav2lip_risk,
+        },
+        "alt_score": alt_score,
+        "vit_score": vit_score,
+        "xception_score": xception_score,
+        "wav2lip_score": wav2lip_risk,
+        "disagreement_flag": fused["disagreement"],
+        "wav2lip_applied": wav2lip_risk is not None,
+        "vit_applied": vit_score is not None,
+        "vit_disqualified": fused.get("vit_disqualified", False),
+        "xception_applied": xception_score is not None,
+        "weights_used": fused["weights_used"],
+        "evidence_strength": evidence_strength,
+        "temporal_penalty": temporal_penalty,
+        "disagreement_boost": fused.get("disagreement_boost", False),
+    }
+
+
 @app.post("/api/analysis/video")
 async def video_analysis(
     file: UploadFile = File(...),
@@ -1762,6 +2283,28 @@ async def video_analysis(
 
         alt_score = alt_result.get("video_score")
         visual_decision = _decide_altfreezing_verdict(alt_score, quality_gate, alt_result)
+        crop_paths = opencv_summary.get("sequence_crop_paths") or []
+        vit_result = (
+            vit_service.predict_from_crops(crop_paths)
+            if crop_paths
+            else {
+                "ok": False,
+                "error": "no_sequence_crops",
+                "video_score": None,
+                "frames_used": 0,
+                "per_frame": [],
+                "model_name": "ViT",
+            }
+        )
+        meta_data["vit"] = vit_result
+        xception_result = xception_service.predict_from_analysis(
+            analysis_id=analysis.id,
+            uploads_dir=upload_dir,
+            max_frames=8,
+            aggregation="mean",
+            threshold=0.5,
+        )
+        meta_data["xception"] = xception_result
 
         # ── Wav2Lip audio-visual sync scoring ─────────────────────────────────
         wav2lip_result = wav2lip_service.wav2lip_sync_score(
@@ -1771,12 +2314,12 @@ async def video_analysis(
         meta_data["wav2lip"] = wav2lip_result
 
         # ── Combined verdict ───────────────────────────────────────────────────
-        def _reasoning_meta(dp: dict, ar: dict) -> dict:
+        def _reasoning_meta(dp: dict, ar: dict, vr: dict, xr: dict) -> dict:
             calibration = (ar or {}).get("calibration") or {}
             return {
                 "verdict":            dp.get("final_verdict"),
                 "final_verdict":      dp.get("final_verdict"),
-                "score":              dp.get("score"),
+                "score":              dp.get("final_score", dp.get("score")),
                 "raw_score":          dp.get("raw_score"),
                 "confidence":         dp.get("confidence"),
                 "reason":             dp.get("reason"),
@@ -1796,11 +2339,22 @@ async def video_analysis(
                 "temporal_penalty":   dp.get("temporal_penalty"),
                 "evidence_quality":   dp.get("evidence_quality", calibration.get("evidence_quality")),
                 "evidence_strength":  dp.get("evidence_strength"),
+                "vit_score":          dp.get("vit_score", (vr or {}).get("video_score")),
+                "xception_score":     dp.get("xception_score", (xr or {}).get("video_score")),
+                "wav2lip_score":      dp.get("wav2lip_score"),
+                "disagreement_flag":  dp.get("disagreement_flag"),
             }
 
-        combined_decision = _combine_verdicts(visual_decision, wav2lip_result)
-        combined_decision["final_explanation"] = generate_verdict_reason(
-            _reasoning_meta(combined_decision, alt_result)
+        combined_decision = _combine_model_signals(
+            visual_decision,
+            alt_result,
+            vit_result,
+            xception_result,
+            wav2lip_result,
+            quality_gate,
+        )
+        combined_decision["final_explanation"] = combined_decision.get("explanation") or generate_verdict_reason(
+            _reasoning_meta(combined_decision, alt_result, vit_result, xception_result)
         )
         combined_decision["verdict_reason"] = combined_decision["final_explanation"]
 
@@ -1812,6 +2366,15 @@ async def video_analysis(
         meta_data["altfreezing"] = alt_result
         meta_data["decision"]    = combined_decision
         analysis.meta = meta_data
+        _persist_model_runs(
+            db,
+            analysis,
+            alt_result=alt_result,
+            visual_decision=visual_decision,
+            vit_result=vit_result,
+            xception_result=xception_result,
+            wav2lip_result=wav2lip_result,
+        )
         db.commit()
 
         try:
@@ -1826,7 +2389,12 @@ async def video_analysis(
             "analysis_id": analysis.id,
             "verdict":     analysis.verdict,
             "score":       analysis.score,
+            "final_score": combined_decision.get("final_score", analysis.score),
             "status":      analysis.status,
+            "confidence":  combined_decision.get("confidence"),
+            "reason":      combined_decision.get("final_explanation"),
+            "signals":     combined_decision.get("signals"),
+            "weights_used": combined_decision.get("weights_used"),
             "sync_score":  wav2lip_result.get("sync_score"),
             "sync_interpretation": wav2lip_result.get("interpretation"),
             "combined_reason": combined_decision.get("combined_reason"),
@@ -1866,6 +2434,11 @@ async def capture_analysis(
 
     # Optional audio blob sent by the extension when it uses offscreen capture
     audio_upload = form_data.get("audio")
+    print(
+        f"[Capture] Received request: frames={len(files)} "
+        f"audio_present={audio_upload is not None} "
+        f"field_names={list(form_data.keys())}"
+    )
 
     try:
         meta_data = json.loads(meta)
@@ -2019,12 +2592,46 @@ async def capture_analysis(
         },
     }
 
-    def _reasoning_metadata_for(decision_payload: dict, alt_payload: dict) -> dict:
+    crop_paths = opencv_summary.get("sequence_crop_paths") or []
+    vit_result = (
+        vit_service.predict_from_crops(crop_paths)
+        if quality_pass and crop_paths
+        else {
+            "ok": False,
+            "error": "quality_gate_failed" if not quality_pass else "no_sequence_crops",
+            "video_score": None,
+            "frames_used": 0,
+            "per_frame": [],
+            "model_name": "ViT",
+        }
+    )
+    meta_data["vit"] = vit_result
+    xception_result = (
+        xception_service.predict_from_analysis(
+            analysis_id=analysis.id,
+            uploads_dir=upload_dir,
+            max_frames=8,
+            aggregation="mean",
+            threshold=0.5,
+        )
+        if quality_pass
+        else {
+            "ok": False,
+            "error": "quality_gate_failed",
+            "video_score": None,
+            "frames_used": 0,
+            "per_frame": [],
+            "model_name": "Xception",
+        }
+    )
+    meta_data["xception"] = xception_result
+
+    def _reasoning_metadata_for(decision_payload: dict, alt_payload: dict, vit_payload: dict, xception_payload: dict) -> dict:
         calibration = (alt_payload or {}).get("calibration") or {}
         return {
             "verdict": decision_payload.get("final_verdict"),
             "final_verdict": decision_payload.get("final_verdict"),
-            "score": decision_payload.get("score"),
+            "score": decision_payload.get("final_score", decision_payload.get("score")),
             "raw_score": decision_payload.get("raw_score"),
             "confidence": decision_payload.get("confidence"),
             "reason": decision_payload.get("reason"),
@@ -2044,6 +2651,10 @@ async def capture_analysis(
             "temporal_penalty": decision_payload.get("temporal_penalty"),
             "evidence_quality": decision_payload.get("evidence_quality", calibration.get("evidence_quality")),
             "evidence_strength": decision_payload.get("evidence_strength"),
+            "vit_score": decision_payload.get("vit_score", (vit_payload or {}).get("video_score")),
+            "xception_score": decision_payload.get("xception_score", (xception_payload or {}).get("video_score")),
+            "wav2lip_score": decision_payload.get("wav2lip_score"),
+            "disagreement_flag": decision_payload.get("disagreement_flag"),
         }
 
     if not quality_pass:
@@ -2056,7 +2667,19 @@ async def capture_analysis(
             "per_frame": [],
         }
         decision = _decide_altfreezing_verdict(None, meta_data["quality_gate"], alt_result)
-        decision["final_explanation"] = generate_verdict_reason(_reasoning_metadata_for(decision, alt_result))
+        decision["signals"] = {
+            "altfreezing": None,
+            "vit": _clamp01(vit_result.get("video_score")) if vit_result.get("ok") else None,
+            "xception": _clamp01(xception_result.get("video_score")) if xception_result.get("ok") else None,
+            "wav2lip": None,
+        }
+        decision["final_score"] = 0.0
+        decision["vit_score"] = decision["signals"]["vit"]
+        decision["xception_score"] = decision["signals"]["xception"]
+        decision["wav2lip_score"] = None
+        decision["disagreement_flag"] = False
+        decision["weights_used"] = {"altfreezing": 0.40, "wav2lip": 0.25, "vit": 0.15, "xception": 0.20}
+        decision["final_explanation"] = generate_verdict_reason(_reasoning_metadata_for(decision, alt_result, vit_result, xception_result))
         decision["verdict_reason"] = decision["final_explanation"]
         analysis.score = 0.0
         analysis.verdict = decision["final_verdict"]
@@ -2065,8 +2688,28 @@ async def capture_analysis(
         meta_data["altfreezing"] = alt_result
         meta_data["decision"] = decision
         analysis.meta = meta_data
+        _persist_model_runs(
+            db,
+            analysis,
+            alt_result=alt_result,
+            visual_decision=decision,
+            vit_result=vit_result,
+            xception_result=xception_result,
+            wav2lip_result={"ok": False, "error": "skipped_due_to_quality_gate", "sync_score": None, "interpretation": "unavailable", "confidence": "low"},
+        )
         db.commit()
-        return {"ok": True, "analysis_id": analysis.id, "verdict": analysis.verdict, "score": analysis.score, "status": analysis.status}
+        return {
+            "ok": True,
+            "analysis_id": analysis.id,
+            "verdict": analysis.verdict,
+            "score": analysis.score,
+            "final_score": decision.get("final_score", analysis.score),
+            "status": analysis.status,
+            "confidence": decision.get("confidence"),
+            "reason": decision.get("final_explanation"),
+            "signals": decision.get("signals"),
+            "weights_used": decision.get("weights_used"),
+        }
 
     alt_result = altfreezing_service.predict_from_sequence(
         analysis_id=analysis.id,
@@ -2077,35 +2720,62 @@ async def capture_analysis(
 
     # ── Wav2Lip audio-visual sync (only when extension sent audio) ────────────
     wav2lip_result = {"ok": False, "error": "no_audio_uploaded", "sync_score": None, "interpretation": "unavailable"}
+    audio_debug = {
+        "uploaded": audio_upload is not None,
+        "filename": getattr(audio_upload, "filename", None) if audio_upload is not None else None,
+        "content_type": getattr(audio_upload, "content_type", None) if audio_upload is not None else None,
+        "byte_size": 0,
+        "saved_path": None,
+    }
     if audio_upload is not None:
-        import tempfile as _tempfile
         audio_content = await audio_upload.read()
+        audio_debug["byte_size"] = len(audio_content)
+        print(
+            f"[Capture][Audio] Received audio upload: "
+            f"filename={audio_debug['filename']} "
+            f"content_type={audio_debug['content_type']} "
+            f"bytes={audio_debug['byte_size']}"
+        )
         audio_tmp_path = None
         try:
-            with _tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as f:
+            suffix = Path(audio_upload.filename or "audio.webm").suffix or ".webm"
+            audio_tmp_path = upload_dir / f"{analysis.id}_audio{suffix}"
+            with open(audio_tmp_path, "wb") as f:
                 f.write(audio_content)
-                audio_tmp_path = f.name
+            audio_debug["saved_path"] = str(audio_tmp_path)
             seq_dir = upload_dir / f"{analysis.id}_seq"
             wav2lip_result = wav2lip_service.wav2lip_sync_score(
                 frames_dir=str(seq_dir),
-                audio_path=audio_tmp_path,
+                audio_path=str(audio_tmp_path),
                 weights_path="checkpoints/wav2lip_gan.pth",
+            )
+            print(
+                f"[Capture][Audio] Wav2Lip invoked with audio_path={audio_debug['saved_path']} "
+                f"ok={wav2lip_result.get('ok')} interpretation={wav2lip_result.get('interpretation')}"
             )
         except Exception as _e:
             wav2lip_result = {"ok": False, "error": f"wav2lip_error:{_e}", "sync_score": None, "interpretation": "unavailable"}
-        finally:
-            if audio_tmp_path:
-                try:
-                    os.remove(audio_tmp_path)
-                except Exception:
-                    pass
+            print(f"[Capture][Audio] Wav2Lip failed: {_e}")
+        if audio_debug["byte_size"] == 0:
+            wav2lip_result = {"ok": False, "error": "empty_audio_uploaded", "sync_score": None, "interpretation": "unavailable"}
+            print("[Capture][Audio] Audio upload existed but contained 0 bytes.")
+    else:
+        print("[Capture][Audio] No audio file was included in the multipart request.")
+    meta_data["audio_debug"] = audio_debug
     meta_data["wav2lip"] = wav2lip_result
 
     # ── Combine visual + sync verdicts ────────────────────────────────────────
     score = alt_result.get("video_score")
     visual_decision = _decide_altfreezing_verdict(score, meta_data["quality_gate"], alt_result)
-    decision = _combine_verdicts(visual_decision, wav2lip_result)
-    decision["final_explanation"] = generate_verdict_reason(_reasoning_metadata_for(decision, alt_result))
+    decision = _combine_model_signals(
+        visual_decision,
+        alt_result,
+        vit_result,
+        xception_result,
+        wav2lip_result,
+        meta_data["quality_gate"],
+    )
+    decision["final_explanation"] = decision.get("explanation") or generate_verdict_reason(_reasoning_metadata_for(decision, alt_result, vit_result, xception_result))
     decision["verdict_reason"] = decision["final_explanation"]
 
     analysis.score = float(decision.get("score")) if decision.get("score") is not None else 0.0
@@ -2116,6 +2786,15 @@ async def capture_analysis(
     meta_data["altfreezing"] = alt_result
     meta_data["decision"] = decision
     analysis.meta = meta_data
+    _persist_model_runs(
+        db,
+        analysis,
+        alt_result=alt_result,
+        visual_decision=visual_decision,
+        vit_result=vit_result,
+        xception_result=xception_result,
+        wav2lip_result=wav2lip_result,
+    )
     db.commit()
 
     # Auto-insert into global blocklist when result meets the risk threshold
@@ -2131,7 +2810,12 @@ async def capture_analysis(
         "analysis_id": analysis.id,
         "verdict": analysis.verdict,
         "score": analysis.score,
+        "final_score": decision.get("final_score", analysis.score),
         "status": analysis.status,
+        "confidence": decision.get("confidence"),
+        "reason": decision.get("final_explanation"),
+        "signals": decision.get("signals"),
+        "weights_used": decision.get("weights_used"),
         "sync_score": wav2lip_result.get("sync_score"),
         "sync_interpretation": wav2lip_result.get("interpretation"),
         "combined_reason": decision.get("combined_reason"),
@@ -2247,7 +2931,7 @@ def delete_user_history_item(analysis_id: int, db: Session = Depends(get_db), cu
 @app.get("/api/analysis/{analysis_id}")
 def get_user_analysis(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     analysis = _get_user_analysis_or_404(db, current_user.id, analysis_id)
-    return {"ok": True, "data": _serialize_analysis(analysis)}
+    return {"ok": True, "data": _serialize_analysis(analysis, include_model_runs=True)}
 
 @app.get("/api/analysis/{analysis_id}/preview")
 def get_user_analysis_preview(analysis_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):

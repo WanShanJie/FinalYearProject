@@ -775,19 +775,55 @@ async function extractLiveFramesFromVideo(video, {
   // needing tabCapture or any extra permissions.
   let audioRecorder = null;
   const audioChunks = [];
+  const audioDebug = {
+    captureStreamSupported: typeof video.captureStream === "function",
+    audioTrackCount: 0,
+    recorderStarted: false,
+    recorderMimeType: null,
+    chunkCount: 0,
+    blobSize: 0,
+    error: null,
+  };
   try {
     const stream = video.captureStream ? video.captureStream() : null;
     const audioTracks = stream ? stream.getAudioTracks() : [];
+    audioDebug.audioTrackCount = audioTracks.length;
+    console.log("[Capture][Audio] captureStream info:", {
+      supported: audioDebug.captureStreamSupported,
+      audioTracks: audioTracks.length,
+      videoTracks: stream ? stream.getVideoTracks().length : 0,
+      paused: video.paused,
+      muted: video.muted,
+      readyState: video.readyState,
+      currentTime: Number(video.currentTime || 0),
+    });
     if (audioTracks.length > 0) {
       const audioStream = new MediaStream(audioTracks);
       const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
         ? "audio/webm;codecs=opus" : "audio/webm";
+      audioDebug.recorderMimeType = mimeType;
       audioRecorder = new MediaRecorder(audioStream, { mimeType });
-      audioRecorder.ondataavailable = e => { if (e.data.size > 0) audioChunks.push(e.data); };
+      audioRecorder.ondataavailable = e => {
+        if (e.data.size > 0) {
+          audioChunks.push(e.data);
+          audioDebug.chunkCount += 1;
+          console.log("[Capture][Audio] chunk:", e.data.size);
+        }
+      };
+      audioRecorder.onerror = e => {
+        audioDebug.error = e?.error?.message || "media_recorder_error";
+        console.warn("[Capture][Audio] recorder error:", e);
+      };
       audioRecorder.start();
+      audioDebug.recorderStarted = true;
+      console.log("[Capture][Audio] recorder started with mime:", mimeType);
+    } else {
+      audioDebug.error = "no_audio_tracks_from_video_element";
+      console.warn("[Capture][Audio] No audio tracks were exposed by video.captureStream().");
     }
   } catch (e) {
     console.warn("[Capture] Audio recorder start failed:", e);
+    audioDebug.error = e?.message || String(e);
     audioRecorder = null;
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -846,15 +882,20 @@ async function extractLiveFramesFromVideo(video, {
       });
       if (audioChunks.length > 0) {
         const audioBlob = new Blob(audioChunks, { type: "audio/webm" });
+        audioDebug.blobSize = audioBlob.size;
         audioB64 = await new Promise(resolve => {
           const reader = new FileReader();
           reader.onloadend = () => resolve(reader.result);
           reader.readAsDataURL(audioBlob);
         });
         console.log("[Capture] Audio recorded, size:", audioBlob.size, "bytes");
+      } else {
+        audioDebug.error = audioDebug.error || "audio_blob_empty";
+        console.warn("[Capture][Audio] Recorder stopped but produced no audio chunks.");
       }
     } catch (e) {
       console.warn("[Capture] Audio recorder stop failed:", e);
+      audioDebug.error = e?.message || String(e);
     }
   }
   // ──────────────────────────────────────────────────────────────────────────
@@ -872,6 +913,7 @@ async function extractLiveFramesFromVideo(video, {
       nonBlocking: true,
       elapsedMs: Date.now() - startedAt,
       hasAudio: !!audioB64,
+      audio: audioDebug,
     },
     error: frames.length > 0 ? null : "all_frames_blank_or_failed",
   };
