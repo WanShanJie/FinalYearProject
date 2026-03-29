@@ -19,6 +19,7 @@ backend/uploads/
 *_faces/
 *_raw/
 *_seq/
+*_audio/
 
 # --- IDEs ---
 .vscode/

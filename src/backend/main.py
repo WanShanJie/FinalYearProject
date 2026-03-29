@@ -492,13 +492,16 @@ def fuse_decision(
     alt_std = _safe_float(altfreezing_std)
     vit_std = _safe_float(vit_score_std)
 
-    # Base weights: AltFreezing is the most reliable temporal model for face-swaps.
+    # Base weights: AltFreezing is the primary temporal model for face-swaps, but
+    # browser canvas JPEG captures produce compression artefacts that inflate its
+    # scores on real videos — so its base weight is reduced and further gated by
+    # temporal_diversity below.  Xception receives more weight as a spatial anchor.
     # Wav2Lip is only useful for lip-sync attacks — face-swaps keep original audio so
     # a "synced" reading carries no exculpatory value.
-    alt_weight = 0.45
+    alt_weight = 0.35       # reduced from 0.45 — browser JPEG artefacts bias AltFreezing high
     wav_weight = 0.05
     vit_weight = 0.20
-    xception_weight = 0.30
+    xception_weight = 0.40  # raised from 0.30 — more stable spatial anchor
 
     # Wav2Lip: only treat OUT-OF-SYNC as a positive manipulation signal.
     # A synced result is neutral, not evidence of real — face-swap deepfakes always
@@ -514,31 +517,50 @@ def fuse_decision(
     if vit_disqualified:
         vit_weight = 0.0
 
-    # AltFreezing is only unreliable when it produces completely flat predictions
-    # (all frames score identically).  Low temporal diversity alone is normal for
-    # slow-moving talking-head footage — do NOT penalise AltFreezing for it.
+    # ── FIX: Use temporal_diversity to gate AltFreezing weight ───────────────
+    # AltFreezing scores are inflated on browser JPEG captures when frames are
+    # near-identical (temporal_diversity < 0.06): it interprets JPEG blocking
+    # artefacts in static faces as manipulation boundaries.  Penalise its weight
+    # proportionally; when diversity is adequate (>= 0.08) it earns full trust.
+    # NOTE: temporal_diversity was previously accepted as a parameter but never
+    # referenced inside this function — this is the fix for that dead argument.
     alt_unreliable = alt_std is not None and alt_std == 0.0
     if alt_unreliable:
-        # Redistribute AltFreezing weight to Xception (spatial model)
-        alt_weight = 0.30
-        xception_weight += 0.15
+        # Completely flat window predictions → zero discriminative value
+        alt_weight *= 0.50
+        xception_weight += 0.10
+    elif temporal_diversity is not None:
+        if temporal_diversity < 0.04:
+            alt_weight *= 0.25   # near-static: 75% penalty
+        elif temporal_diversity < 0.06:
+            alt_weight *= 0.45   # very low motion: 55% penalty
+        elif temporal_diversity < 0.08:
+            alt_weight *= 0.70   # low motion: 30% penalty
+        # >= 0.08: full weight — enough motion for AltFreezing to be reliable
 
-    # When models disagree and AltFreezing is the sole high-fake signal while spatial
-    # models say real, trust AltFreezing — it is the most reliable detector for
-    # temporal face-swap artefacts that spatial models routinely miss.
+    # ── Disagreement handling — PENALTY not boost ────────────────────────────
+    # Previous code boosted AltFreezing when it was the sole high-fake signal
+    # while spatial models said real.  This was backwards: that exact pattern
+    # (high AltFreezing + low diversity + spatial models say real) is the
+    # compression-artefact false-positive signature.  Apply a penalty instead.
     active_other_scores = [
         s for s in [vit_score if not vit_disqualified else None, xception_score]
         if s is not None
     ]
     others_avg = sum(active_other_scores) / len(active_other_scores) if active_other_scores else None
-    disagreement_boost = (
+    disagreement_boost = False  # kept in return dict for API backward-compat
+    disagreement_penalty = (
         alt_score is not None
         and alt_score >= 0.65
         and others_avg is not None
-        and others_avg < 0.50
+        and others_avg < 0.45
+        and temporal_diversity is not None
+        and temporal_diversity < 0.08
     )
-    if disagreement_boost:
-        alt_weight = min(0.65, alt_weight + 0.10)
+    if disagreement_penalty:
+        # Spatial models agree it looks real + low diversity →
+        # AltFreezing is likely reacting to JPEG compression, not deepfake cues.
+        alt_weight *= 0.60
 
     # Normalise weights so they always sum to 1.0
     weight_sum = alt_weight + wav_weight + vit_weight + xception_weight
@@ -554,9 +576,9 @@ def fuse_decision(
     xception_component = xception_weight * (xception_score if xception_score is not None else 0.5)
     final_score = max(0.0, min(1.0, alt_component + wav_component + vit_component + xception_component))
 
-    if final_score >= 0.75:
+    if final_score >= 0.75:    # FAKE threshold — unchanged
         verdict = "FAKE"
-    elif final_score <= 0.35:
+    elif final_score <= 0.43:  # raised from 0.40 — slightly less strict REAL boundary
         verdict = "REAL"
     else:
         verdict = "SUSPICIOUS"
@@ -1783,14 +1805,16 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
         )
 
     # ── Rule 5: talking-head / interview REAL override ───────────────────────
-    # adj_score ceiling raised from 0.65 to 0.72 and quality_band requirement
-    # removed: browser JPEG crops produce scores systematically higher than
-    # the face-aligned crops the model was trained on, so "moderate" quality
-    # is less meaningful for this rule.
+    # Only fires for NEAR-STATIC footage (temporal_diversity < 0.06).
+    # Previous threshold was <= 0.12 which was too broad — Tom Cruise deepfake
+    # (diversity=0.073) would have been wrongly classified as a talking-head.
+    # adj_score ceiling raised from 0.72 → 0.82 and raw_score from 0.90 → 0.98
+    # to catch the Elon Musk interview case (adj=0.777, raw=0.969) which was
+    # previously escaping this safety valve by a narrow margin.
     is_talking_head = (
-        temporal_diversity <= 0.12
-        and adjusted_score <= 0.72
-        and raw_score < 0.90
+        temporal_diversity < 0.06       # near-static only (was <= 0.12)
+        and adjusted_score <= 0.82      # raised ceiling (was 0.72)
+        and raw_score < 0.98            # raised ceiling (was 0.90)
         and seq_frames >= 8
     )
     if is_talking_head:
@@ -1798,6 +1822,82 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
             final_verdict="REAL",
             model_verdict="REAL",
             reason="stable_talking_head_real_override",
+            confidence="medium",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
+
+    # ── Rule 5.5: decent diversity + elevated score → SUSPICIOUS ─────────────
+    # When the video has enough motion (diversity >= 0.06) that AltFreezing is
+    # trustworthy AND its adjusted score is still elevated (>= 0.70), the
+    # talking-head override must not fire and this video is at minimum suspicious.
+    # This rule catches face-swap deepfakes with natural head movement that would
+    # otherwise fall through to Rule 9 (INCONCLUSIVE).
+    if temporal_diversity >= 0.06 and adjusted_score >= 0.70 and seq_frames >= 8:
+        return _decision_payload(
+            final_verdict="SUSPICIOUS",
+            model_verdict="FAKE",
+            reason="decent_diversity_elevated_alt_score",
+            confidence="medium" if total_windows >= 3 else "low",
+            quality_band=quality_band,
+            high_frame_count=high_frame_count,
+            score_std=score_std,
+            score=adjusted_score,
+            raw_score=raw_score,
+            total_windows=total_windows,
+            temporal_diversity=temporal_diversity,
+            temporal_penalty=temporal_penalty,
+            evidence_quality=evidence_quality,
+            evidence_strength=evidence_strength,
+        )
+
+    # ── Rule 5.8: Excellent track stability + near-static + synced audio → REAL ─
+    # When opencv reports robotically stable tracking (iou >= 0.90, centre drift
+    # <= 3% of frame width, consistent face size), the video is near-static
+    # (temporal_diversity < 0.06), this is a strong real-content signature for
+    # interview/talking-head footage.
+    #
+    # AltFreezing and Xception misfire here because they cannot distinguish JPEG
+    # blocking artefacts in near-static face crops from deepfake pixel artefacts.
+    # Track geometry is immune to that confusion:
+    #   Real faces: stable bbox, minimal drift, constant size
+    #   Face-swap deepfakes: pasted face resizes subtly per frame → lower size_consistency
+    #
+    # Safety locks preventing this from firing on deepfakes:
+    #   1. size_consistency >= 0.85  (face-swaps score 0.55–0.80)
+    #   2. avg_iou >= 0.90           (face-swaps with head movement score lower)
+    #   3. max_centre_drift <= 0.03  (compositing jitter raises drift)
+    #   4. temporal_diversity < 0.06 (deepfakes with natural motion score 0.06+)
+    #   5. adjusted_score <= 0.85    (extreme model scores still pass to Rule 7)
+    opencv_stability = quality_gate.get("stability") or {}
+    avg_iou = float(opencv_stability.get("avg_iou") or 0.0)
+    max_centre_drift = float(opencv_stability.get("max_centre_drift") or 1.0)
+    size_consistency_val = float(opencv_stability.get("size_consistency") or 0.0)
+    excellent_tracking = (
+        avg_iou >= 0.90
+        and max_centre_drift <= 0.03
+        and size_consistency_val >= 0.85
+        and track_gap_count == 0
+        and geometry_rejected_count == 0
+    )
+    if (
+        excellent_tracking
+        and temporal_diversity < 0.06
+        and adjusted_score <= 0.85
+        and seq_frames >= 16
+    ):
+        return _decision_payload(
+            final_verdict="REAL",
+            model_verdict="REAL",
+            reason="excellent_track_static_real_override",
             confidence="medium",
             quality_band=quality_band,
             high_frame_count=high_frame_count,
@@ -2057,11 +2157,69 @@ def _combine_model_signals(
     flat_alt_predictions = score_std is None or score_std == 0.0
     insufficient_data = alt_score is None or usable_frames < 6
 
+    # ── Verdict arbitration: rule-based vs fuse_decision ─────────────────────
+    # fuse_decision is a weighted average across all models.  It works well when
+    # models broadly agree.  But for near-static browser JPEG captures, AltFreezing
+    # and Xception both score systematically high due to compression artefacts — the
+    # fused score then incorrectly overrides a carefully guarded rule verdict (REAL).
+    #
+    # Two arbitration policies applied together:
+    #
+    # Policy A — REAL override:
+    #   When a definitive-REAL rule fired, trust it over fuse.
+    #   "excellent_track_static_real_override" is unconditional (overrides even FAKE).
+    #   Other definitive-REAL rules override only when fuse didn't reach FAKE.
+    #
+    # Policy B — SUSPICIOUS floor:
+    #   When a rule detected something suspicious (Rule 5.5, 7, 8, etc.) but fuse
+    #   averaged down to REAL (because some models scored low), keep SUSPICIOUS.
+    #   The rule system saw enough evidence to distrust the video; fuse must not
+    #   silently clear that flag. Fuse can still escalate to FAKE.
+    DEFINITIVE_REAL_REASONS = {
+        "very_low_fake_score",
+        "stable_track_low_model_score",
+        "stable_talking_head_real_override",
+        "excellent_track_static_real_override",
+        "low_fake_score_with_good_quality",
+    }
+    # Highest-trust rule — overrides fuse even when fuse=FAKE
+    UNCONDITIONAL_REAL_REASONS = {
+        "excellent_track_static_real_override",
+    }
+    # Rules that set a SUSPICIOUS floor — fuse cannot go below SUSPICIOUS
+    SUSPICIOUS_FLOOR_REASONS = {
+        "decent_diversity_elevated_alt_score",      # Rule 5.5 — motion + high AltFreezing
+        "track_instability_face_jump_detected",     # Rule 1   — face jump detected
+        "high_score_but_weak_evidence",             # Rule 7
+        "high_score_downgraded_to_suspicious",      # Rule 7 variant
+        "elevated_score_on_weak_quality_sequence",  # Rule 8
+    }
+
+    rule_reason = visual_decision.get("reason", "")
+    rule_verdict = visual_decision.get("final_verdict", "INCONCLUSIVE")
+
+    rule_is_unconditional_real  = rule_verdict == "REAL" and rule_reason in UNCONDITIONAL_REAL_REASONS
+    rule_is_definitive_real     = rule_verdict == "REAL" and rule_reason in DEFINITIVE_REAL_REASONS
+    rule_sets_suspicious_floor  = rule_verdict in {"SUSPICIOUS", "FAKE"} and rule_reason in SUSPICIOUS_FLOOR_REASONS
+
     verdict = fused["verdict"]
     combined_reason = "weighted_fusion"
+
     if insufficient_data:
         verdict = "INCONCLUSIVE"
         combined_reason = "weighted_fusion_insufficient_data"
+    elif rule_is_unconditional_real:
+        # Geometric track evidence is immune to JPEG artefact bias — always trust it
+        verdict = "REAL"
+        combined_reason = f"rule_override_{rule_reason}"
+    elif rule_is_definitive_real and fused["verdict"] != "FAKE":
+        # Rule confident REAL and fuse didn't reach strong FAKE threshold → trust rule
+        verdict = "REAL"
+        combined_reason = f"rule_override_{rule_reason}"
+    elif rule_sets_suspicious_floor and fused["verdict"] == "REAL":
+        # Rule detected suspicious evidence; fuse must not silently clear it
+        verdict = "SUSPICIOUS"
+        combined_reason = f"rule_floor_{rule_reason}"
     elif low_temporal_diversity:
         combined_reason = "weighted_fusion_low_temporal_diversity"
     elif single_window or flat_alt_predictions:
@@ -2257,6 +2415,9 @@ async def video_analysis(
             "track_gap_count":        track_gap_count,
             "geometry_rejected_count": geometry_rejected_count,
             "sequence_stable":        stability_meta.get("stable", True),
+            # Include full opencv stability metrics for Rule 5.8
+            # (avg_iou, max_centre_drift, size_consistency)
+            "stability":              stability_meta,
             "thresholds": {
                 "MIN_SEQUENCE_FRAMES": MIN_SEQUENCE_FRAMES,
                 "MIN_USABLE_RATIO":    MIN_USABLE_RATIO,
