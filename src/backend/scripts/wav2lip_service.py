@@ -325,7 +325,10 @@ def _load_audio_from_video(video_path: str) -> Optional[np.ndarray]:
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
         tmp = f.name
     try:
-        cmd = ["ffmpeg", "-y", "-i", video_path,
+        import shutil
+        ffmpeg_cmd = shutil.which("ffmpeg") or r"C:\Users\Admin\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.WinGet.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe"
+
+        cmd = [ffmpeg_cmd, "-y", "-i", video_path,
                "-vn", "-acodec", "pcm_s16le",
                "-ar", str(WAV2LIP_SAMPLE_RATE), "-ac", "1", tmp]
         res = subprocess.run(cmd, capture_output=True, timeout=120)
@@ -341,13 +344,59 @@ def _load_audio_from_video(video_path: str) -> Optional[np.ndarray]:
 
 
 def _load_audio_file(audio_path: str) -> Optional[np.ndarray]:
-    """Load a WAV/MP3/etc. file into a float32 array at 16 kHz."""
+    """Load any audio/video file into a float32 array at 16 kHz.
+
+    WebM (Opus), OGG, M4A, and other container formats that librosa cannot
+    decode directly are first transcoded to PCM WAV via ffmpeg, then loaded.
+    WAV and MP3 files fall through to librosa directly.
+    """
     try:
         import librosa
-        wav, _ = librosa.load(audio_path, sr=WAV2LIP_SAMPLE_RATE)
-        return wav
-    except Exception:
+    except ImportError:
         return None
+
+    path = Path(audio_path)
+    suffix = path.suffix.lower()
+
+    # Formats librosa/soundfile handle natively — skip ffmpeg for these
+    _NATIVE = {".wav", ".mp3", ".flac", ".ogg", ".aiff", ".aif"}
+
+    if suffix in _NATIVE:
+        try:
+            wav, _ = librosa.load(audio_path, sr=WAV2LIP_SAMPLE_RATE)
+            return wav
+        except Exception:
+            pass  # fall through to ffmpeg as last resort
+
+    # Everything else (WebM, Opus, M4A, MP4, MKV, …) — transcode via ffmpeg
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        tmp = f.name
+    try:
+        # Check if ffmpeg is in path, else use the absolute path we found earlier
+        import shutil
+        ffmpeg_cmd = shutil.which("ffmpeg") or r"C:\Users\Admin\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.WinGet.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe"
+
+        cmd = [
+            ffmpeg_cmd, "-y", "-i", audio_path,
+            "-vn",
+            "-acodec", "pcm_s16le",
+            "-ar", str(WAV2LIP_SAMPLE_RATE),
+            "-ac", "1",
+            tmp,
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=60)
+        if res.returncode != 0:
+            print(f"[Wav2Lip][Audio] ffmpeg failed with code {res.returncode}: {res.stderr.decode(errors='ignore')}")
+            return None
+        wav, _ = librosa.load(tmp, sr=WAV2LIP_SAMPLE_RATE)
+        print(f"[Wav2Lip][Audio] Successfully loaded audio from transcode: {len(wav)} samples")
+        return wav
+    except Exception as e:
+        print(f"[Wav2Lip][Audio] Exception in _load_audio_file: {e}")
+        return None
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def _extract_video_frames(video_path: str,
@@ -552,15 +601,18 @@ def wav2lip_sync_score(
         cap.release()
 
     elif frames_dir and audio_path:
+        print(f"[Wav2Lip] Loading audio from file: {audio_path}")
         wav = _load_audio_file(audio_path)
         if wav is None:
             return _error_payload(f"audio_load_failed:{audio_path}")
         # Load face crops from the sequence directory (already cropped by opencv_pipeline)
+        print(f"[Wav2Lip] Scanning frames_dir: {frames_dir}")
         crops_sorted = sorted(Path(frames_dir).glob("face_*.jpg"))[:max_frames]
         for p in crops_sorted:
             img = cv2.imread(str(p))
             if img is not None:
                 raw_frames.append(img)
+        print(f"[Wav2Lip] Found {len(raw_frames)} face crops in frames_dir.")
 
     else:
         return _error_payload(
@@ -568,9 +620,11 @@ def wav2lip_sync_score(
         )
 
     if wav is None or len(wav) < WAV2LIP_SAMPLE_RATE // 2:
+        print(f"[Wav2Lip] Audio error: wav is None or too short ({len(wav) if wav is not None else 0} samples)")
         return _error_payload("no_audio_available")
 
     if len(raw_frames) < 5:
+        print(f"[Wav2Lip] Insufficient raw_frames: {len(raw_frames)}")
         return _error_payload(f"insufficient_frames:{len(raw_frames)}")
 
     # ── Compute mel spectrogram ───────────────────────────────────────────────

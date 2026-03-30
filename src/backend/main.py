@@ -1,4 +1,5 @@
 import os
+import math
 import secrets
 import hashlib
 import hmac
@@ -477,6 +478,155 @@ def _score_stance(score: Optional[float]) -> str:
     return "suspicious"
 
 
+# ── Improvement 1: Temperature Scaling ───────────────────────────────────────
+# Models output overconfident raw probabilities on browser JPEG captures.
+# Temperature scaling shrinks scores toward 0.5 without changing model weights.
+# T=1.0 is no change; T=2.0 roughly halves the logit distance from 0.5.
+_ALT_TEMPERATURE      = 2.0   # AltFreezing — most overconfident on static JPEG
+_XCEPTION_TEMPERATURE = 1.8   # Xception — moderately overconfident
+
+
+def _calibrate_score(raw_prob: float, temperature: float) -> float:
+    """Reduce overconfidence by dividing the logit by `temperature`."""
+    p = max(1e-7, min(1.0 - 1e-7, float(raw_prob)))
+    logit = math.log(p / (1.0 - p))
+    return 1.0 / (1.0 + math.exp(-logit / temperature))
+
+
+# ── Improvement 2: Context-Aware Dynamic Thresholds ──────────────────────────
+def _get_verdict_thresholds(
+    avg_blur: float,
+    avg_iou: float,
+    total_windows: int,
+    temporal_diversity: Optional[float],
+) -> tuple:
+    """Return (fake_threshold, real_threshold) adjusted for video context."""
+    fake_threshold = 0.75
+    real_threshold = 0.43
+
+    # Small face or unstable track — model predictions are unreliable
+    if avg_blur < 30 or avg_iou < 0.50:
+        fake_threshold = 0.90
+        real_threshold = 0.50
+
+    # Weak evidence — only 1–2 windows
+    if total_windows <= 2:
+        fake_threshold = max(fake_threshold, 0.88)
+        real_threshold = max(real_threshold, 0.48)
+
+    # High-motion video — natural movement increases model scores; raise bar for FAKE
+    if temporal_diversity is not None and temporal_diversity > 0.12:
+        fake_threshold = max(fake_threshold, 0.82)
+
+    return fake_threshold, real_threshold
+
+
+# ── Improvement 3: Video Type Classifier ─────────────────────────────────────
+def _classify_video_context(
+    avg_blur: float,
+    avg_iou: float,
+    size_consistency: float,
+    avg_brightness: float,
+    temporal_diversity: Optional[float],
+) -> str:
+    """Classify video type using already-computed quality signals (no ML needed)."""
+    div = temporal_diversity or 0.0
+
+    # Conference / stage: small blurry face, position jumps, inconsistent size
+    if avg_blur < 40 and avg_iou < 0.60 and size_consistency < 0.75:
+        return "conference"
+
+    # Interview / talking head: sharp face, stable position, near-static
+    if avg_blur > 40 and avg_iou > 0.80 and div < 0.06:
+        return "interview"
+
+    # Active speaker: good quality + natural motion
+    if avg_blur > 100 and avg_iou > 0.60 and div >= 0.06:
+        return "active_speaker"
+
+    return "unknown"
+
+
+# ── Improvement 4: Fake Vote Counter ─────────────────────────────────────────
+def _count_fake_votes(signals: dict, threshold: float = 0.65) -> int:
+    """Count models independently agreeing the content is likely fake."""
+    votes = 0
+    if signals.get("altfreezing") is not None and signals["altfreezing"] >= threshold:
+        votes += 1
+    if signals.get("xception") is not None and signals["xception"] >= threshold:
+        votes += 1
+    if signals.get("vit") is not None and signals["vit"] >= threshold:
+        votes += 1
+    if signals.get("wav2lip") is not None and signals["wav2lip"] >= 0.60:
+        votes += 1
+    return votes
+
+
+# ── Improvement 5: Xception Quality Normalisation ────────────────────────────
+def _normalise_xception_by_quality(xc_score: float, avg_blur: float) -> float:
+    """Blend Xception score toward 0.5 when face sharpness is too low to be reliable."""
+    if avg_blur >= 100:
+        return xc_score
+    trust = min(1.0, max(0.0, (avg_blur - 10.0) / 90.0))
+    return 0.5 + (xc_score - 0.5) * trust
+
+
+# ── Improvement 6: Confidence-Based Verdict Downgrade ────────────────────────
+def _apply_uncertainty_cascade(
+    verdict: str,
+    total_windows: int,
+    avg_blur: float,
+    wav2lip_available: bool,
+    avg_iou: float,
+    seq_frames: int,
+) -> tuple:
+    """Downgrade verdict one level when >= 2 weak-evidence flags co-occur."""
+    flags = []
+    if total_windows <= 1:
+        flags.append("single_window")
+    if avg_blur < 30:
+        flags.append("small_face")
+    if not wav2lip_available:
+        flags.append("no_audio_check")
+    if avg_iou < 0.55:
+        flags.append("mobile_subject")
+    if seq_frames < 20:
+        flags.append("few_frames")
+
+    if len(flags) >= 2 and verdict == "FAKE":
+        return "SUSPICIOUS", f"uncertainty_cascade:{','.join(flags)}"
+    if len(flags) >= 3 and verdict == "SUSPICIOUS":
+        return "INCONCLUSIVE", f"high_uncertainty:{','.join(flags)}"
+
+    return verdict, "no_cascade"
+
+
+# ── Improvement 7: Cross-Frame Consistency Check ─────────────────────────────
+def _xception_consistency_check(per_frame: list) -> dict:
+    """Determine whether Xception's per-frame scores are consistent or confused."""
+    probs = [
+        float(f["fake_prob"])
+        for f in (per_frame or [])
+        if isinstance(f, dict) and "fake_prob" in f
+    ]
+    if not probs:
+        return {"mean": None, "std": None, "high_frame_count": 0, "consistent": False, "confused": False}
+
+    mean = sum(probs) / len(probs)
+    std  = (sum((p - mean) ** 2 for p in probs) / len(probs)) ** 0.5
+    high_count = sum(1 for p in probs if p >= 0.65)
+
+    return {
+        "mean": mean,
+        "std": std,
+        "high_frame_count": high_count,
+        # consistent = model strongly agrees across most frames
+        "consistent": std < 0.10 and high_count >= max(1, len(probs) * 3 // 4),
+        # confused = model swings wildly (half fake / half real across frames)
+        "confused": std > 0.20,
+    }
+
+
 def fuse_decision(
     altfreezing_score,
     altfreezing_std,
@@ -485,6 +635,9 @@ def fuse_decision(
     vit_fake_score,
     xception_fake_score=None,
     vit_score_std=None,
+    fake_threshold: float = 0.75,
+    real_threshold: float = 0.43,
+    xception_confused: bool = False,
 ):
     alt_score = _clamp01(altfreezing_score)
     vit_score = _clamp01(vit_fake_score)
@@ -516,6 +669,11 @@ def fuse_decision(
     vit_disqualified = vit_std is not None and vit_std > 0.35
     if vit_disqualified:
         vit_weight = 0.0
+
+    # Improvement 7 integration: reduce Xception's weight when its per-frame
+    # scores swing wildly (std > 0.20 across frames — model is confused, not detecting).
+    if xception_confused:
+        xception_weight *= 0.50
 
     # ── FIX: Use temporal_diversity to gate AltFreezing weight ───────────────
     # AltFreezing scores are inflated on browser JPEG captures when frames are
@@ -576,9 +734,9 @@ def fuse_decision(
     xception_component = xception_weight * (xception_score if xception_score is not None else 0.5)
     final_score = max(0.0, min(1.0, alt_component + wav_component + vit_component + xception_component))
 
-    if final_score >= 0.75:    # FAKE threshold — unchanged
+    if final_score >= fake_threshold:
         verdict = "FAKE"
-    elif final_score <= 0.43:  # raised from 0.40 — slightly less strict REAL boundary
+    elif final_score <= real_threshold:
         verdict = "REAL"
     else:
         verdict = "SUSPICIOUS"
@@ -2142,14 +2300,56 @@ def _combine_model_signals(
 
     vit_score_std = _safe_float((vit_result or {}).get("score_std"))
 
+    # ── Extract quality metrics for improvements 2–7 ─────────────────────────
+    avg_blur       = float((quality_gate or {}).get("avg_blur") or 0.0)
+    avg_brightness = float((quality_gate or {}).get("avg_brightness") or 0.0)
+    stability_meta_qs = (quality_gate or {}).get("stability") or {}
+    avg_iou         = float(stability_meta_qs.get("avg_iou") or 1.0)
+    size_consistency = float(stability_meta_qs.get("size_consistency") or 1.0)
+
+    # ── Improvement 7: Xception per-frame consistency ─────────────────────────
+    xception_per_frame  = (xception_result or {}).get("per_frame") or []
+    xception_consistency = _xception_consistency_check(xception_per_frame)
+
+    # ── Improvement 5: Xception quality normalisation (by face sharpness) ────
+    # Shrinks Xception score toward 0.5 when blur is too low for reliable detection
+    xception_score_calibrated = (
+        _normalise_xception_by_quality(xception_score, avg_blur)
+        if xception_score is not None else None
+    )
+
+    # ── Improvement 1: Temperature scaling to reduce overconfidence ──────────
+    # Apply after quality normalisation so both corrections compound correctly.
+    alt_score_calibrated = (
+        _calibrate_score(alt_score, _ALT_TEMPERATURE)
+        if alt_score is not None else None
+    )
+    xception_score_calibrated = (
+        _calibrate_score(xception_score_calibrated, _XCEPTION_TEMPERATURE)
+        if xception_score_calibrated is not None else None
+    )
+
+    # ── Improvement 3: Video type classification ──────────────────────────────
+    video_context = _classify_video_context(
+        avg_blur, avg_iou, size_consistency, avg_brightness, temporal_diversity
+    )
+
+    # ── Improvement 2: Dynamic verdict thresholds ────────────────────────────
+    fake_threshold, real_threshold = _get_verdict_thresholds(
+        avg_blur, avg_iou, total_windows, temporal_diversity
+    )
+
     fused = fuse_decision(
-        altfreezing_score=alt_score,
+        altfreezing_score=alt_score_calibrated,
         altfreezing_std=score_std,
         temporal_diversity=temporal_diversity,
         wav2lip_sync=wav2lip_sync,
         vit_fake_score=vit_score,
-        xception_fake_score=xception_score,
+        xception_fake_score=xception_score_calibrated,
         vit_score_std=vit_score_std,
+        fake_threshold=fake_threshold,
+        real_threshold=real_threshold,
+        xception_confused=xception_consistency["confused"],
     )
 
     low_temporal_diversity = temporal_diversity is not None and temporal_diversity < 0.10
@@ -2209,15 +2409,12 @@ def _combine_model_signals(
         verdict = "INCONCLUSIVE"
         combined_reason = "weighted_fusion_insufficient_data"
     elif rule_is_unconditional_real:
-        # Geometric track evidence is immune to JPEG artefact bias — always trust it
         verdict = "REAL"
         combined_reason = f"rule_override_{rule_reason}"
     elif rule_is_definitive_real and fused["verdict"] != "FAKE":
-        # Rule confident REAL and fuse didn't reach strong FAKE threshold → trust rule
         verdict = "REAL"
         combined_reason = f"rule_override_{rule_reason}"
     elif rule_sets_suspicious_floor and fused["verdict"] == "REAL":
-        # Rule detected suspicious evidence; fuse must not silently clear it
         verdict = "SUSPICIOUS"
         combined_reason = f"rule_floor_{rule_reason}"
     elif low_temporal_diversity:
@@ -2226,6 +2423,41 @@ def _combine_model_signals(
         combined_reason = "weighted_fusion_weak_alt_evidence"
     elif fused["disagreement"]:
         combined_reason = "weighted_fusion_model_disagreement"
+
+    # ── Improvement 3: Video context arbitration ─────────────────────────────
+    if verdict == "FAKE" and video_context == "conference" and (
+        total_windows <= 2 or fused["final_score"] < 0.90
+    ):
+        # Conference footage: small faces make models unreliable — require stronger signal
+        verdict = "SUSPICIOUS"
+        combined_reason = "conference_context_insufficient_evidence"
+    elif verdict in {"SUSPICIOUS", "INCONCLUSIVE"} and video_context == "interview" and rule_is_definitive_real:
+        # Clear interview/talking-head + definitive rule says REAL → trust rule unconditionally
+        verdict = "REAL"
+        combined_reason = f"interview_context_rule_override_{rule_reason}"
+
+    # ── Improvement 4: Require >= 2 independent models agreeing for FAKE ─────
+    fake_votes = _count_fake_votes({
+        "altfreezing": alt_score_calibrated,
+        "xception":    xception_score_calibrated,
+        "vit":         vit_score if not fused.get("vit_disqualified") else None,
+        "wav2lip":     wav2lip_risk,
+    })
+    if verdict == "FAKE" and fake_votes < 2:
+        verdict = "SUSPICIOUS"
+        combined_reason = "insufficient_model_agreement_for_fake"
+
+    # ── Improvement 6: Uncertainty cascade ───────────────────────────────────
+    verdict, cascade_reason = _apply_uncertainty_cascade(
+        verdict,
+        total_windows=total_windows,
+        avg_blur=avg_blur,
+        wav2lip_available=wav_sync_available,
+        avg_iou=avg_iou,
+        seq_frames=usable_frames,
+    )
+    if cascade_reason != "no_cascade":
+        combined_reason = cascade_reason
 
     evidence_strength = _evidence_strength_label(
         {
@@ -2264,10 +2496,18 @@ def _combine_model_signals(
         "vit_applied": vit_score is not None,
         "vit_disqualified": fused.get("vit_disqualified", False),
         "xception_applied": xception_score is not None,
+        "xception_confused": xception_consistency["confused"],
+        "xception_consistency": xception_consistency,
         "weights_used": fused["weights_used"],
         "evidence_strength": evidence_strength,
         "temporal_penalty": temporal_penalty,
         "disagreement_boost": fused.get("disagreement_boost", False),
+        "video_context": video_context,
+        "fake_votes": fake_votes,
+        "fake_threshold": fake_threshold,
+        "real_threshold": real_threshold,
+        "alt_score_calibrated": alt_score_calibrated,
+        "xception_score_calibrated": xception_score_calibrated,
     }
 
 
@@ -2745,6 +2985,8 @@ async def capture_analysis(
         "track_gap_count": track_gap_count,
         "geometry_rejected_count": geometry_rejected_count,
         "sequence_stable": stability_meta.get("stable", True),
+        # Full stability metrics needed by _classify_video_context and _apply_uncertainty_cascade
+        "stability": stability_meta,
         "thresholds": {
             "MIN_SEQUENCE_FRAMES": MIN_SEQUENCE_FRAMES,
             "MIN_USABLE_RATIO": MIN_USABLE_RATIO,
