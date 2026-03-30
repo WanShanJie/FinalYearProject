@@ -108,3 +108,22 @@ export async function verifyEmailOtp(payload) {
   });
   return handleResponse(res);
 }
+
+function authHeaders() {
+  const token = localStorage.getItem("token");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+export async function getAdminStats() {
+  const res = await fetch(`${API_BASE}/api/admin/stats`, {
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function getAdminLogs(limit = 20) {
+  const res = await fetch(`${API_BASE}/api/admin/logs?limit=${limit}`, {
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}

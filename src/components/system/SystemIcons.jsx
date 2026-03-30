@@ -161,6 +161,51 @@ export function VideoIcon(props) {
   );
 }
 
+export function MonitorIcon(props) {
+  return (
+    <BaseIcon {...props}>
+      <rect x="2" y="3" width="20" height="14" rx="2" />
+      <path d="M8 21h8M12 17v4" />
+      <path d="M7 8h2M11 8h6M7 11h4M13 11h4" />
+    </BaseIcon>
+  );
+}
+
+export function ActivityIcon(props) {
+  return (
+    <BaseIcon {...props}>
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </BaseIcon>
+  );
+}
+
+export function CheckCircleIcon(props) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M8.5 12.5l2.5 2.5 4.5-5" />
+    </BaseIcon>
+  );
+}
+
+export function XCircleIcon(props) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M9 9l6 6M15 9l-6 6" />
+    </BaseIcon>
+  );
+}
+
+export function ClockIcon(props) {
+  return (
+    <BaseIcon {...props}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3 3" />
+    </BaseIcon>
+  );
+}
+
 export function AlertIcon(props) {
   return (
     <BaseIcon {...props}>

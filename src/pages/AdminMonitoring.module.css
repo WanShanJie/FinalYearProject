@@ -1,0 +1,376 @@
+/* ═══════════════════════════════════════════════════
+   AdminMonitoring.module.css
+   Variables resolve from SystemLayout.module.css
+   ═══════════════════════════════════════════════════ */
+
+/* ── Page header ──────────────────────────────────── */
+.pageHeader {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 28px;
+}
+
+.pageTitle {
+  font-size: 1.55rem;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  margin: 0;
+}
+
+.pageSubtitle {
+  margin-top: 4px;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+/* ── KPI grid ─────────────────────────────────────── */
+.kpiGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 20px;
+  margin-bottom: 28px;
+}
+
+.kpiCard {
+  position: relative;
+  overflow: hidden;
+  padding: 20px 20px 18px;
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.kpiTop {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.kpiLabel {
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.kpiIcon {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.kpiValue {
+  font-size: 2rem;
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  line-height: 1;
+}
+
+.kpiSub {
+  margin-top: 6px;
+  font-size: 0.81rem;
+  color: var(--muted);
+}
+
+.kpiGlow {
+  position: absolute;
+  left: -15%;
+  right: -15%;
+  bottom: -48px;
+  height: 100px;
+  border-radius: 999px;
+  opacity: 0.38;
+}
+
+.blue  .kpiGlow  { background: rgba(59, 130, 246, 0.4); }
+.blue  .kpiIcon  { color: var(--primary); }
+.green .kpiGlow  { background: rgba(34, 197, 94, 0.35); }
+.green .kpiIcon  { color: var(--success); }
+.amber .kpiGlow  { background: rgba(245, 158, 11, 0.3); }
+.amber .kpiIcon  { color: var(--warning); }
+.red   .kpiGlow  { background: rgba(239, 68, 68, 0.32); }
+.red   .kpiIcon  { color: var(--danger); }
+
+/* ── Two-column row ───────────────────────────────── */
+.rowSplit {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 22px;
+  margin-bottom: 28px;
+}
+
+/* ── Panel shell ──────────────────────────────────── */
+.panel {
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.panelHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.panelTitle {
+  font-size: 0.92rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.panelBadge {
+  font-size: 0.74rem;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+
+.panelBody {
+  padding: 20px;
+}
+
+/* ── Verdict breakdown bars ───────────────────────── */
+.verdictList {
+  display: grid;
+  gap: 15px;
+}
+
+.verdictRow {
+  display: grid;
+  gap: 6px;
+}
+
+.verdictMeta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.verdictLabel {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.verdictCount {
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.barTrack {
+  height: 7px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.barFill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  min-width: 3px;
+}
+
+.barReal        { background: var(--success); }
+.barFake        { background: var(--danger); }
+.barSuspicious  { background: var(--warning); }
+.barInconclusive{ background: var(--cyan); }
+.barPending     { background: var(--muted-2); }
+
+/* ── Platform list ────────────────────────────────── */
+.platformList {
+  display: grid;
+  gap: 13px;
+}
+
+.platformRow {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+}
+
+.platformDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.platformName {
+  flex: 1;
+  font-size: 0.86rem;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.platformCount {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.platformBar {
+  width: 60px;
+}
+
+/* ── Logs section ─────────────────────────────────── */
+.logsPanel {
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+  margin-bottom: 28px;
+}
+
+.tableWrap {
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.86rem;
+}
+
+.table th {
+  padding: 10px 16px;
+  text-align: left;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: 11px 16px;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+
+.table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.table tbody tr:hover td {
+  background: var(--surface-2);
+}
+
+/* ── Verdict chip ─────────────────────────────────── */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.chipReal        { background: var(--success-soft);  color: var(--success); }
+.chipFake        { background: var(--danger-soft);   color: var(--danger); }
+.chipSuspicious  { background: var(--warning-soft);  color: var(--warning); }
+.chipInconclusive{ background: var(--cyan-soft);     color: var(--cyan); }
+.chipPending     { background: var(--surface-3);     color: var(--muted); }
+
+/* ── Status dot ───────────────────────────────────── */
+.statusCell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.83rem;
+  font-weight: 600;
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dotDone    { background: var(--success); }
+.dotError   { background: var(--danger); }
+.dotPending { background: var(--muted-2); }
+
+/* ── Secondary text cells ─────────────────────────── */
+.muted {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.videoId {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+/* ── Refresh button ───────────────────────────────── */
+.refreshBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 8px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 0.84rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+
+.refreshBtn:hover {
+  background: var(--surface-3);
+  border-color: var(--border-strong);
+}
+
+.refreshIcon {
+  width: 15px;
+  height: 15px;
+}
+
+/* ── Loading / error ──────────────────────────────── */
+.stateBox {
+  min-height: 220px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.stateBox.error { color: var(--danger); }
+
+/* ── Empty table row ──────────────────────────────── */
+.emptyCell {
+  text-align: center;
+  color: var(--muted);
+  padding: 36px !important;
+}
+
+/* ── Responsive ───────────────────────────────────── */
+@media (max-width: 1100px) {
+  .kpiGrid   { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rowSplit  { grid-template-columns: 1fr; }
+}

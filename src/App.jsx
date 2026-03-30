@@ -12,6 +12,7 @@ import MediaAnalysisDetail from "./pages/MediaAnalysisDetail";
 import BlocklistManager from "./pages/BlocklistManager";
 import Settings from "./pages/Settings";
 import ExtensionConnect from "./pages/ExtensionConnect";
+import AdminMonitoring from "./pages/AdminMonitoring";
 import SystemLayout from "./components/system/SystemLayout";
 
 function RequireAuth({ children }) {
@@ -54,6 +55,7 @@ export default function App() {
         <Route path="/blocklist-manager" element={<BlocklistManager />} />
         <Route path="/settings" element={<Settings />} />
         <Route path="/extension/connect" element={<ExtensionConnect />} />
+        <Route path="/admin/monitoring" element={<AdminMonitoring />} />
       </Route>
 
       {/* Default */}

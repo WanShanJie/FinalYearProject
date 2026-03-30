@@ -8,19 +8,20 @@ import {
   DashboardIcon,
   ListIcon,
   LogoutIcon,
+  MonitorIcon,
   MoonIcon,
   SearchIcon,
   SettingsIcon,
-  ShieldIcon,
   SunIcon,
   UserIcon,
 } from "./SystemIcons";
 
 const iconMap = {
-  dashboard: DashboardIcon,
-  media: SearchIcon,
-  blocklist: ListIcon,
-  settings: SettingsIcon,
+  dashboard:  DashboardIcon,
+  media:      SearchIcon,
+  blocklist:  ListIcon,
+  monitoring: MonitorIcon,
+  settings:   SettingsIcon,
 };
 
 export default function SystemHeader({ theme, onToggleTheme }) {

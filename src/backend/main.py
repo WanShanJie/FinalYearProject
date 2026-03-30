@@ -1,4 +1,5 @@
 import os
+import time
 import math
 import secrets
 import hashlib
@@ -12,7 +13,7 @@ from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, 
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import or_
+from sqlalchemy import or_, func
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
@@ -973,6 +974,14 @@ def _persist_model_runs(
 
     if runs:
         db.add_all(runs)
+
+
+def _finalize_analysis_log(db: Session, analysis: MediaAnalysis, start_time: float, status: str = "DONE"):
+    """Update analysis with completion timestamp and processing time for monitoring."""
+    analysis.completed_at = _utcnow()
+    analysis.processing_time = round(time.time() - start_time, 2)
+    analysis.status = status
+    db.commit()
 
 
 def _serialize_analysis(analysis: MediaAnalysis, include_model_runs: bool = False) -> dict:
@@ -2528,6 +2537,7 @@ async def video_analysis(
     """
     upload_dir = Path(__file__).resolve().parent / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
 
     # ── Save uploaded video to a temp file ────────────────────────────────────
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
@@ -2763,8 +2773,7 @@ async def video_analysis(
 
         analysis.score   = float(combined_decision.get("score") or 0.0)
         analysis.verdict = combined_decision["final_verdict"]
-        analysis.status  = "DONE"
-        analysis.completed_at = datetime.utcnow()
+
 
         meta_data["altfreezing"] = alt_result
         meta_data["decision"]    = combined_decision
@@ -2778,7 +2787,8 @@ async def video_analysis(
             xception_result=xception_result,
             wav2lip_result=wav2lip_result,
         )
-        db.commit()
+        _finalize_analysis_log(db, analysis, start_time, status="DONE")
+
 
         try:
             _maybe_insert_blocklist(analysis, db)
@@ -2807,9 +2817,8 @@ async def video_analysis(
         import traceback
         traceback.print_exc()
         analysis.verdict = "INCONCLUSIVE"
-        analysis.status  = "ERROR"
         analysis.meta    = {**meta_data, "error": str(e)}
-        db.commit()
+        _finalize_analysis_log(db, analysis, start_time, status="ERROR")
         raise HTTPException(status_code=500, detail=f"Video analysis failed: {e}")
 
     finally:
@@ -2898,6 +2907,8 @@ async def capture_analysis(
     db.refresh(analysis)
 
     upload_dir = Path(__file__).resolve().parent / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    start_time = time.time()
     raw_dir = upload_dir / f"{analysis.id}_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -3088,8 +3099,7 @@ async def capture_analysis(
         decision["verdict_reason"] = decision["final_explanation"]
         analysis.score = 0.0
         analysis.verdict = decision["final_verdict"]
-        analysis.status = "DONE"
-        analysis.completed_at = datetime.utcnow()
+        _finalize_analysis_log(db, analysis, start_time, status="DONE")
         meta_data["altfreezing"] = alt_result
         meta_data["decision"] = decision
         analysis.meta = meta_data
@@ -3185,12 +3195,10 @@ async def capture_analysis(
 
     analysis.score = float(decision.get("score")) if decision.get("score") is not None else 0.0
     analysis.verdict = decision["final_verdict"]
-    analysis.status = "DONE"
-    analysis.completed_at = datetime.utcnow()
-
     meta_data["altfreezing"] = alt_result
     meta_data["decision"] = decision
     analysis.meta = meta_data
+
     _persist_model_runs(
         db,
         analysis,
@@ -3200,7 +3208,7 @@ async def capture_analysis(
         xception_result=xception_result,
         wav2lip_result=wav2lip_result,
     )
-    db.commit()
+    _finalize_analysis_log(db, analysis, start_time, status="DONE")
 
     # Auto-insert into global blocklist when result meets the risk threshold
     try:
@@ -3454,4 +3462,61 @@ def check_blocklist(payload: dict, db: Session = Depends(get_db), current_user: 
         "ok": True,
         "matched_hashes": list(matched_hashes),
         "matched_video_ids": list(matched_video_ids),
+    }
+# --- Monitoring & Admin API -------------------------------------------------
+
+@app.get("/api/admin/stats")
+def get_admin_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return system-wide monitoring metrics for the admin dashboard."""
+    total = db.query(MediaAnalysis).count()
+    success = db.query(MediaAnalysis).filter(MediaAnalysis.status == "DONE").count()
+    failure = db.query(MediaAnalysis).filter(MediaAnalysis.status == "ERROR").count()
+    avg_time = (
+        db.query(func.avg(MediaAnalysis.processing_time))
+        .filter(MediaAnalysis.status == "DONE", MediaAnalysis.processing_time.isnot(None))
+        .scalar() or 0.0
+    )
+    verdicts = (
+        db.query(MediaAnalysis.verdict, func.count(MediaAnalysis.id))
+        .group_by(MediaAnalysis.verdict)
+        .all()
+    )
+    verdict_breakdown = {v: c for v, c in verdicts if v}
+    return {
+        "ok": True,
+        "stats": {
+            "total_requests": total,
+            "success_count": success,
+            "failure_count": failure,
+            "success_rate": round(success / total * 100, 1) if total > 0 else 0.0,
+            "avg_processing_time": round(float(avg_time), 2),
+            "verdict_breakdown": verdict_breakdown,
+        },
+    }
+
+
+@app.get("/api/admin/logs")
+def get_admin_logs(limit: int = 20, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """Return the most recent detection logs across all users."""
+    rows = (
+        db.query(MediaAnalysis)
+        .order_by(MediaAnalysis.created_at.desc())
+        .limit(min(limit, 100))
+        .all()
+    )
+    return {
+        "ok": True,
+        "data": [
+            {
+                "request_id": r.id,
+                "user_id": r.user_id,
+                "platform": r.platform,
+                "video_id": r.video_id or r.page_url,
+                "verdict": r.verdict,
+                "status": r.status,
+                "processing_time": r.processing_time,
+                "timestamp": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
     }

@@ -2,6 +2,7 @@ export const headerNav = [
   { label: "Dashboard", to: "/dashboard", key: "dashboard" },
   { label: "Media Analysis", to: "/media-analysis", key: "media" },
   { label: "Blocklist Manager", to: "/blocklist-manager", key: "blocklist" },
+  { label: "Monitoring", to: "/admin/monitoring", key: "monitoring" },
   { label: "Settings", to: "/settings", key: "settings" },
 ];
 

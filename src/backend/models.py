@@ -116,7 +116,10 @@ class MediaAnalysis(Base):
     score = Column(Float, default=0.0)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    processing_time = Column(Float, nullable=True) # in seconds
     status = Column(String(30), default="PENDING")
+
     user = relationship("User")
     model_runs = relationship("ModelRun", back_populates="analysis", cascade="all, delete-orphan")
 
