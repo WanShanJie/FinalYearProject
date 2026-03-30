@@ -1974,6 +1974,8 @@ def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_
         and adjusted_score <= 0.82      # raised ceiling (was 0.72)
         and raw_score < 0.98            # raised ceiling (was 0.90)
         and seq_frames >= 8
+        and total_windows <= 2          # don't override when 3+ windows give consistent signal
+        and high_frame_count <= 1       # don't override when multiple windows exceed fake threshold
     )
     if is_talking_head:
         return _decision_payload(
