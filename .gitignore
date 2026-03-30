@@ -19,7 +19,7 @@ backend/uploads/
 *_faces/
 *_raw/
 *_seq/
-*_audio/
+*_audio.webm
 
 # --- IDEs ---
 .vscode/
