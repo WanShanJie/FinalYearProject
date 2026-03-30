@@ -15,11 +15,11 @@ build/
 
 # --- Project Specific Data ---
 # This ensures you don't upload thousands of face crops or raw frames
-backend/uploads/
-*_faces/
-*_raw/
-*_seq/
-*_audio.webm
+src/backend/uploads/
+**/_faces/
+**/_raw/
+**/_seq/
+**/_audio.webm
 
 # --- IDEs ---
 .vscode/
