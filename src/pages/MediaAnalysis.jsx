@@ -1,9 +1,54 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./MediaAnalysis.module.css";
 import { ImageIcon, SearchIcon } from "../components/system/SystemIcons";
 import { getDisplayMetrics } from "./mediaAnalysisShared";
+import { getAnalysisStatus } from "../api/auth";
+
+// ── In-progress states that should trigger polling ────────────────────────────
+const ACTIVE_STATUSES = new Set(["PENDING", "PROCESSING"]);
+
+// ── Progress bar shown for PENDING / PROCESSING rows ─────────────────────────
+const STAGE_LABELS = {
+  queued:             "Queued…",
+  starting:           "Starting worker…",
+  frame_extraction:   "Extracting frames…",
+  face_detection:     "Detecting faces…",
+  quality_gate:       "Quality check…",
+  inference_alt:      "Running AltFreezing model…",
+  inference_vit:      "Running ViT model…",
+  inference_xception: "Running Xception model…",
+  inference_wav2lip:  "Audio-visual sync check…",
+  fusion:             "Computing verdict…",
+  saving:             "Saving results…",
+};
+
+function ProcessingBadge({ progress = 0, stage }) {
+  const label = STAGE_LABELS[stage] || "Processing…";
+  return (
+    <div style={{ minWidth: 180 }}>
+      <div style={{
+        display: "flex", justifyContent: "space-between",
+        fontSize: "0.7rem", color: "var(--text-muted, #888)", marginBottom: 4,
+      }}>
+        <span>{label}</span>
+        <span>{progress}%</span>
+      </div>
+      <div style={{
+        height: 6, borderRadius: 3,
+        background: "var(--border, #333)", overflow: "hidden",
+      }}>
+        <div style={{
+          height: "100%", borderRadius: 3,
+          background: "var(--accent, #6366f1)",
+          width: `${progress}%`,
+          transition: "width 0.4s ease",
+        }} />
+      </div>
+    </div>
+  );
+}
 
 function VerdictBadge({ verdict, color, bg }) {
   return (
@@ -35,36 +80,89 @@ export default function MediaAnalysis() {
   const [deletingId, setDeletingId] = useState(null);
   const [clearingAll, setClearingAll] = useState(false);
   const itemsPerPage = 8;
+  const pollTimerRef = useRef(null);
 
-  useEffect(() => {
-    async function fetchData() {
-      try {
-        const token = localStorage.getItem("token");
-        const res = await fetch("http://localhost:8000/api/history", {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+  // ── Fetch full detection list ─────────────────────────────────────────────
+  const fetchData = useCallback(async () => {
+    try {
+      const token = localStorage.getItem("token");
+      const res = await fetch("http://localhost:8000/api/history", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
 
-        if (res.status === 401) {
-          localStorage.removeItem("token");
-          localStorage.removeItem("user");
-          navigate("/signin", { replace: true });
-          return;
-        }
-
-        const json = await res.json();
-        if (json.ok) {
-          setDetections(json.data || []);
-        }
-      } catch (err) {
-        console.error("MediaAnalysis fetch error:", err);
-        setFeedback({ type: "error", text: "Unable to load detection history." });
-      } finally {
-        setLoading(false);
+      if (res.status === 401) {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        navigate("/signin", { replace: true });
+        return;
       }
+
+      const json = await res.json();
+      if (json.ok) {
+        setDetections(json.data || []);
+      }
+    } catch (err) {
+      console.error("MediaAnalysis fetch error:", err);
+      setFeedback({ type: "error", text: "Unable to load detection history." });
+    } finally {
+      setLoading(false);
+    }
+  }, [navigate]);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+
+  // ── Poll active jobs every 3 s, stop when none remain ────────────────────
+  useEffect(() => {
+    const activeItems = detections.filter(d => ACTIVE_STATUSES.has(d.status));
+    if (activeItems.length === 0) {
+      clearTimeout(pollTimerRef.current);
+      return;
     }
 
-    fetchData();
-  }, [navigate]);
+    async function pollActive() {
+      // Fetch fresh status for each active job
+      const updates = await Promise.all(
+        activeItems.map(item =>
+          getAnalysisStatus(item.id).catch(() => null)
+        )
+      );
+
+      let changed = false;
+      setDetections(prev => {
+        const map = new Map(prev.map(d => [d.id, d]));
+        updates.forEach((upd, i) => {
+          if (!upd) return;
+          const old = map.get(activeItems[i].id);
+          if (old && (old.status !== upd.status || old.verdict !== upd.verdict)) {
+            map.set(old.id, {
+              ...old,
+              status:   upd.status,
+              verdict:  upd.verdict  ?? old.verdict,
+              score:    upd.score    ?? old.score,
+              // keep progress/stage for the UI
+              _progress: upd.progress ?? 0,
+              _stage:    upd.stage    ?? null,
+            });
+            changed = true;
+          } else if (old && ACTIVE_STATUSES.has(upd.status)) {
+            // Still processing — update progress bar only
+            map.set(old.id, {
+              ...old,
+              _progress: upd.progress ?? old._progress ?? 0,
+              _stage:    upd.stage    ?? old._stage,
+            });
+          }
+        });
+        return changed ? Array.from(map.values()) : prev;
+      });
+
+      // Schedule next poll if any are still active
+      pollTimerRef.current = setTimeout(pollActive, 3000);
+    }
+
+    pollTimerRef.current = setTimeout(pollActive, 3000);
+    return () => clearTimeout(pollTimerRef.current);
+  }, [detections]);
 
   function resolveApiError(payload, fallbackMessage) {
     if (typeof payload?.detail === "string") return payload.detail;
@@ -241,13 +339,15 @@ export default function MediaAnalysis() {
 
             <div className={styles.listBody}>
               {paginatedItems.map((item) => {
-                const metrics = getDisplayMetrics(item.verdict, item.score);
+                const isActive  = ACTIVE_STATUSES.has(item.status);
+                const metrics   = getDisplayMetrics(item.verdict, item.score);
                 return (
                   <div key={item.id} className={styles.mediaRowWrap}>
                     <button
                       type="button"
-                      onClick={() => navigate(`/media-analysis/${item.id}`)}
+                      onClick={() => !isActive && navigate(`/media-analysis/${item.id}`)}
                       className={styles.mediaRow}
+                      style={isActive ? { cursor: "default", opacity: 0.85 } : undefined}
                     >
                       <div className={styles.thumb}>
                         <AuthImage
@@ -259,14 +359,25 @@ export default function MediaAnalysis() {
                       </div>
                       <div className={styles.mediaMeta}>
                         <strong>{item.title || "Untitled media"}</strong>
-                        <span>{item.platform || "Web"} - {new Date(item.created_at).toLocaleDateString()}</span>
-                        <span className={styles.riskLabel} style={{ color: metrics.scoreColor }}>
-                          {metrics.riskLevel} - {metrics.riskScore}%
-                        </span>
+                        <span>{item.platform || "Web"} – {new Date(item.created_at).toLocaleDateString()}</span>
+                        {!isActive && (
+                          <span className={styles.riskLabel} style={{ color: metrics.scoreColor }}>
+                            {metrics.riskLevel} – {metrics.riskScore}%
+                          </span>
+                        )}
                       </div>
                       <div className={styles.listStatusStack}>
-                        <VerdictBadge verdict={metrics.displayVerdict} color={metrics.verdictColor} bg={metrics.verdictBg} />
-                        <span className={styles.viewHint}>View Details</span>
+                        {isActive ? (
+                          <ProcessingBadge
+                            progress={item._progress ?? 0}
+                            stage={item._stage ?? "queued"}
+                          />
+                        ) : (
+                          <>
+                            <VerdictBadge verdict={metrics.displayVerdict} color={metrics.verdictColor} bg={metrics.verdictBg} />
+                            <span className={styles.viewHint}>View Details</span>
+                          </>
+                        )}
                       </div>
                     </button>
                     <button

@@ -1,4 +1,5 @@
 import os
+import asyncio
 import time
 import math
 import secrets
@@ -6,6 +7,7 @@ import hashlib
 import hmac
 import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,6 +32,14 @@ from typing import List, Optional
 from base64 import urlsafe_b64encode
 
 from opencv_pipeline import process_frames_for_sequence
+try:
+    from celery_app import celery_app as _celery_app
+    _CELERY_AVAILABLE = True
+except ModuleNotFoundError:
+    _celery_app = None          # server still starts; async video upload disabled
+    _CELERY_AVAILABLE = False
+    print("[Startup] WARNING: celery not installed — async video upload disabled. "
+          "Run: pip install celery[redis]")
 import os as _os
 # Force UTF-8 output so AltFreezing's logger doesn't crash on Windows
 _os.environ.setdefault("PYTHONUTF8", "1")
@@ -43,6 +53,12 @@ from scripts import xception_service
 Base.metadata.create_all(bind=engine)
 load_dotenv()
 app = FastAPI()
+
+# ── Shared thread pool for concurrent deepfake model inference ────────────────
+# Three workers cover ViT + Xception + AltFreezing running simultaneously.
+# PyTorch and OpenCV release the GIL during their C++ kernels, so real
+# parallelism is achieved even without multiprocessing.
+_model_executor = _ThreadPoolExecutor(max_workers=3, thread_name_prefix="deepfake_model")
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
 
@@ -130,6 +146,71 @@ def get_optional_user(token: str = Depends(oauth2_scheme), db: Session = Depends
 # NOTE: altfreezing_service is lazy-loaded on first capture request.
 # Do NOT call altfreezing_service.init() here — it imports slowfast/torch3D
 # which takes 10-30s and would block uvicorn startup.
+
+# ── Backend performance timing ────────────────────────────────────────────────
+# _StageTimer: lightweight per-request stage profiler.
+#
+#   Usage:
+#       t = _StageTimer(analysis_id=123)
+#       t.mark("upload")
+#       ... do work ...
+#       t.mark("preprocessing")
+#       ... do work ...
+#       t.mark("altfreezing_inference")
+#       summary = t.summary()   # returns dict of stage → elapsed seconds
+#
+# Each call to mark() records the elapsed time since the PREVIOUS mark (or
+# since construction for the first mark). The final summary() call adds a
+# "total" key covering the full span from construction to now.
+#
+# All timings are also printed to stdout so they appear in the uvicorn log,
+# which is the simplest way to inspect backend speed without extra tooling.
+
+class _StageTimer:
+    """Lightweight per-request stage profiler. Zero external dependencies."""
+
+    def __init__(self, analysis_id: int | None = None, label: str = "request"):
+        self._start = time.perf_counter()
+        self._last  = self._start
+        self._stages: list[tuple[str, float]] = []  # (name, elapsed_since_prev)
+        self._label = f"[Perf][{label}][id={analysis_id}]"
+
+    def mark(self, stage: str) -> float:
+        """Record elapsed time since the last mark (or construction). Returns ms."""
+        now = time.perf_counter()
+        delta_ms = (now - self._last) * 1000
+        self._stages.append((stage, delta_ms))
+        self._last = now
+        print(f"{self._label} stage={stage:35s} {delta_ms:8.1f} ms")
+        return delta_ms
+
+    def summary(self) -> dict:
+        """Return a dict of stage → ms, plus total_ms covering the full span."""
+        total_ms = (time.perf_counter() - self._start) * 1000
+        result = {stage: round(ms, 1) for stage, ms in self._stages}
+        result["total_ms"] = round(total_ms, 1)
+        print(
+            f"{self._label} TOTAL {total_ms:.1f} ms  "
+            + "  ".join(f"{s}={round(ms)}ms" for s, ms in self._stages)
+        )
+        return result
+
+
+# ── Global middleware: total API latency for every request ────────────────────
+# Adds an X-Process-Time header (ms) to every response — visible in DevTools
+# Network tab without any extra tooling. Also logs to stdout.
+
+@app.middleware("http")
+async def _request_timing_middleware(request: Request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
+    response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
+    # Only log analysis endpoints to avoid spamming logs with health-checks
+    if "/api/analysis/" in request.url.path or "/api/admin/" in request.url.path:
+        print(f"[Perf][API] {request.method} {request.url.path} → {response.status_code}  {elapsed_ms} ms")
+    return response
+# ─────────────────────────────────────────────────────────────────────────────
 
 TERMS_VERSION = "v1"
 PRIVACY_VERSION = "v1"
@@ -2532,30 +2613,39 @@ async def video_analysis(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Accept a video file upload, run AltFreezing (visual) + Wav2Lip (audio-visual
-    sync) and return a combined deepfake verdict.
+    Accept a video file upload and enqueue it for background processing.
+
+    Returns immediately with an analysis_id so the frontend can poll
+    GET /api/analysis/{analysis_id}/status rather than waiting 10–60 s.
+
+    Flow:
+      1. Save video to uploads/{analysis_id}_video{ext}  (persisted for worker)
+      2. Create MediaAnalysis row with status="PENDING"
+      3. Push "worker.run_video_analysis" task to Redis via Celery
+      4. Return {"ok": True, "analysis_id": ..., "status": "queued"}
+
+    The Chrome extension capture endpoint (POST /api/analysis/capture) is
+    intentionally kept synchronous — the extension overlay requires an
+    immediate verdict.
     """
     upload_dir = Path(__file__).resolve().parent / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    start_time = time.time()
 
-    # ── Save uploaded video to a temp file ────────────────────────────────────
+    # ── 1. Save uploaded video to a named, persistent path ────────────────────
+    # Do NOT use NamedTemporaryFile(delete=True) here — the Celery worker
+    # process needs the file to still exist when the task runs.
     suffix = Path(file.filename or "video.mp4").suffix or ".mp4"
-    import tempfile as _tempfile
-    with _tempfile.NamedTemporaryFile(
-        dir=str(upload_dir), suffix=suffix, delete=False
-    ) as tmp:
-        video_tmp_path = tmp.name
-        tmp.write(await file.read())
+    video_content = await file.read()
 
     meta_data: dict = {
         "capture_mode": "video_upload",
-        "filename": file.filename,
-        "platform": platform,
-        "page_url": page_url,
-        "title": title,
+        "filename":     file.filename,
+        "platform":     platform,
+        "page_url":     page_url,
+        "title":        title,
     }
 
+    # ── 2. Create analysis record (PENDING) ───────────────────────────────────
     analysis = MediaAnalysis(
         user_id=current_user.id,
         platform=platform,
@@ -2570,262 +2660,116 @@ async def video_analysis(
     db.commit()
     db.refresh(analysis)
 
-    try:
-        # ── Extract frames from video as JPEG bytes ────────────────────────────
-        import cv2 as _cv2
-        cap = _cv2.VideoCapture(video_tmp_path)
-        src_fps = cap.get(_cv2.CAP_PROP_FPS) or 25.0
-        from scripts.wav2lip_config import WAV2LIP_FPS as _TARGET_FPS
-        step = max(1, int(src_fps / _TARGET_FPS))
-        frames_for_cv = []
-        idx = 0
-        while cap.isOpened():
-            cap.set(_cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
-            if not ok:
-                break
-            ret, buf = _cv2.imencode(".jpg", frame, [_cv2.IMWRITE_JPEG_QUALITY, 90])
-            if ret:
-                frames_for_cv.append((f"frame_{idx:06d}.jpg", bytes(buf)))
-            idx += step
-        cap.release()
+    # Save video now that we have the analysis_id for the filename
+    video_path = upload_dir / f"{analysis.id}_video{suffix}"
+    with open(video_path, "wb") as _f:
+        _f.write(video_content)
 
-        if not frames_for_cv:
-            raise ValueError("no_frames_extracted_from_video")
-
-        # ── opencv_pipeline: face detection + quality gating ──────────────────
-        opencv_summary = process_frames_for_sequence(
-            analysis_id=analysis.id,
-            frames=frames_for_cv,
-            uploads_dir=str(upload_dir),
-            sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
-            save_crops=True,
+    # ── 3. Enqueue Celery task ────────────────────────────────────────────────
+    if not _CELERY_AVAILABLE or _celery_app is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Task queue unavailable. Install celery[redis] and start Redis.",
         )
+    # Using send_task() (string name) to avoid importing worker.py here,
+    # which would create a circular import (worker.py → main.py → worker.py).
+    task = _celery_app.send_task(
+        "worker.run_video_analysis",
+        args=[analysis.id, str(video_path), str(upload_dir)],
+        queue="deepfake",
+    )
+    print(f"[VideoUpload] Queued analysis_id={analysis.id}  "
+          f"celery_task_id={task.id}  file={video_path.name}")
 
-        per_frame   = opencv_summary.get("per_frame", []) if isinstance(opencv_summary, dict) else []
-        total_frames  = int(opencv_summary.get("frames_total", 0) or 0)
-        frames_with_face = int(opencv_summary.get("frames_with_face", 0) or 0)
-        seq_frames    = int(opencv_summary.get("sequence_frames_used", 0) or 0)
+    # Persist the Celery task ID so the status endpoint can query Redis
+    # for live progress data (stage + percentage) while PROCESSING.
+    meta_data["celery_task_id"] = task.id
+    analysis.meta = meta_data
+    db.commit()
 
-        reject_reasons: dict = {}
-        blur_used:   list = []
-        bright_used: list = []
-        for pf in per_frame:
-            if not isinstance(pf, dict):
-                continue
-            if pf.get("used") is True:
-                if pf.get("blur_var") is not None:
-                    blur_used.append(float(pf["blur_var"]))
-                if pf.get("brightness") is not None:
-                    bright_used.append(float(pf["brightness"]))
-            else:
-                r = pf.get("reason") or "unknown"
-                reject_reasons[r] = reject_reasons.get(r, 0) + 1
-
-        avg_blur       = sum(blur_used) / len(blur_used) if blur_used else 0.0
-        avg_brightness = sum(bright_used) / len(bright_used) if bright_used else 0.0
-        usable_ratio   = (seq_frames / total_frames) if total_frames else 0.0
-
-        MIN_SEQUENCE_FRAMES = 6
-        MIN_USABLE_RATIO    = 0.10
-        MIN_AVG_BLUR        = 2.0
-        MIN_AVG_BRIGHTNESS  = 15.0
-
-        quality_pass = True
-        quality_fail_reasons = []
-        if seq_frames < MIN_SEQUENCE_FRAMES:
-            quality_pass = False
-            quality_fail_reasons.append(f"too_few_sequence_frames:{seq_frames}")
-        if usable_ratio < MIN_USABLE_RATIO:
-            quality_pass = False
-            quality_fail_reasons.append(f"usable_ratio_too_low:{usable_ratio:.2f}")
-        if avg_blur < MIN_AVG_BLUR:
-            quality_pass = False
-            quality_fail_reasons.append(f"avg_blur_too_low:{avg_blur:.2f}")
-        if avg_brightness < MIN_AVG_BRIGHTNESS:
-            quality_pass = False
-            quality_fail_reasons.append(f"avg_brightness_too_low:{avg_brightness:.2f}")
-
-        meta_data["opencv"] = opencv_summary
-        track_summary    = opencv_summary.get("track_summary", {}) if isinstance(opencv_summary, dict) else {}
-        stability_meta   = opencv_summary.get("stability", {}) if isinstance(opencv_summary, dict) else {}
-        track_gap_count  = int(track_summary.get("gap_count", 0) or 0)
-        geometry_rejected_count = sum(
-            v for k, v in reject_reasons.items()
-            if isinstance(k, str) and "geometry_rejected" in k
-        )
-        quality_gate = {
-            "pass":                   quality_pass,
-            "fail_reasons":           quality_fail_reasons,
-            "frames_total":           total_frames,
-            "frames_with_face":       frames_with_face,
-            "sequence_frames_used":   seq_frames,
-            "usable_ratio":           usable_ratio,
-            "avg_blur":               avg_blur,
-            "avg_brightness":         avg_brightness,
-            "reject_reasons":         reject_reasons,
-            "track_gap_count":        track_gap_count,
-            "geometry_rejected_count": geometry_rejected_count,
-            "sequence_stable":        stability_meta.get("stable", True),
-            # Include full opencv stability metrics for Rule 5.8
-            # (avg_iou, max_centre_drift, size_consistency)
-            "stability":              stability_meta,
-            "thresholds": {
-                "MIN_SEQUENCE_FRAMES": MIN_SEQUENCE_FRAMES,
-                "MIN_USABLE_RATIO":    MIN_USABLE_RATIO,
-                "MIN_AVG_BLUR":        MIN_AVG_BLUR,
-                "MIN_AVG_BRIGHTNESS":  MIN_AVG_BRIGHTNESS,
-            },
-        }
-        meta_data["quality_gate"] = quality_gate
-
-        # ── AltFreezing visual verdict ─────────────────────────────────────────
-        if not quality_pass:
-            alt_result = {
-                "ok": False, "error": "quality_gate_failed",
-                "video_score": None, "frames_used": seq_frames,
-                "sequence_length": opencv_summary.get("sequence_length", 16), "per_frame": [],
-            }
-        else:
-            alt_result = altfreezing_service.predict_from_sequence(
-                analysis_id=analysis.id,
-                uploads_dir=upload_dir,
-                sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
-                weights_path="checkpoints/model.pth",
-            )
-
-        alt_score = alt_result.get("video_score")
-        visual_decision = _decide_altfreezing_verdict(alt_score, quality_gate, alt_result)
-        crop_paths = opencv_summary.get("sequence_crop_paths") or []
-        vit_result = (
-            vit_service.predict_from_crops(crop_paths)
-            if crop_paths
-            else {
-                "ok": False,
-                "error": "no_sequence_crops",
-                "video_score": None,
-                "frames_used": 0,
-                "per_frame": [],
-                "model_name": "ViT",
-            }
-        )
-        meta_data["vit"] = vit_result
-        xception_result = xception_service.predict_from_analysis(
-            analysis_id=analysis.id,
-            uploads_dir=upload_dir,
-            max_frames=8,
-            aggregation="mean",
-            threshold=0.5,
-        )
-        meta_data["xception"] = xception_result
-
-        # ── Wav2Lip audio-visual sync scoring ─────────────────────────────────
-        wav2lip_result = wav2lip_service.wav2lip_sync_score(
-            video_path=video_tmp_path,
-            weights_path="checkpoints/wav2lip_gan.pth",
-        )
-        meta_data["wav2lip"] = wav2lip_result
-
-        # ── Combined verdict ───────────────────────────────────────────────────
-        def _reasoning_meta(dp: dict, ar: dict, vr: dict, xr: dict) -> dict:
-            calibration = (ar or {}).get("calibration") or {}
-            return {
-                "verdict":            dp.get("final_verdict"),
-                "final_verdict":      dp.get("final_verdict"),
-                "score":              dp.get("final_score", dp.get("score")),
-                "raw_score":          dp.get("raw_score"),
-                "confidence":         dp.get("confidence"),
-                "reason":             dp.get("reason"),
-                "quality_band":       dp.get("quality_band"),
-                "usable_frames":      seq_frames,
-                "usable_ratio":       usable_ratio,
-                "temporal_diversity": dp.get("temporal_diversity", calibration.get("temporal_diversity")),
-                "duplicate_frames":   reject_reasons.get("duplicate_frame", 0),
-                "stability":          stability_meta.get("stable"),
-                "drift":              stability_meta.get("max_centre_drift"),
-                "blur":               avg_blur,
-                "brightness":         avg_brightness,
-                "fail_reasons":       quality_fail_reasons,
-                "high_frame_count":   dp.get("high_frame_count", (ar or {}).get("high_frame_count")),
-                "score_std":          dp.get("score_std", (ar or {}).get("score_std")),
-                "total_windows":      dp.get("total_windows", (ar or {}).get("total_windows")),
-                "temporal_penalty":   dp.get("temporal_penalty"),
-                "evidence_quality":   dp.get("evidence_quality", calibration.get("evidence_quality")),
-                "evidence_strength":  dp.get("evidence_strength"),
-                "vit_score":          dp.get("vit_score", (vr or {}).get("video_score")),
-                "xception_score":     dp.get("xception_score", (xr or {}).get("video_score")),
-                "wav2lip_score":      dp.get("wav2lip_score"),
-                "disagreement_flag":  dp.get("disagreement_flag"),
-            }
-
-        combined_decision = _combine_model_signals(
-            visual_decision,
-            alt_result,
-            vit_result,
-            xception_result,
-            wav2lip_result,
-            quality_gate,
-        )
-        combined_decision["final_explanation"] = combined_decision.get("explanation") or generate_verdict_reason(
-            _reasoning_meta(combined_decision, alt_result, vit_result, xception_result)
-        )
-        combined_decision["verdict_reason"] = combined_decision["final_explanation"]
-
-        analysis.score   = float(combined_decision.get("score") or 0.0)
-        analysis.verdict = combined_decision["final_verdict"]
+    # ── 4. Return immediately ─────────────────────────────────────────────────
+    return {
+        "ok":          True,
+        "analysis_id": analysis.id,
+        "task_id":     task.id,
+        "status":      "queued",
+        "message":     "Video queued for processing. Poll /api/analysis/{id}/status for updates.",
+        "poll_url":    f"/api/analysis/{analysis.id}/status",
+    }
 
 
-        meta_data["altfreezing"] = alt_result
-        meta_data["decision"]    = combined_decision
-        analysis.meta = meta_data
-        _persist_model_runs(
-            db,
-            analysis,
-            alt_result=alt_result,
-            visual_decision=visual_decision,
-            vit_result=vit_result,
-            xception_result=xception_result,
-            wav2lip_result=wav2lip_result,
-        )
-        _finalize_analysis_log(db, analysis, start_time, status="DONE")
+@app.get("/api/analysis/{analysis_id}/status")
+def get_analysis_status(
+    analysis_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Lightweight polling endpoint for the frontend to track async video analysis.
 
+    Response shape:
+      {
+        "ok":          true,
+        "analysis_id": 42,
+        "status":      "PENDING" | "PROCESSING" | "DONE" | "ERROR",
+        "progress":    0-100,          // present while PROCESSING
+        "stage":       "face_detection", ...  // present while PROCESSING
+        "verdict":     "FAKE" | "REAL" | ..., // present when DONE
+        "score":       0.85,           // present when DONE
+        "confidence":  "high",         // present when DONE
+        "reason":      "...",          // present when DONE
+      }
 
-        try:
-            _maybe_insert_blocklist(analysis, db)
-        except Exception as e:
-            print(f"[Blocklist] Failed to auto-insert: {e}")
+    Frontend should poll every 3 s until status == "DONE" or "ERROR".
+    """
+    analysis = _get_user_analysis_or_404(db, current_user.id, analysis_id)
 
-        _prune_analysis_uploads(analysis.id)
+    base = {
+        "ok":          True,
+        "analysis_id": analysis_id,
+        "status":      analysis.status or "PENDING",
+    }
 
-        return {
-            "ok":          True,
-            "analysis_id": analysis.id,
-            "verdict":     analysis.verdict,
-            "score":       analysis.score,
-            "final_score": combined_decision.get("final_score", analysis.score),
-            "status":      analysis.status,
-            "confidence":  combined_decision.get("confidence"),
-            "reason":      combined_decision.get("final_explanation"),
-            "signals":     combined_decision.get("signals"),
-            "weights_used": combined_decision.get("weights_used"),
-            "sync_score":  wav2lip_result.get("sync_score"),
-            "sync_interpretation": wav2lip_result.get("interpretation"),
-            "combined_reason": combined_decision.get("combined_reason"),
-        }
+    if analysis.status == "DONE":
+        decision = (analysis.meta or {}).get("decision", {})
+        base.update({
+            "verdict":    analysis.verdict,
+            "score":      analysis.score,
+            "confidence": decision.get("confidence"),
+            "reason":     decision.get("final_explanation") or decision.get("verdict_reason"),
+            "signals":    decision.get("signals"),
+        })
 
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        analysis.verdict = "INCONCLUSIVE"
-        analysis.meta    = {**meta_data, "error": str(e)}
-        _finalize_analysis_log(db, analysis, start_time, status="ERROR")
-        raise HTTPException(status_code=500, detail=f"Video analysis failed: {e}")
+    elif analysis.status == "ERROR":
+        base["error"] = (analysis.meta or {}).get("worker_error", "Processing failed")
 
-    finally:
-        try:
-            os.remove(video_tmp_path)
-        except Exception:
-            pass
+    elif analysis.status in ("PROCESSING", "PENDING"):
+        # Query Celery's result backend (Redis) for live progress.
+        # The worker calls self.update_state(state="PROGRESS", meta={…})
+        # at each pipeline stage, which stores data in Redis keyed by task_id.
+        task_id = (analysis.meta or {}).get("celery_task_id")
+        progress = 0
+        stage    = "queued"
+        if task_id:
+            try:
+                from celery.result import AsyncResult
+                result = AsyncResult(task_id, app=_celery_app)
+                if result.state == "PROGRESS" and isinstance(result.info, dict):
+                    progress = result.info.get("progress", 0)
+                    stage    = result.info.get("stage", "processing")
+                elif result.state == "STARTED":
+                    progress = 5
+                    stage    = "starting"
+                elif result.state == "FAILURE":
+                    # Worker died but DB wasn't updated — sync here
+                    base["status"] = "ERROR"
+                    base["error"]  = str(result.info) if result.info else "Worker failed"
+            except Exception as _ce:
+                print(f"[Status] Celery query failed for task {task_id}: {_ce}")
+        base["progress"] = progress
+        base["stage"]    = stage
+
+    return base
 
 
 @app.post("/api/analysis/capture")
@@ -2909,6 +2853,11 @@ async def capture_analysis(
     upload_dir = Path(__file__).resolve().parent / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
     start_time = time.time()
+
+    # ── Stage timer (analysis_id now known after DB insert) ───────────────────
+    _t = _StageTimer(analysis_id=analysis.id, label="capture")
+    # ─────────────────────────────────────────────────────────────────────────
+
     raw_dir = upload_dir / f"{analysis.id}_raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2920,6 +2869,8 @@ async def capture_analysis(
         with open(file_path, "wb") as f:
             f.write(content)
         frames_for_cv.append((orig_name, content))
+
+    _t.mark("upload")          # time to receive + save all frames to disk
 
     opencv_summary = process_frames_for_sequence(
         analysis_id=analysis.id,
@@ -3008,39 +2959,9 @@ async def capture_analysis(
         },
     }
 
+    _t.mark("preprocessing_opencv")  # face detection + quality gate + crop extraction
+
     crop_paths = opencv_summary.get("sequence_crop_paths") or []
-    vit_result = (
-        vit_service.predict_from_crops(crop_paths)
-        if quality_pass and crop_paths
-        else {
-            "ok": False,
-            "error": "quality_gate_failed" if not quality_pass else "no_sequence_crops",
-            "video_score": None,
-            "frames_used": 0,
-            "per_frame": [],
-            "model_name": "ViT",
-        }
-    )
-    meta_data["vit"] = vit_result
-    xception_result = (
-        xception_service.predict_from_analysis(
-            analysis_id=analysis.id,
-            uploads_dir=upload_dir,
-            max_frames=8,
-            aggregation="mean",
-            threshold=0.5,
-        )
-        if quality_pass
-        else {
-            "ok": False,
-            "error": "quality_gate_failed",
-            "video_score": None,
-            "frames_used": 0,
-            "per_frame": [],
-            "model_name": "Xception",
-        }
-    )
-    meta_data["xception"] = xception_result
 
     def _reasoning_metadata_for(decision_payload: dict, alt_payload: dict, vit_payload: dict, xception_payload: dict) -> dict:
         calibration = (alt_payload or {}).get("calibration") or {}
@@ -3074,6 +2995,14 @@ async def capture_analysis(
         }
 
     if not quality_pass:
+        vit_result = {
+            "ok": False, "error": "quality_gate_failed", "video_score": None,
+            "frames_used": 0, "per_frame": [], "model_name": "ViT",
+        }
+        xception_result = {
+            "ok": False, "error": "quality_gate_failed", "video_score": None,
+            "frames_used": 0, "per_frame": [], "model_name": "Xception",
+        }
         alt_result = {
             "ok": False,
             "error": "quality_gate_failed",
@@ -3100,6 +3029,8 @@ async def capture_analysis(
         analysis.score = 0.0
         analysis.verdict = decision["final_verdict"]
         _finalize_analysis_log(db, analysis, start_time, status="DONE")
+        meta_data["vit"] = vit_result
+        meta_data["xception"] = xception_result
         meta_data["altfreezing"] = alt_result
         meta_data["decision"] = decision
         analysis.meta = meta_data
@@ -3126,12 +3057,46 @@ async def capture_analysis(
             "weights_used": decision.get("weights_used"),
         }
 
-    alt_result = altfreezing_service.predict_from_sequence(
-        analysis_id=analysis.id,
-        uploads_dir=upload_dir,
-        sequence_length=ALT_ANALYSIS_SEQUENCE_LENGTH,
-        weights_path="checkpoints/model.pth",
+    # ── Concurrent model inference ─────────────────────────────────────────────
+    # ViT, Xception, and AltFreezing all consume the same crop paths and are
+    # fully independent. Run all three at the same time; wall-clock time becomes
+    # max(t_vit, t_xception, t_altfreezing) instead of their sum.
+    _analysis_id   = analysis.id          # capture for thread closures
+    _upload_dir    = upload_dir
+    _crop_paths    = crop_paths
+    _seq_len       = ALT_ANALYSIS_SEQUENCE_LENGTH
+
+    loop = asyncio.get_event_loop()
+
+    vit_result, xception_result, alt_result = await asyncio.gather(
+        loop.run_in_executor(
+            _model_executor,
+            lambda: vit_service.predict_from_crops(_crop_paths),
+        ),
+        loop.run_in_executor(
+            _model_executor,
+            lambda: xception_service.predict_from_analysis(
+                analysis_id=_analysis_id,
+                uploads_dir=_upload_dir,
+                max_frames=8,
+                aggregation="mean",
+                threshold=0.5,
+            ),
+        ),
+        loop.run_in_executor(
+            _model_executor,
+            lambda: altfreezing_service.predict_from_sequence(
+                analysis_id=_analysis_id,
+                uploads_dir=_upload_dir,
+                sequence_length=_seq_len,
+                weights_path="checkpoints/model.pth",
+            ),
+        ),
     )
+    _t.mark("inference_parallel_vit_xception_altfreezing")
+
+    meta_data["vit"]      = vit_result
+    meta_data["xception"] = xception_result
 
     # ── Wav2Lip audio-visual sync (only when extension sent audio) ────────────
     wav2lip_result = {"ok": False, "error": "no_audio_uploaded", "sync_score": None, "interpretation": "unavailable"}
@@ -3176,6 +3141,7 @@ async def capture_analysis(
             print("[Capture][Audio] Audio upload existed but contained 0 bytes.")
     else:
         print("[Capture][Audio] No audio file was included in the multipart request.")
+    _t.mark("inference_wav2lip")
     meta_data["audio_debug"] = audio_debug
     meta_data["wav2lip"] = wav2lip_result
 
@@ -3192,6 +3158,7 @@ async def capture_analysis(
     )
     decision["final_explanation"] = decision.get("explanation") or generate_verdict_reason(_reasoning_metadata_for(decision, alt_result, vit_result, xception_result))
     decision["verdict_reason"] = decision["final_explanation"]
+    _t.mark("fusion_decision")
 
     analysis.score = float(decision.get("score")) if decision.get("score") is not None else 0.0
     analysis.verdict = decision["final_verdict"]
@@ -3209,6 +3176,7 @@ async def capture_analysis(
         wav2lip_result=wav2lip_result,
     )
     _finalize_analysis_log(db, analysis, start_time, status="DONE")
+    _t.mark("db_write")
 
     # Auto-insert into global blocklist when result meets the risk threshold
     try:
@@ -3217,6 +3185,11 @@ async def capture_analysis(
         print(f"[Blocklist] Failed to auto-insert: {e}")
 
     _prune_analysis_uploads(analysis.id)
+
+    # ── Emit stage summary into response + stdout ─────────────────────────────
+    timing = _t.summary()
+    meta_data["timing"] = timing
+    # ─────────────────────────────────────────────────────────────────────────
 
     return {
         "ok": True,
@@ -3232,6 +3205,7 @@ async def capture_analysis(
         "sync_score": wav2lip_result.get("sync_score"),
         "sync_interpretation": wav2lip_result.get("interpretation"),
         "combined_reason": decision.get("combined_reason"),
+        "timing": timing,
     }
 
 

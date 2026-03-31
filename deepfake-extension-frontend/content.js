@@ -2,15 +2,50 @@
 // Real-Time Protection: monitors IMG/VIDEO and checks IndexedDB blocklist.
 // Analyze feature: provides GET_PAGE_META and EXTRACT_FRAMES_LIVE.
 
+if (!window.__deepfakeGuardInstalled) {
+  window.__deepfakeGuardInstalled = true;
+  (function() {
+
+// ── Performance timing (content script side) ──────────────────────────────────
+// Lightweight logger — writes to chrome.storage.local so the popup can read it.
+// Keeps only the last 50 entries to avoid unbounded storage growth.
+var _contextDead = false;
+var _perfLog = [];
+var _perfFlushTimer = null;
+
+function perfMark(metric, valueMs, extra = {}) {
+  const entry = { metric, ms: Math.round(valueMs), ts: Date.now(), ...extra };
+  _perfLog.push(entry);
+  console.log(`[Perf][${metric}] ${entry.ms}ms`, extra);
+  // Debounce writes — flush at most once every 500 ms
+  if (!_perfFlushTimer) {
+    if (_contextDead) return;
+    _perfFlushTimer = setTimeout(() => {
+      _perfFlushTimer = null;
+      if (_contextDead || !chrome.runtime?.id) {
+        _contextDead = true;
+        _perfLog = [];
+        return;
+      }
+      chrome.storage.local.get(["perfLog"], st => {
+        if (chrome.runtime.lastError) {
+          if ((chrome.runtime.lastError.message || "").includes("context invalidated")) _contextDead = true;
+          return;
+        }
+        const existing = Array.isArray(st.perfLog) ? st.perfLog : [];
+        const merged = [...existing, ..._perfLog].slice(-100);
+        _perfLog = [];
+        chrome.storage.local.set({ perfLog: merged });
+      });
+    }, 500);
+  }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 // ── SINGLE-INSTANCE GUARD ────────────────────────────────────────────────────
 // Prevents duplicate listeners if the script is injected more than once.
 // Uses a plain window property — never const/let at top level, which would
 // throw "already declared" on re-injection in the same page context.
-if (window.__deepfakeGuardInstalled) {
-  // Already running. Bail out without registering anything.
-  throw new Error("[DeepfakeGuard] Already installed — duplicate injection ignored.");
-}
-window.__deepfakeGuardInstalled = true;
 // ─────────────────────────────────────────────────────────────────────────────
 
 var monitoringEnabled = false;
@@ -23,7 +58,6 @@ window.__captureInProgress = false;
 
 // ── Safe SW messaging ─────────────────────────────────────────────────────────
 
-var _contextDead = false;
 function safeSendMessage(msg) {
   return new Promise(resolve => {
     if (_contextDead) return resolve({ ok: false, error: "context dead" });
@@ -155,9 +189,20 @@ async function processMedia(el) {
     const hash = await fingerprintElement(el);
     if (!hash) return;
     await bumpCounter("scanned", 1);
+
+    // ── Metric: blocklist_check_latency ───────────────────────────────────────
+    const t0Check = performance.now();
     const res = await safeSendMessage({ type: "CHECK_FINGERPRINT_BLOCKLIST", hash });
+    perfMark("blocklist_check_latency", performance.now() - t0Check,
+      { hit: !!(res?.ok && res?.entry), type: "fingerprint" });
+    // ─────────────────────────────────────────────────────────────────────────
+
     if (res?.ok && res?.entry) {
+      // ── Metric: ui_block_latency ────────────────────────────────────────────
+      const t0Block = performance.now();
       blockElement(el, res.entry);
+      perfMark("ui_block_latency", performance.now() - t0Block, { type: "overlay" });
+      // ───────────────────────────────────────────────────────────────────────
       await bumpCounter("blocked", 1);
     }
     safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
@@ -288,6 +333,10 @@ function addWatchPageWarning(entry) {
 async function checkVideoIdOnPage() {
   if (window.__captureInProgress) return;
   try {
+    // ── Metric: watch_page_to_blocked_covered ──────────────────────────────
+    const t0Watch = performance.now();
+    // ─────────────────────────────────────────────────────────────────────
+
     const url = location.href;
     let videoId = null;
     const shorts = url.match(/\/shorts\/([^/?]+)/);
@@ -297,7 +346,11 @@ async function checkVideoIdOnPage() {
 
     if (_videoIdCache.has(videoId)) {
       const cached = _videoIdCache.get(videoId);
-      if (cached) addWatchPageWarning(cached);
+      if (cached) {
+        addWatchPageWarning(cached);
+        perfMark("watch_page_to_blocked_covered", performance.now() - t0Watch,
+          { videoId, source: "cache", hit: true });
+      }
       return;
     }
 
@@ -305,8 +358,16 @@ async function checkVideoIdOnPage() {
     _videoIdCache.set(videoId, res?.ok && res?.entry ? res.entry : null);
     if (res?.ok && res?.entry) {
       addWatchPageWarning(res.entry);
+      // ── Metric end ───────────────────────────────────────────────────────
+      perfMark("watch_page_to_blocked_covered", performance.now() - t0Watch,
+        { videoId, source: "idb_lookup", hit: true });
+      // ─────────────────────────────────────────────────────────────────────
       await bumpCounter("blocked", 1);
       safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
+    } else {
+      // No block — still log the check latency for the "clean" path
+      perfMark("watch_page_to_blocked_covered", performance.now() - t0Watch,
+        { videoId, source: "idb_lookup", hit: false });
     }
   } catch { }
 }
@@ -501,24 +562,44 @@ function addWarningBadge(card, entry) {
 async function processYouTubeCard(card) {
   if (window.__captureInProgress) return;
   if (_scannedCards.has(card)) return;
+
+  // ── Metric: dom_detection_latency ─────────────────────────────────────────
+  // Time from card appearing in DOM (MutationObserver fires) → we start processing.
+  // We approximate DOM insertion time with performance.now() at entry, which is
+  // called directly from the MutationObserver callback with minimal delay.
+  const t0Dom = performance.now();
   _scannedCards.add(card);
 
   const videoId = extractCardVideoId(card);
   if (!videoId) return;
+  perfMark("dom_detection_latency", performance.now() - t0Dom, { type: "card_video_id" });
+  // ──────────────────────────────────────────────────────────────────────────
 
-  // Cache hit
+  // Cache hit — no IPC needed
   if (_videoIdCache.has(videoId)) {
     const entry = _videoIdCache.get(videoId);
-    if (entry) addWarningBadge(card, entry);
+    if (entry) {
+      const t0UI = performance.now();
+      addWarningBadge(card, entry);
+      perfMark("ui_block_latency", performance.now() - t0UI, { type: "badge_cached" });
+    }
     return;
   }
 
+  // ── Metric: blocklist_check_latency ───────────────────────────────────────
+  const t0Check = performance.now();
   const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+  perfMark("blocklist_check_latency", performance.now() - t0Check,
+    { hit: !!(res?.ok && res?.entry), type: "video_id" });
+  // ──────────────────────────────────────────────────────────────────────────
+
   const entry = res?.ok && res?.entry ? res.entry : null;
   _videoIdCache.set(videoId, entry);
 
   if (entry) {
+    const t0UI = performance.now();
     addWarningBadge(card, entry);
+    perfMark("ui_block_latency", performance.now() - t0UI, { type: "badge_fresh" });
     bumpCounter("blocked", 1).catch(() => { });
     safeSendMessage({ type: "COUNTS_UPDATED" }).catch(() => { });
   }
@@ -549,6 +630,11 @@ var scanTimer = null;
 // This is more reliable than watching addedNodes for URL changes.
 window.addEventListener("yt-navigate-finish", () => {
   if (location.href === currentUrl) return;
+  // ── Metric: spa_navigate_to_extension_active ───────────────────────────────
+  // Fires on every YouTube SPA navigation (search → watch, watch → watch, etc.).
+  // Records how long after the navigation event the extension resets + rescans.
+  const t0Nav = performance.now();
+  // ──────────────────────────────────────────────────────────────────────────
   currentUrl = location.href;
   _videoIdCache.clear();
   _scannedCards = new WeakSet();
@@ -558,6 +644,10 @@ window.addEventListener("yt-navigate-finish", () => {
   // History/Playlist pages render content lazily — wait 800ms before first scan,
   // then scan again at 2s in case more cards loaded.
   scanTimer = setTimeout(() => {
+    perfMark("spa_navigate_to_extension_active", performance.now() - t0Nav, {
+      platform: "youtube",
+      url: location.href.slice(0, 80),
+    });
     checkVideoIdOnPage().catch(() => { });
     scanYouTubeCards(document);
     setTimeout(() => scanYouTubeCards(document), 1500);
@@ -587,13 +677,30 @@ var mo = new MutationObserver((mutations) => {
 
   // Scan when new nodes appear (lazy-loaded cards, infinite scroll)
   let hasAdded = false;
+  // ── Metric: scroll_inject_to_card_scanned ─────────────────────────────────
+  // Record timestamp when MutationObserver fires (= when browser tells us
+  // new nodes exist). The scan happens after the 300ms debounce — we store
+  // the observer fire time and measure in the scan callback.
+  let mutationFireTime = null;
   for (const m of mutations) {
-    if (m.addedNodes.length > 0) { hasAdded = true; break; }
+    if (m.addedNodes.length > 0) { hasAdded = true; mutationFireTime = performance.now(); break; }
   }
   if (!hasAdded) return;
 
   clearTimeout(scanTimer);
-  scanTimer = setTimeout(() => scanYouTubeCards(document), 300);
+  scanTimer = setTimeout(() => {
+    const scanStart = performance.now();
+    scanYouTubeCards(document);
+    // Time from observer fire → scan function called (includes 300ms debounce)
+    if (mutationFireTime !== null) {
+      perfMark("scroll_inject_to_card_scanned", performance.now() - mutationFireTime, {
+        debounce_ms: 300,
+        scan_ms: Math.round(performance.now() - scanStart),
+        platform: getPlatform(),
+      });
+    }
+  }, 300);
+  // ──────────────────────────────────────────────────────────────────────────
 });
 
 // ── Video capture helpers ─────────────────────────────────────────────────────
@@ -758,12 +865,20 @@ async function extractLiveFramesFromVideo(video, {
   // pipeline's duplicate-frame filter discards them and the quality gate fails.
   intervalMs = Math.max(250, intervalMs);
 
-  // Wait for the video to be ready, but do NOT replace the locked video element.
-  // The original working code keeps the element that was locked at message-receive
-  // time — replacing it with whatever waitForVideoReady finds can produce the wrong
-  // element (e.g. a different size or a Shorts reel that's not the active one).
-  const ready = await waitForVideoReady(12000, lockedVideoId);
-  if (!ready.ok) return { ok: false, error: ready.error || "not_ready" };
+  // Verify the locked video element is ready WITHOUT swapping it for a different
+  // element. Calling waitForVideoReady() here would block for up to 12s and might
+  // return a different video node — instead we check the element we already have.
+  if (!(video.videoWidth > 0 && video.readyState >= 2)) {
+    // Give the player a short window to become ready before giving up.
+    const readyStart = Date.now();
+    while (Date.now() - readyStart < 5000) {
+      await wait(150);
+      if (video.videoWidth > 0 && video.readyState >= 2) break;
+    }
+    if (!(video.videoWidth > 0 && video.readyState >= 2)) {
+      return { ok: false, error: "video_not_ready" };
+    }
+  }
 
   const canvas = document.createElement("canvas");
   canvas.width = video.videoWidth || 640;
@@ -959,6 +1074,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       stopObserver();
       console.log("[Capture] START");
 
+      // ── Metric: capture_latency (content-script side) ─────────────────────
+      const t0Capture = performance.now();
+      // ─────────────────────────────────────────────────────────────────────
+
       try {
         const v = findVideoElementForCapture(msg.lockedVideoId);
         if (!v) { sendResponse({ ok: false, error: "no_video_element" }); return; }
@@ -971,9 +1090,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           lockedVideoId: msg.lockedVideoId || null,
         });
 
+        // ── Metric: capture_latency ──────────────────────────────────────────
+        perfMark("capture_latency", performance.now() - t0Capture, {
+          frames: out.frames?.length ?? 0,
+          blank: out.debug?.blankCount ?? 0,
+          ok: out.ok,
+          source: "content_canvas",
+        });
+        // ────────────────────────────────────────────────────────────────────
+
         sendResponse(out);
       } catch (err) {
         console.error("[Capture] EXTRACT_FRAMES_LIVE error:", err);
+        perfMark("capture_latency", performance.now() - t0Capture, { ok: false, error: err?.message });
         sendResponse({ ok: false, error: err?.message || "extract_failed" });
       } finally {
         window.__captureInProgress = false;
@@ -1061,6 +1190,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 (async function init() {
+  // ── Metric: page_load_to_extension_active ──────────────────────────────────
+  // performance.timeOrigin is the navigation start time.
+  // performance.now() here is how long since page navigation began.
+  // Together they give: time from page load → content script active.
+  const pageLoadAge = performance.now();
+  perfMark("page_load_to_extension_active", pageLoadAge, {
+    platform: getPlatform(),
+    url: location.href.slice(0, 80),
+  });
+  // ──────────────────────────────────────────────────────────────────────────
+
   await loadMonitoringFlag();
   startObserver();
   // Initial scans — staggered because History/Playlist pages load cards lazily
@@ -1068,3 +1208,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   setTimeout(() => { if (!window.__captureInProgress) scanYouTubeCards(document); }, 2000);
   setTimeout(() => { if (!window.__captureInProgress) { checkVideoIdOnPage().catch(() => { }); scanYouTubeCards(document); } }, 4000);
 })();
+
+// ── Metric: play_event_to_extension_response ──────────────────────────────────
+// Attach once at document level (capture phase) so we catch play events from
+// any video element regardless of when it was inserted into the DOM.
+// Measures: user presses play → extension reacts (video-ID blocklist check).
+document.addEventListener("play", async (e) => {
+  if (window.__captureInProgress) return;
+  const video = e.target;
+  if (!video || video.tagName !== "VIDEO") return;
+  if (!location.hostname.includes("youtube.com")) return;
+
+  const t0Play = performance.now();
+  const yt = getYouTubeCurrentVideoIdAndContext();
+  const videoId = yt.videoId;
+  if (!videoId) return;
+
+  const res = await safeSendMessage({ type: "CHECK_VIDEO_ID_BLOCKLIST", videoId });
+  const ms = performance.now() - t0Play;
+  perfMark("play_event_to_extension_response", ms, {
+    videoId,
+    hit: !!(res?.ok && res?.entry),
+    platform: "youtube",
+  });
+}, true /* capture phase — fires before the video actually starts */);
+// ─────────────────────────────────────────────────────────────────────────────
+  })();
+} else {
+  console.log("[DeepfakeGuard] Already active in this tab.");
+}

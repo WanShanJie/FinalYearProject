@@ -127,3 +127,140 @@ export async function getAdminLogs(limit = 20) {
   });
   return handleResponse(res);
 }
+
+// ── Async video analysis (Celery task queue) ──────────────────────────────────
+
+/**
+ * Upload a video for background deepfake analysis.
+ * Returns immediately with { analysis_id, status: "queued" } — does NOT wait
+ * for the pipeline to finish.  Use getAnalysisStatus() to poll for results.
+ *
+ * @param {File}   file      - Video file object from an <input type="file">
+ * @param {object} meta      - Optional metadata: { title, platform, page_url }
+ * @returns {Promise<{ok, analysis_id, task_id, status, poll_url}>}
+ */
+export async function submitVideoAnalysis(file, meta = {}) {
+  const form = new FormData();
+  form.append("file", file);
+  if (meta.title)    form.append("title",    meta.title);
+  if (meta.platform) form.append("platform", meta.platform);
+  if (meta.page_url) form.append("page_url", meta.page_url);
+
+  const res = await fetch(`${API_BASE}/api/analysis/video`, {
+    method: "POST",
+    headers: authHeaders(),   // no Content-Type — browser sets multipart boundary
+    body: form,
+  });
+  return handleResponse(res);
+}
+
+/**
+ * Poll the status of a queued / in-progress analysis job.
+ *
+ * @param {number} analysisId
+ * @returns {Promise<{
+ *   ok, analysis_id, status,
+ *   progress?, stage?,          // while PROCESSING
+ *   verdict?, score?, reason?,  // when DONE
+ *   error?,                     // when ERROR
+ * }>}
+ */
+export async function getAnalysisStatus(analysisId) {
+  const res = await fetch(`${API_BASE}/api/analysis/${analysisId}/status`, {
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+// ── Async video analysis (Celery task queue) ─────────────────────────────────
+
+/**
+ * Submit a video file for background deepfake analysis.
+ * Returns immediately with { ok, analysis_id, status: "queued" }.
+ * Use getAnalysisStatus() or submitAndPoll() to track progress.
+ *
+ * @param {File}   videoFile
+ * @param {object} opts  - { title, platform, page_url }
+ */
+export async function submitVideoAnalysis(videoFile, { title = "", platform = "", page_url = "" } = {}) {
+  const form = new FormData();
+  form.append("file", videoFile);
+  if (title)    form.append("title", title);
+  if (platform) form.append("platform", platform);
+  if (page_url) form.append("page_url", page_url);
+
+  // Do NOT set Content-Type header — the browser sets the multipart boundary.
+  const res = await fetch(`${API_BASE}/api/analysis/video`, {
+    method: "POST",
+    headers: authHeaders(),
+    body: form,
+  });
+  return handleResponse(res);
+}
+
+/**
+ * Poll the status of a single analysis.
+ * @param {number} analysisId
+ * @returns {{ ok, analysis_id, status, progress?, verdict?, score?, reason? }}
+ */
+export async function getAnalysisStatus(analysisId) {
+  const res = await fetch(`${API_BASE}/api/analysis/${analysisId}/status`, {
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+/**
+ * Submit a video and poll until analysis completes or fails.
+ *
+ * @param {File}   videoFile
+ * @param {object} opts                           - passed to submitVideoAnalysis
+ * @param {object} callbacks
+ *   onQueued(analysisId)                         - fired right after submission
+ *   onProgress({ progress: 0-100, stage: str }) - fired each poll while processing
+ *   onDone(statusPayload)                        - fired when status === "DONE"
+ *   onError(statusPayload | Error)               - fired on ERROR or network failure
+ * @param {number} intervalMs                     - polling interval in ms (default 3000)
+ */
+export async function submitAndPoll(
+  videoFile,
+  opts = {},
+  { onQueued, onProgress, onDone, onError } = {},
+  intervalMs = 3000,
+) {
+  let analysisId;
+
+  try {
+    const queued = await submitVideoAnalysis(videoFile, opts);
+    analysisId = queued.analysis_id;
+    onQueued?.(analysisId);
+  } catch (err) {
+    onError?.(err);
+    return;
+  }
+
+  const _poll = async () => {
+    try {
+      const status = await getAnalysisStatus(analysisId);
+
+      if (status.status === "DONE") {
+        onDone?.(status);
+        return;
+      }
+      if (status.status === "ERROR") {
+        onError?.(status);
+        return;
+      }
+
+      // Still PENDING or PROCESSING — report progress and reschedule
+      if (status.status === "PROCESSING") {
+        onProgress?.({ progress: status.progress ?? 0, stage: status.stage ?? "" });
+      }
+      setTimeout(_poll, intervalMs);
+    } catch (err) {
+      onError?.(err);
+    }
+  };
+
+  setTimeout(_poll, intervalMs);
+}

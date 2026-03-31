@@ -20,8 +20,10 @@ Five quality improvements over the previous version:
 """
 
 import os
+import threading
 import cv2
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple, Dict, Any, Optional
 
 # ── Model path ───────────────────────────────────────────────────────────────
@@ -71,10 +73,48 @@ DEFAULT_SEQUENCE_LENGTH = 32
 face_detector      = None
 face_detector_size = None
 
+# ── Thread-local YuNet detectors for parallel frame processing ───────────────
+_thread_local = threading.local()
+
+# ── Maximum worker threads for parallel frame preprocessing ──────────────────
+# Kept modest (4) to avoid spawning more threads than CPU cores on most servers.
+_MAX_PREPROC_WORKERS = 4
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Low-level helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _get_thread_detector(w: int, h: int):
+    """Return (or create) a per-thread YuNet detector with the requested input size.
+
+    Each worker thread keeps its own cv2.FaceDetectorYN instance so that
+    concurrent calls do not race on the module-level singleton.
+    """
+    det      = getattr(_thread_local, "detector",      None)
+    det_size = getattr(_thread_local, "detector_size", None)
+    if not os.path.exists(YUNET_MODEL_PATH):
+        return None
+    try:
+        if det is None:
+            det = cv2.FaceDetectorYN.create(
+                model=YUNET_MODEL_PATH,
+                config="",
+                input_size=(int(w), int(h)),
+                score_threshold=0.45,
+                nms_threshold=0.3,
+                top_k=5000,
+            )
+            _thread_local.detector      = det
+            _thread_local.detector_size = (int(w), int(h))
+        elif det_size != (int(w), int(h)):
+            det.setInputSize((int(w), int(h)))
+            _thread_local.detector_size = (int(w), int(h))
+        return det
+    except Exception as e:
+        print(f"[YuNet] Thread-local init failed: {e}")
+        return None
+
 
 def _init_yunet(w: int, h: int):
     global face_detector, face_detector_size
@@ -355,6 +395,84 @@ def _track_primary_face(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-frame parallel worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _process_single_frame(
+    idx: int,
+    orig_name: str,
+    content: bytes,
+    is_warmup: bool,
+) -> Dict[str, Any]:
+    """Decode one frame, run YuNet face detection, apply quality gates.
+
+    Returns a dict with:
+      ``per_frame``      – record for the audit log (None when frame has usable face candidates)
+      ``candidate_entry``– entry for ``_track_primary_face``
+      ``frame_diag``     – diagonal of the image in pixels (None for skipped frames)
+    """
+    if is_warmup:
+        return {
+            "per_frame": {"idx": idx, "orig": orig_name, "used": False, "reason": "warmup_skip"},
+            "candidate_entry": {"idx": idx, "orig": orig_name, "img": None, "candidates": []},
+            "frame_diag": None,
+        }
+
+    img = _safe_decode(content)
+    if img is None:
+        return {
+            "per_frame": {"idx": idx, "orig": orig_name, "used": False, "reason": "decode_failed"},
+            "candidate_entry": {"idx": idx, "orig": orig_name, "img": None, "candidates": []},
+            "frame_diag": None,
+        }
+
+    h, w = img.shape[:2]
+    diag = (w ** 2 + h ** 2) ** 0.5
+    detector = _get_thread_detector(w, h)
+    if detector is None:
+        return {
+            "per_frame": {"idx": idx, "orig": orig_name, "used": False, "reason": "detector_init_failed"},
+            "candidate_entry": {"idx": idx, "orig": orig_name, "img": img, "candidates": []},
+            "frame_diag": diag,
+        }
+
+    _, faces = detector.detect(img)
+    frame_entry: Dict[str, Any] = {"idx": idx, "orig": orig_name, "img": img, "candidates": []}
+    per_frame_record = None
+
+    if faces is None or len(faces) == 0:
+        per_frame_record = {"idx": idx, "orig": orig_name, "used": False, "reason": "no_face_found"}
+    else:
+        for face in faces:
+            fx, fy, fw, fh = map(int, face[:4])
+            bbox = {"x": fx, "y": fy, "w": fw, "h": fh}
+            if fw < MIN_FACE_SIZE or fh < MIN_FACE_SIZE:
+                continue
+            crop = _crop_with_margin(img, bbox)
+            if crop.size == 0:
+                continue
+            blur_var   = blur_variance_laplacian(crop)
+            brightness = calc_brightness(crop)
+            if brightness < MIN_BRIGHTNESS or blur_var < HARD_MIN_BLUR:
+                continue
+            frame_entry["candidates"].append({
+                "bbox":         bbox,
+                "crop":         crop,
+                "blur_var":     float(blur_var),
+                "brightness":   float(brightness),
+                "center_score": _centre_score(bbox, w, h),
+            })
+        if not frame_entry["candidates"]:
+            per_frame_record = {"idx": idx, "orig": orig_name, "used": False, "reason": "no_usable_face"}
+
+    return {
+        "per_frame":      per_frame_record,
+        "candidate_entry": frame_entry,
+        "frame_diag":     diag,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public API
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -376,73 +494,25 @@ def process_frames_for_sequence(
 
     frames_total = len(frames)
 
-    for idx, (orig_name, content) in enumerate(frames):
+    # ── Parallel per-frame decode + face detection + quality gating ──────────
+    # Each worker uses a thread-local YuNet instance so there is no shared
+    # state between threads.  The tracker that follows must remain sequential.
+    n_workers = min(_MAX_PREPROC_WORKERS, max(1, frames_total))
+    task_args = [
+        (idx, orig_name, content, idx < WARMUP_SKIP_FRAMES)
+        for idx, (orig_name, content) in enumerate(frames)
+    ]
 
-        # Fix 4 ─ skip warm-up frames
-        if idx < WARMUP_SKIP_FRAMES:
-            per_frame.append({
-                "idx": idx, "orig": orig_name,
-                "used": False, "reason": "warmup_skip",
-            })
-            frame_candidates.append({
-                "idx": idx, "orig": orig_name, "img": None, "candidates": [],
-            })
-            continue
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        # executor.map preserves input order
+        results = list(pool.map(lambda a: _process_single_frame(*a), task_args))
 
-        img = _safe_decode(content)
-        if img is None:
-            per_frame.append({"idx": idx, "orig": orig_name, "used": False,
-                               "reason": "decode_failed"})
-            frame_candidates.append({"idx": idx, "orig": orig_name, "img": None,
-                                     "candidates": []})
-            continue
-
-        h, w = img.shape[:2]
-        frame_diag = (w ** 2 + h ** 2) ** 0.5
-
-        detector = _init_yunet(w, h)
-        if detector is None:
-            per_frame.append({"idx": idx, "orig": orig_name, "used": False,
-                               "reason": "detector_init_failed"})
-            frame_candidates.append({"idx": idx, "orig": orig_name, "img": img,
-                                     "candidates": []})
-            continue
-
-        _, faces = detector.detect(img)
-        frame_entry: Dict[str, Any] = {
-            "idx": idx, "orig": orig_name, "img": img, "candidates": []
-        }
-
-        if faces is None or len(faces) == 0:
-            per_frame.append({"idx": idx, "orig": orig_name, "used": False,
-                               "reason": "no_face_found"})
-            frame_candidates.append(frame_entry)
-            continue
-
-        for face in faces:
-            fx, fy, fw, fh = map(int, face[:4])
-            bbox = {"x": fx, "y": fy, "w": fw, "h": fh}
-            if fw < MIN_FACE_SIZE or fh < MIN_FACE_SIZE:
-                continue
-            crop = _crop_with_margin(img, bbox)
-            if crop.size == 0:
-                continue
-            blur_var   = blur_variance_laplacian(crop)
-            brightness = calc_brightness(crop)
-            if brightness < MIN_BRIGHTNESS or blur_var < HARD_MIN_BLUR:
-                continue
-            frame_entry["candidates"].append({
-                "bbox":         bbox,
-                "crop":         crop,
-                "blur_var":     float(blur_var),
-                "brightness":   float(brightness),
-                "center_score": _centre_score(bbox, w, h),
-            })
-
-        if not frame_entry["candidates"]:
-            per_frame.append({"idx": idx, "orig": orig_name, "used": False,
-                               "reason": "no_usable_face"})
-        frame_candidates.append(frame_entry)
+    for res in results:
+        if res["per_frame"] is not None:
+            per_frame.append(res["per_frame"])
+        frame_candidates.append(res["candidate_entry"])
+        if res["frame_diag"] is not None:
+            frame_diag = res["frame_diag"]  # last non-None wins (all frames same size)
 
     # ── Run strict tracker (Fixes 1, 2, 4) ───────────────────────────────────
     track_items, tracker_meta = _track_primary_face(frame_candidates, frame_diag)

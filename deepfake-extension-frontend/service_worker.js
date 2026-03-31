@@ -7,6 +7,19 @@ try {
   console.error("[SW] idb.js load failed:", e);
 }
 
+// ── Performance timing (service worker side) ──────────────────────────────────
+// Appends timing entries to chrome.storage.local["perfLog"] (same key as
+// content.js) so all metrics are readable from one place.
+function swPerfMark(metric, valueMs, extra = {}) {
+  const entry = { metric, ms: Math.round(valueMs), ts: Date.now(), side: "sw", ...extra };
+  console.log(`[Perf][SW][${metric}] ${entry.ms}ms`, extra);
+  chrome.storage.local.get(["perfLog"], st => {
+    const existing = Array.isArray(st.perfLog) ? st.perfLog : [];
+    chrome.storage.local.set({ perfLog: [...existing, entry].slice(-50) });
+  });
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 const API_BASE = "http://127.0.0.1:8000";
 const FRONTEND_BASE = "http://localhost:5173";
 const PORTAL_ANALYSIS_URL = `${FRONTEND_BASE}/media-analysis`;
@@ -246,10 +259,15 @@ async function waitUntilReady(tabId, lockedVideoId) {
     await chrome.tabs.sendMessage(tabId, { type: "PREP_CAPTURE", lockedVideoId });
   } catch { }
   const start = Date.now();
+  // Use a SHORT per-poll timeout (1500ms) so the content script returns quickly
+  // and the SW loop can retry multiple times within READY_TIMEOUT_MS.
+  // Previously passing READY_TIMEOUT_MS (12000) as timeoutMs meant the content
+  // script blocked for the entire 12s window, allowing only ONE iteration.
+  const POLL_TIMEOUT_MS = 1500;
   while (Date.now() - start < READY_TIMEOUT_MS) {
     try {
       const r = await chrome.tabs.sendMessage(tabId, {
-        type: "WAIT_UNTIL_READY", timeoutMs: READY_TIMEOUT_MS, lockedVideoId,
+        type: "WAIT_UNTIL_READY", timeoutMs: POLL_TIMEOUT_MS, lockedVideoId,
       });
       if (r?.ok && r?.ready) return true;
     } catch { }
@@ -431,7 +449,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 
 // ── Message handler ───────────────────────────────────────────────────────────
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg?.type === "ALLOW_BYPASS") {
     // Synchronously write to the in-memory bypass map, then respond.
@@ -507,6 +525,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Prevent SW from being killed during the capture + upload sequence.
     chrome.alarms.create("capture_keepalive", { periodInMinutes: 0.4 }).catch(() => { });
 
+    // ── Metric: capture_latency (SW wall-clock, user perspective) ─────────────
+    const t0Total = Date.now();
+    // ─────────────────────────────────────────────────────────────────────────
+
     try {
       const tab = await getActiveTab();
       if (!tab?.id) { sendResponse({ ok: false, error: "No active tab." }); return; }
@@ -530,6 +552,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!ready) console.warn("[SW] Ready check timed out — attempting capture anyway.");
 
       // ── Canvas capture (primary) + audio from content script ─────────────────
+      // ── Metric: message_passing_latency ──────────────────────────────────────
+      const t0Msg = Date.now();
       const nativeRes = await chrome.tabs.sendMessage(tabId, {
         type: "EXTRACT_FRAMES_LIVE",
         frameCount: FRAME_COUNT,
@@ -537,7 +561,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         quality: JPEG_QUALITY / 100,
         warmupMs: 350,
         lockedVideoId,
-      }).catch(() => null);
+      }).catch((err) => {
+        console.warn("[SW] EXTRACT_FRAMES_LIVE sendMessage failed (context invalidated or no listener):", err?.message || err);
+        return null;
+      });
+      // Round-trip includes frame extraction time; we log it as message_passing_latency
+      // because for the service worker this is the entire "send message → get response" hop.
+      if (!nativeRes?.ok) {
+        console.warn("[SW] EXTRACT_FRAMES_LIVE returned failure:", {
+          ok: nativeRes?.ok,
+          error: nativeRes?.error,
+          frames: nativeRes?.frames?.length ?? 0,
+        });
+      }
+      swPerfMark("message_passing_latency", Date.now() - t0Msg, {
+        frames: nativeRes?.frames?.length ?? 0,
+        ok: !!nativeRes?.ok,
+        direction: "sw→content→sw",
+      });
+      // ─────────────────────────────────────────────────────────────────────────
 
       const captureMethod = "content_script_canvas_live_jpeg";
       const captureDebug = nativeRes?.debug || null;
@@ -609,10 +651,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       const out = await postToBackend(meta, blobs, audioBlob);
       await handleCaptureSuccess(out, meta);
+
+      // ── Metric: capture_latency (full user-facing wall-clock) ────────────────
+      swPerfMark("capture_latency_total", Date.now() - t0Total, {
+        frames: blobs.length,
+        has_audio: !!audioBlob,
+        verdict: out?.verdict ?? null,
+        ok: true,
+      });
+      // ────────────────────────────────────────────────────────────────────────
+
       sendResponse({ ok: true, ...out, capture_method: captureMethod, analysis_meta: meta });
 
     } catch (e) {
       console.error("[SW] Capture failed:", e);
+      swPerfMark("capture_latency_total", Date.now() - t0Total, { ok: false, error: String(e?.message || e) });
       sendResponse({ ok: false, error: String(e?.message || e) });
     } finally {
       isCapturing = false;
