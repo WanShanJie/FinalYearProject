@@ -23,11 +23,11 @@ from jose import jwt, JWTError
 
 from db import SessionLocal, engine, Base
 from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ModelRun, ExtensionLinkRequest, LinkedExtension, GlobalBlocklist
-from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn
+from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn, SetRoleIn, AdminCreateUserIn, SetInitialPasswordIn, UpdateProfileIn
 from auth import hash_password, verify_password, create_token, create_extension_token
 from oauth_routes import router as oauth_router
 from password_reset import make_reset_token, hash_token, expires_at_dt
-from email_utils import send_reset_email, send_mfa_code, send_email_verification_code
+from email_utils import send_reset_email, send_mfa_code, send_email_verification_code, send_welcome_credentials_email
 from typing import List, Optional
 from base64 import urlsafe_b64encode
 
@@ -35,6 +35,7 @@ from opencv_pipeline import process_frames_for_sequence
 try:
     from celery_app import celery_app as _celery_app
     _CELERY_AVAILABLE = True
+    print("[Startup] Celery loaded — queue: deepfake  broker:", _celery_app.conf.broker_url)
 except ModuleNotFoundError:
     _celery_app = None          # server still starts; async video upload disabled
     _CELERY_AVAILABLE = False
@@ -118,6 +119,13 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
+
+
+def require_admin(current_user: User = Depends(get_current_user)):
+    """Dependency: raises HTTP 403 if the authenticated user is not ADMIN."""
+    if getattr(current_user, "role", "USER") != "ADMIN":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
 
 
 def get_portal_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
@@ -206,9 +214,13 @@ async def _request_timing_middleware(request: Request, call_next):
     response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
     response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
-    # Only log analysis endpoints to avoid spamming logs with health-checks
-    if "/api/analysis/" in request.url.path or "/api/admin/" in request.url.path:
-        print(f"[Perf][API] {request.method} {request.url.path} → {response.status_code}  {elapsed_ms} ms")
+    # Skip high-frequency polling endpoints to avoid log spam
+    _path = request.url.path
+    _is_status_poll = _path.endswith("/status") and request.method == "GET"
+    _is_blocklist    = "/api/blocklist/" in _path and request.method == "GET"
+    if not _is_status_poll and not _is_blocklist:
+        if "/api/analysis/" in _path or "/api/admin/" in _path or "/api/capture" in _path:
+            print(f"[Perf][API] {request.method} {_path} → {response.status_code}  {elapsed_ms} ms")
     return response
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1254,8 +1266,14 @@ def _delete_analysis_records(db: Session, analyses: List[MediaAnalysis], user_id
         raise
 
 def _issue_user_token(user: User) -> dict:
-    token = create_token(user.id, user.email)
-    return {"token": token, "user": UserOut(id=user.id, email=user.email, first_name=user.first_name, last_name=user.last_name)}
+    role = getattr(user, "role", "USER") or "USER"
+    token = create_token(user.id, user.email, role)
+    return {
+        "token": token,
+        "role": role,
+        "must_change_password": bool(getattr(user, "must_change_password", False)),
+        "user": UserOut(id=user.id, email=user.email, first_name=user.first_name, last_name=user.last_name),
+    }
 
 def _create_or_refresh_trusted_device(db: Session, user_id: int, device_id: str) -> None:
     if not device_id:
@@ -1367,6 +1385,9 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
         privacy_version=data.privacy_version or PRIVACY_VERSION,
         email_verified=False,
         email_verified_at=None,
+        # Closed-access: all new users are pending admin approval
+        role="USER",
+        is_approved=False,
     )
     db.add(user)
     db.commit()
@@ -1383,7 +1404,7 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
         db.commit()
         raise HTTPException(status_code=500, detail=f"Failed to send verification email: {e}")
 
-    return {"verification_required": True, "email": user.email, "message": "Verification code sent to your email."}
+    return {"verification_required": True, "email": user.email, "message": "Verification code sent to your email. Your account will be active once an admin approves it."}
 
 
 @app.post("/api/auth/verify-email-otp")
@@ -1392,8 +1413,11 @@ def verify_email_otp(data: VerifyEmailOtpIn, request: Request, db: Session = Dep
     if not user:
         raise HTTPException(status_code=400, detail="User not found")
 
-    # If already verified, just issue a token (and optionally trust device)
+    # If already verified, issue a token only if the account is approved
     if getattr(user, "email_verified", False):
+        if not getattr(user, "is_approved", False):
+            return {"approval_required": True, "email": user.email,
+                    "message": "Email already verified. Your account is pending admin approval."}
         if data.trust_device and data.device_id:
             _create_or_refresh_trusted_device(db, user.id, data.device_id)
         return _issue_user_token(user)
@@ -1422,6 +1446,12 @@ def verify_email_otp(data: VerifyEmailOtpIn, request: Request, db: Session = Dep
     if data.trust_device and data.device_id:
         _create_or_refresh_trusted_device(db, user.id, data.device_id)
 
+    # Only issue a JWT if the account is already approved (e.g. bootstrap admin).
+    # Normal new users are is_approved=False — return "pending approval" instead.
+    if not getattr(user, "is_approved", False):
+        return {"approval_required": True, "email": user.email,
+                "message": "Email verified! Your account is pending admin approval. You will receive access once an administrator approves your request."}
+
     return _issue_user_token(user)
 
 
@@ -1434,6 +1464,9 @@ def login(request: Request, data: LoginIn, db: Session = Depends(get_db)):
 
     # Google OAuth accounts: rely on Google (including their MFA if enabled)
     if getattr(user, "provider", "local") == "google":
+        # Check approval for OAuth users too
+        if not getattr(user, "is_approved", False):
+            raise HTTPException(status_code=403, detail="Your account is pending admin approval. Please wait for an administrator to approve your access.")
         return _issue_user_token(user)
 
     # Must verify email first (signup OTP)
@@ -1445,6 +1478,10 @@ def login(request: Request, data: LoginIn, db: Session = Depends(get_db)):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Failed to send verification email: {e}")
         return {"verification_required": True, "email": user.email, "message": "Email not verified. We sent a new verification code."}
+
+    # ── CLOSED ACCESS: block unapproved users ──────────────────────────────
+    if not getattr(user, "is_approved", False):
+        raise HTTPException(status_code=403, detail="Your account is pending admin approval. Please wait for an administrator to approve your access.")
 
     # Trusted device? -> no OTP needed
     if _is_trusted_device(db, user.id, data.device_id):
@@ -1508,6 +1545,9 @@ def verify_mfa(request: Request, data: MfaVerifyIn, db: Session = Depends(get_db
     user = db.query(User).filter(User.id == challenge.user_id).first()
     if not user:
         raise HTTPException(status_code=400, detail="User not found")
+
+    if not getattr(user, "is_approved", False):
+        raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
 
     challenge.consumed_at = now
     db.commit()
@@ -1700,6 +1740,15 @@ def redeem_extension_link_request(data: ExtensionLinkRedeemIn, db: Session = Dep
     user = db.query(User).filter(User.id == req.user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    # In single-extension mode, automatically revoke any previous linking
+    previous_extensions = db.query(LinkedExtension).filter(
+        LinkedExtension.user_id == user.id,
+        LinkedExtension.is_active == True
+    ).all()
+    for prev in previous_extensions:
+        prev.is_active = False
+        prev.revoked_at = now
 
     device = LinkedExtension(
         user_id=user.id,
@@ -2740,13 +2789,15 @@ def get_analysis_status(
             "signals":    decision.get("signals"),
         })
 
-    elif analysis.status == "ERROR":
+    elif analysis.status in ("FAILED", "ERROR"):
+        base["status"] = "ERROR"  # normalise to ERROR for frontend
         base["error"] = (analysis.meta or {}).get("worker_error", "Processing failed")
 
     elif analysis.status in ("PROCESSING", "PENDING"):
+        # Read created_at now while the session is clean — used for auto-fail below.
+        created_at_snapshot = analysis.created_at
+
         # Query Celery's result backend (Redis) for live progress.
-        # The worker calls self.update_state(state="PROGRESS", meta={…})
-        # at each pipeline stage, which stores data in Redis keyed by task_id.
         task_id = (analysis.meta or {}).get("celery_task_id")
         progress = 0
         stage    = "queued"
@@ -2761,11 +2812,41 @@ def get_analysis_status(
                     progress = 5
                     stage    = "starting"
                 elif result.state == "FAILURE":
-                    # Worker died but DB wasn't updated — sync here
+                    # Worker died without updating the DB — write ERROR now so
+                    # future polls read it directly from DB (no more Redis query).
+                    error_msg = str(result.info) if result.info else "Worker failed"
+                    try:
+                        analysis.status  = "FAILED"
+                        analysis.verdict = "INCONCLUSIVE"
+                        analysis.meta    = {**(analysis.meta or {}), "worker_error": error_msg}
+                        db.commit()
+                    except Exception as _db_err:
+                        db.rollback()
+                        print(f"[Status] DB write failed for FAILURE state (id={analysis_id}): {_db_err}")
                     base["status"] = "ERROR"
-                    base["error"]  = str(result.info) if result.info else "Worker failed"
+                    base["error"]  = error_msg
+                    return base
             except Exception as _ce:
+                db.rollback()
                 print(f"[Status] Celery query failed for task {task_id}: {_ce}")
+
+        # Auto-fail analyses stuck in PENDING/PROCESSING for more than 10 minutes
+        # (covers cases where the worker died without leaving a Celery result).
+        if created_at_snapshot:
+            age_s = (datetime.utcnow() - created_at_snapshot).total_seconds()
+            if age_s > 600:
+                try:
+                    analysis.status  = "FAILED"
+                    analysis.verdict = "INCONCLUSIVE"
+                    analysis.meta    = {**(analysis.meta or {}), "worker_error": "Task timed out — worker may have crashed"}
+                    db.commit()
+                except Exception as _db_err:
+                    db.rollback()
+                    print(f"[Status] DB auto-fail write failed (id={analysis_id}): {_db_err}")
+                base["status"] = "ERROR"
+                base["error"]  = "Analysis timed out. Please try again."
+                return base
+
         base["progress"] = progress
         base["stage"]    = stage
 
@@ -2871,6 +2952,40 @@ async def capture_analysis(
         frames_for_cv.append((orig_name, content))
 
     _t.mark("upload")          # time to receive + save all frames to disk
+
+    # ── Save optional audio file to disk ──────────────────────────────────────
+    saved_audio_path = None
+    if audio_upload is not None:
+        audio_content = await audio_upload.read()
+        if audio_content:
+            audio_path = raw_dir / (audio_upload.filename or "audio.webm")
+            with open(audio_path, "wb") as _af:
+                _af.write(audio_content)
+            saved_audio_path = str(audio_path)
+            print(f"[Capture] Saved audio {len(audio_content)} bytes → {audio_path}")
+
+    # ── Enqueue Celery task — return immediately ───────────────────────────────
+    if _CELERY_AVAILABLE and _celery_app is not None:
+        task = _celery_app.send_task(
+            "worker.run_capture_analysis",
+            args=[analysis.id, str(raw_dir), str(upload_dir), saved_audio_path],
+            queue="deepfake",
+        )
+        meta_data["celery_task_id"] = task.id
+        analysis.meta = meta_data
+        db.commit()
+        print(f"[Capture] Queued analysis_id={analysis.id}  celery_task_id={task.id}")
+        return {
+            "ok": True,
+            "analysis_id": analysis.id,
+            "task_id": task.id,
+            "status": "queued",
+            "verdict": "PENDING",
+            "score": 0.0,
+        }
+
+    # ── Fallback: Celery not available — run synchronously (dev/no-Redis) ──────
+    print(f"[Capture] Celery unavailable — running synchronously for analysis_id={analysis.id}")
 
     opencv_summary = process_frames_for_sequence(
         analysis_id=analysis.id,
@@ -3108,7 +3223,9 @@ async def capture_analysis(
         "saved_path": None,
     }
     if audio_upload is not None:
-        audio_content = await audio_upload.read()
+        # Re-use the bytes already saved to disk by the enqueue block above.
+        # If we're in the sync fallback path, saved_audio_path is set.
+        audio_content = open(saved_audio_path, "rb").read() if saved_audio_path else b""
         audio_debug["byte_size"] = len(audio_content)
         print(
             f"[Capture][Audio] Received audio upload: "
@@ -3116,12 +3233,13 @@ async def capture_analysis(
             f"content_type={audio_debug['content_type']} "
             f"bytes={audio_debug['byte_size']}"
         )
-        audio_tmp_path = None
+        audio_tmp_path = Path(saved_audio_path) if saved_audio_path else None
         try:
-            suffix = Path(audio_upload.filename or "audio.webm").suffix or ".webm"
-            audio_tmp_path = upload_dir / f"{analysis.id}_audio{suffix}"
-            with open(audio_tmp_path, "wb") as f:
-                f.write(audio_content)
+            if not audio_tmp_path:
+                suffix = Path(audio_upload.filename or "audio.webm").suffix or ".webm"
+                audio_tmp_path = upload_dir / f"{analysis.id}_audio{suffix}"
+                with open(audio_tmp_path, "wb") as f:
+                    f.write(audio_content)
             audio_debug["saved_path"] = str(audio_tmp_path)
             seq_dir = upload_dir / f"{analysis.id}_seq"
             wav2lip_result = wav2lip_service.wav2lip_sync_score(
@@ -3440,11 +3558,11 @@ def check_blocklist(payload: dict, db: Session = Depends(get_db), current_user: 
 # --- Monitoring & Admin API -------------------------------------------------
 
 @app.get("/api/admin/stats")
-def get_admin_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_admin_stats(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     """Return system-wide monitoring metrics for the admin dashboard."""
     total = db.query(MediaAnalysis).count()
     success = db.query(MediaAnalysis).filter(MediaAnalysis.status == "DONE").count()
-    failure = db.query(MediaAnalysis).filter(MediaAnalysis.status == "ERROR").count()
+    failure = db.query(MediaAnalysis).filter(MediaAnalysis.status == "FAILED").count()
     avg_time = (
         db.query(func.avg(MediaAnalysis.processing_time))
         .filter(MediaAnalysis.status == "DONE", MediaAnalysis.processing_time.isnot(None))
@@ -3470,7 +3588,7 @@ def get_admin_stats(db: Session = Depends(get_db), current_user: User = Depends(
 
 
 @app.get("/api/admin/logs")
-def get_admin_logs(limit: int = 20, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+def get_admin_logs(limit: int = 20, db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
     """Return the most recent detection logs across all users."""
     rows = (
         db.query(MediaAnalysis)
@@ -3494,3 +3612,216 @@ def get_admin_logs(limit: int = 20, db: Session = Depends(get_db), current_user:
             for r in rows
         ],
     }
+
+
+# ── Current User Info ─────────────────────────────────────────────────────────
+
+@app.get("/api/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    """Return the current authenticated user's profile including role."""
+    return {
+        "ok": True,
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "first_name": current_user.first_name,
+            "last_name": current_user.last_name,
+            "role": getattr(current_user, "role", "USER") or "USER",
+            "is_approved": getattr(current_user, "is_approved", False),
+            "must_change_password": bool(getattr(current_user, "must_change_password", False)),
+        },
+    }
+
+@app.put("/api/me")
+def update_me(
+    data: UpdateProfileIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Update profile information."""
+    if data.first_name is not None:
+        current_user.first_name = data.first_name
+    if data.last_name is not None:
+        current_user.last_name = data.last_name
+    
+    db.commit()
+    db.refresh(current_user)
+    
+    return {
+        "ok": True,
+        "message": "Profile updated successfully.",
+        "user": {
+            "id": current_user.id,
+            "email": current_user.email,
+            "first_name": current_user.first_name,
+            "last_name": current_user.last_name,
+            "role": getattr(current_user, "role", "USER") or "USER",
+            "is_approved": getattr(current_user, "is_approved", False),
+            "must_change_password": bool(getattr(current_user, "must_change_password", False)),
+        },
+    }
+
+
+@app.get("/api/admin/users")
+def list_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Return all registered users with their approval and role status."""
+    users = db.query(User).order_by(User.id.desc()).all()
+    return {
+        "ok": True,
+        "data": [
+            {
+                "id": u.id,
+                "email": u.email,
+                "first_name": u.first_name,
+                "last_name": u.last_name,
+                "role": getattr(u, "role", "USER") or "USER",
+                "is_approved": getattr(u, "is_approved", False),
+                "email_verified": getattr(u, "email_verified", False),
+                "created_at": u.created_at.isoformat() if u.created_at else None,
+            }
+            for u in users
+        ],
+    }
+
+
+@app.post("/api/admin/users/{user_id}/approve")
+def approve_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Directly approve a user's account (grant login access)."""
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    target.is_approved = True
+    db.commit()
+    return {"ok": True, "message": f"User {target.email} approved."}
+
+
+@app.post("/api/admin/users/{user_id}/revoke")
+def revoke_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Revoke a user's login access (set is_approved=False)."""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="You cannot revoke your own access.")
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    target.is_approved = False
+    db.commit()
+    return {"ok": True, "message": f"User {target.email} access revoked."}
+
+
+@app.post("/api/admin/users/{user_id}/set-role")
+def set_user_role(
+    user_id: int,
+    data: SetRoleIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Promote or demote a user's role (USER <-> ADMIN). Admins cannot demote themselves."""
+    if user_id == current_user.id and data.role != "ADMIN":
+        raise HTTPException(status_code=400, detail="You cannot demote your own admin role.")
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found.")
+    target.role = data.role
+    # Promoting to ADMIN also ensures is_approved so the account can log in
+    if data.role == "ADMIN":
+        target.is_approved = True
+    db.commit()
+    action = "promoted to ADMIN" if data.role == "ADMIN" else "demoted to USER"
+    return {"ok": True, "message": f"User {target.email} {action}."}
+
+
+@app.post("/api/admin/users/create")
+def admin_create_user(
+    data: AdminCreateUserIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Admin provisions a new user account directly.
+    Generates a random temporary password, creates the account (pre-approved,
+    email pre-verified), and emails the credentials to the new user.
+    The user is required to change the password on first login.
+    """
+    existing = db.query(User).filter(User.email == data.email).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="An account with that email already exists.")
+
+    # Generate a readable 12-character temporary password
+    import string as _str
+    _alphabet = _str.ascii_letters + _str.digits
+    temp_password = "".join(secrets.choice(_alphabet) for _ in range(12))
+
+    new_user = User(
+        first_name=data.first_name,
+        last_name=data.last_name,
+        email=data.email,
+        provider="local",
+        password_hash=hash_password(temp_password),
+        agreed_terms=True,
+        agreed_terms_at=_utcnow(),
+        email_verified=True,
+        email_verified_at=_utcnow(),
+        role=data.role,
+        is_approved=True,
+        must_change_password=True,
+    )
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    login_url = os.getenv("FRONTEND_BASE_URL", "http://localhost:5173") + "/signin"
+    try:
+        send_welcome_credentials_email(
+            to_email=data.email,
+            temp_password=temp_password,
+            login_url=login_url,
+        )
+    except Exception as e:
+        # Roll back the user creation so admin can retry
+        db.delete(new_user)
+        db.commit()
+        raise HTTPException(status_code=500, detail=f"Account created but email delivery failed: {e}")
+
+    return {
+        "ok": True,
+        "message": f"Account created and credentials emailed to {data.email}.",
+        "user": {
+            "id": new_user.id,
+            "email": new_user.email,
+            "first_name": new_user.first_name,
+            "last_name": new_user.last_name,
+            "role": new_user.role,
+        },
+    }
+
+
+# ── Force password change (admin-provisioned accounts) ────────────────────────
+
+@app.post("/api/auth/set-initial-password")
+def set_initial_password(
+    data: SetInitialPasswordIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Let an admin-provisioned user set their own permanent password.
+    Only callable when must_change_password=True on the account.
+    """
+    if not getattr(current_user, "must_change_password", False):
+        raise HTTPException(status_code=400, detail="Password change is not required for this account.")
+    current_user.password_hash = hash_password(data.new_password)
+    current_user.must_change_password = False
+    db.commit()
+    # Re-issue token so the frontend session stays valid
+    return {**_issue_user_token(current_user), "ok": True, "message": "Password updated successfully."}

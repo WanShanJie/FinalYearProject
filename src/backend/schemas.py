@@ -54,3 +54,28 @@ class ExtensionLinkApproveIn(BaseModel):
 class ExtensionLinkRedeemIn(BaseModel):
     request_id: str = Field(min_length=8, max_length=128)
     code_verifier: str = Field(min_length=32, max_length=255)
+
+
+# ── Admin Request Schemas ──────────────────────────────────────────────────────
+
+class SetRoleIn(BaseModel):
+    """Payload for POST /api/admin/users/{id}/set-role."""
+    role: str = Field(..., pattern="^(USER|ADMIN)$")
+
+class UpdateProfileIn(BaseModel):
+    """Payload for PUT /api/me"""
+    first_name: str | None = Field(default=None, max_length=80)
+    last_name: str | None = Field(default=None, max_length=80)
+
+
+class AdminCreateUserIn(BaseModel):
+    """Payload for POST /api/admin/users/create — admin-provisioned accounts."""
+    email: EmailStr
+    first_name: str | None = Field(default=None, max_length=80)
+    last_name: str | None = Field(default=None, max_length=80)
+    role: str = Field(default="USER", pattern="^(USER|ADMIN)$")
+
+
+class SetInitialPasswordIn(BaseModel):
+    """Payload for POST /api/auth/set-initial-password (force-change on first login)."""
+    new_password: str = Field(min_length=8, max_length=72)

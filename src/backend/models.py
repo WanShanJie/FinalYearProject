@@ -20,6 +20,11 @@ class User(Base):
     privacy_version = Column(String(20), nullable=True)
     email_verified = Column(Boolean, nullable=False, server_default=text("0"))
     email_verified_at = Column(TIMESTAMP, nullable=True)
+    # RBAC: role is USER or ADMIN; is_approved gates login access
+    role = Column(String(20), nullable=False, server_default=text("'USER'"))
+    is_approved = Column(Boolean, nullable=False, server_default=text("0"))
+    # True for admin-provisioned accounts: user must change password on first login
+    must_change_password = Column(Boolean, nullable=False, server_default=text("0"))
 
 class OAuthAccount(Base):
     __tablename__ = "oauth_accounts"
@@ -193,3 +198,5 @@ class GlobalBlocklist(Base):
     status = Column(String(20), nullable=False, server_default=text("'active'"))
     created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
     updated_at = Column(TIMESTAMP, nullable=True, onupdate=func.now())
+
+

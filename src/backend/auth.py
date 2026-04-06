@@ -18,16 +18,23 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, hashed: str) -> bool:
     return pwd_ctx.verify(password, hashed)
 
-def create_token(user_id: int, email: str):
+def create_token(user_id: int, email: str, role: str = "USER"):
+    """Create a signed JWT with user_id, email, role, and 24-hour expiry."""
     expire = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MIN)
-    payload = {"sub": str(user_id), "email": email, "exp": expire}
+    payload = {
+        "sub": str(user_id),
+        "email": email,
+        "role": role,
+        "exp": expire,
+    }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
 
-def create_extension_token(user_id: int, email: str, linked_extension_id: int, scopes: Iterable[str] | None = None, expires_days: int = 30):
+def create_extension_token(user_id: int, email: str, linked_extension_id: int, role: str = "USER", scopes: Iterable[str] | None = None, expires_days: int = 30):
     expire = datetime.utcnow() + timedelta(days=expires_days)
     payload = {
         "sub": str(user_id),
         "email": email,
+        "role": role,
         "type": "extension",
         "linked_extension_id": linked_extension_id,
         "scope": list(scopes or ["analysis:create", "analysis:read:self"]),

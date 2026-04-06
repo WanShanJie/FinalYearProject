@@ -144,6 +144,62 @@ If you didn't try to sign in, you can ignore this email.
         raise
 
 
+def send_welcome_credentials_email(to_email: str, temp_password: str, login_url: str):
+    """Send admin-provisioned account credentials with a forced password-change notice."""
+    host = os.getenv("SMTP_HOST", "").strip()
+    port_str = os.getenv("SMTP_PORT", "587").strip()
+    port = int(port_str) if port_str.isdigit() else 587
+    user = os.getenv("SMTP_USER", "").strip()
+    password = os.getenv("SMTP_PASS", "").strip()
+    sender = os.getenv("SMTP_FROM", "").strip() or user
+
+    if not host or not user or not password or not sender:
+        raise RuntimeError(
+            "SMTP settings missing. Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM in .env"
+        )
+
+    msg = EmailMessage()
+    msg["Subject"] = "Your A2U account has been created"
+    msg["From"] = sender
+    msg["To"] = to_email
+
+    msg.set_content(
+        f"""Hi,
+
+An administrator has created an account for you on the A2U Deepfake Verification System.
+
+Your login credentials:
+  Email:             {to_email}
+  Temporary Password:{temp_password}
+
+Sign in here: {login_url}
+
+You will be asked to set a new password immediately after your first login.
+Please do not share this email or your temporary password with anyone.
+
+If you were not expecting this, please contact your system administrator.
+
+Thanks,
+Context-Aware Deepfake Verification System
+"""
+    )
+
+    if os.getenv("DEV_PRINT_EMAILS", "false").lower() == "true" or host == "mock":
+        print(f"[DEV_PRINT_EMAILS] Welcome credentials for {to_email}: temp_password={temp_password}")
+        return
+
+    try:
+        with smtplib.SMTP(host, port) as s:
+            s.ehlo()
+            s.starttls()
+            s.ehlo()
+            s.login(user, password)
+            s.send_message(msg)
+    except Exception as e:
+        print(f"[email_utils] Failed to send welcome email to {to_email}: {e}")
+        raise
+
+
 def send_email_verification_code(to_email: str, code: str, ttl_minutes: int = 10):
     """Send a one-time code to verify ownership of the email (used right after signup)."""
     host = os.getenv("SMTP_HOST", "").strip()

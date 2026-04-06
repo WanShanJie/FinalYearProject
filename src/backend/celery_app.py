@@ -23,6 +23,9 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
+    # ── Queue ─────────────────────────────────────────────────────────────────
+    task_default_queue="deepfake",   # worker and tasks must use the same name
+
     # ── Serialisation ─────────────────────────────────────────────────────────
     task_serializer="json",
     result_serializer="json",
