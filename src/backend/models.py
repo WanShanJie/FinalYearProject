@@ -1,4 +1,4 @@
-from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Float, Text, TIMESTAMP, text, ForeignKey, DateTime, JSON
+from sqlalchemy import Column, BigInteger, String, Boolean, Integer, Float, Text, TIMESTAMP, text, ForeignKey, DateTime, JSON, UniqueConstraint
 from sqlalchemy.dialects.mysql import BIGINT
 from db import Base
 from sqlalchemy.sql import func
@@ -25,6 +25,8 @@ class User(Base):
     is_approved = Column(Boolean, nullable=False, server_default=text("0"))
     # True for admin-provisioned accounts: user must change password on first login
     must_change_password = Column(Boolean, nullable=False, server_default=text("0"))
+    # Per-user persisted settings (JSON blob)
+    settings = Column(JSON, nullable=True)
 
 class OAuthAccount(Base):
     __tablename__ = "oauth_accounts"
@@ -72,6 +74,10 @@ class TrustedDevice(Base):
 
     created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
     last_used_at = Column(TIMESTAMP, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint('user_id', 'device_hash', name='uq_user_device'),
+    )
 
 
 class MfaChallenge(Base):
@@ -180,6 +186,25 @@ class LinkedExtension(Base):
     is_active = Column(Boolean, nullable=False, server_default=text("1"))
 
     user = relationship("User")
+
+
+class SystemMetricSnapshot(Base):
+    __tablename__ = "system_metric_snapshots"
+
+    id          = Column(BIGINT(unsigned=True), primary_key=True, autoincrement=True)
+    recorded_at = Column(DateTime, nullable=False, index=True)
+    cpu_pct     = Column(Float, nullable=True)
+    ram_pct     = Column(Float, nullable=True)
+    ram_used_gb = Column(Float, nullable=True)
+    disk_pct    = Column(Float, nullable=True)
+    disk_used_gb= Column(Float, nullable=True)
+    queue_depth = Column(Integer, nullable=True)
+    active_tasks= Column(Integer, nullable=True)
+    stuck_jobs  = Column(Integer, nullable=True)
+    # Service health flags — used to detect downtime incidents
+    redis_ok    = Column(Boolean, nullable=True)
+    worker_ok   = Column(Boolean, nullable=True)
+    db_ok       = Column(Boolean, nullable=True)
 
 
 class GlobalBlocklist(Base):

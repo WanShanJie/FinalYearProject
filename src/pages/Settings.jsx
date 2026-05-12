@@ -1,11 +1,16 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState, useCallback } from "react";
 import { useNavigate, useOutletContext } from "react-router-dom";
+import { formatDateTime } from "../utils/formatDate";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./Settings.module.css";
 import { settingsCards, systemSettings } from "../data/systemMockData";
 import { CheckIcon, LinkIcon, MoonIcon, SettingsIcon, SunIcon } from "../components/system/SystemIcons";
 
 const API_BASE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+
+function authHeaders() {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token")}` };
+}
 
 export default function Settings() {
   const navigate = useNavigate();
@@ -15,12 +20,64 @@ export default function Settings() {
   const [strictMode, setStrictMode] = useState(systemSettings.strictMode);
   const [autoSync, setAutoSync] = useState(systemSettings.autoSync);
   const [threshold, setThreshold] = useState(systemSettings.threshold);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState(null); // "saving" | "saved" | "error"
+  const saveTimer = useRef(null);
   const [devices, setDevices] = useState([]);
   const [devicesLoading, setDevicesLoading] = useState(true);
   const [devicesError, setDevicesError] = useState("");
   const [revokingId, setRevokingId] = useState(null);
+  const fetchDevicesLastAt = useRef(0);
+
+  // ── Load settings from backend on mount ──────────────────────────────────
+  useEffect(() => {
+    async function loadSettings() {
+      try {
+        const res = await fetch(`${API_BASE}/api/settings`, { headers: authHeaders() });
+        if (res.status === 401) { navigate("/signin", { replace: true }); return; }
+        const json = await res.json();
+        if (json.ok && json.settings) {
+          const s = json.settings;
+          setAnalystReview(s.analyst_review ?? systemSettings.analystReview);
+          setNotifications(s.notifications ?? systemSettings.notifications);
+          setStrictMode(s.strict_mode ?? systemSettings.strictMode);
+          setAutoSync(s.auto_sync ?? systemSettings.autoSync);
+          setThreshold(s.threshold ?? systemSettings.threshold);
+        }
+      } catch { /* keep defaults */ }
+      finally { setSettingsLoaded(true); }
+    }
+    loadSettings();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Persist a settings patch to the backend ───────────────────────────────
+  const persistSettings = useCallback(async (patch) => {
+    setSaveStatus("saving");
+    clearTimeout(saveTimer.current);
+    try {
+      const res = await fetch(`${API_BASE}/api/settings`, {
+        method: "PUT",
+        headers: authHeaders(),
+        body: JSON.stringify(patch),
+      });
+      if (res.status === 401) { navigate("/signin", { replace: true }); return; }
+      const json = await res.json();
+      setSaveStatus(json.ok ? "saved" : "error");
+    } catch { setSaveStatus("error"); }
+    saveTimer.current = setTimeout(() => setSaveStatus(null), 2000);
+  }, [navigate]);
+
+  function toggle(field, setter, current) {
+    const next = !current;
+    setter(next);
+    persistSettings({ [field]: next });
+  }
 
   async function fetchDevices() {
+    const now = Date.now();
+    if (now - fetchDevicesLastAt.current < 3000) return;
+    fetchDevicesLastAt.current = now;
     try {
       setDevicesLoading(true);
       setDevicesError("");
@@ -48,6 +105,20 @@ export default function Settings() {
 
   useEffect(() => {
     fetchDevices();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    // Real-time synchronization with the browser extension.
+    // If the user connects or disconnects via the popup, it alerts the page natively.
+    function handleExtensionMessages(event) {
+      if (event.data?.type === "A2U_EXTENSION_STATUS_CHANGED") {
+        fetchDevices();
+      }
+    }
+    window.addEventListener("message", handleExtensionMessages);
+    return () => window.removeEventListener("message", handleExtensionMessages);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function revokeDevice(deviceId) {
@@ -62,6 +133,10 @@ export default function Settings() {
       if (!res.ok || !json.ok) {
         throw new Error(json.detail || "Unable to revoke extension.");
       }
+      
+      // Dispatch event to the injected content script to wipe its linked token locally.
+      window.postMessage({ type: "A2U_PORTAL_REVOKED" }, "*");
+      
       await fetchDevices();
     } catch (err) {
       setDevicesError(err.message || "Unable to revoke extension.");
@@ -69,6 +144,12 @@ export default function Settings() {
       setRevokingId(null);
     }
   }
+
+  const activeDevice = devices.find(d => d.is_active);
+
+  // Threshold: update local state on drag, persist only on release
+  function handleThresholdChange(e) { setThreshold(Number(e.target.value)); }
+  function handleThresholdCommit(e)  { persistSettings({ threshold: Number(e.target.value) }); }
 
   return (
     <div className={layout.page}>
@@ -79,9 +160,14 @@ export default function Settings() {
             System configuration panels for analyst review, notifications, strict mode, extension linking, and interface preferences.
           </p>
         </div>
-        <div className={layout.pill}>
-          <SettingsIcon className={styles.smallIcon} />
-          <span>Configuration center</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {saveStatus === "saving" && <span style={{ fontSize: 13, color: "#94a3b8" }}>Saving…</span>}
+          {saveStatus === "saved"  && <span style={{ fontSize: 13, color: "#22c55e" }}>Saved</span>}
+          {saveStatus === "error"  && <span style={{ fontSize: 13, color: "#ef4444" }}>Save failed</span>}
+          <div className={layout.pill}>
+            <SettingsIcon className={styles.smallIcon} />
+            <span>Configuration center</span>
+          </div>
         </div>
       </section>
 
@@ -94,24 +180,30 @@ export default function Settings() {
             </div>
           </div>
 
-          <div className={styles.toggleList}>
-            <ToggleRow title="Analyst review" description="Require a human reviewer for inconclusive or sensitive detections." checked={analystReview} onChange={() => setAnalystReview((prev) => !prev)} />
-            <ToggleRow title="Notifications" description="Notify operators about detections, policy events, and sync issues." checked={notifications} onChange={() => setNotifications((prev) => !prev)} />
-            <ToggleRow title="Strict mode" description="Increase sensitivity for high-risk sources and suspicious uploads." checked={strictMode} onChange={() => setStrictMode((prev) => !prev)} />
-            <ToggleRow title="Auto-sync global database" description="Keep threat fingerprints and moderation policies aligned automatically." checked={autoSync} onChange={() => setAutoSync((prev) => !prev)} />
-          </div>
+          {!settingsLoaded ? (
+            <div style={{ padding: "16px 0", color: "#94a3b8", fontSize: 14 }}>Loading settings…</div>
+          ) : (
+            <>
+              <div className={styles.toggleList}>
+                <ToggleRow title="Analyst review" description="Require a human reviewer for inconclusive or sensitive detections." checked={analystReview} onChange={() => toggle("analyst_review", setAnalystReview, analystReview)} />
+                <ToggleRow title="Notifications" description="Notify operators about detections, policy events, and sync issues." checked={notifications} onChange={() => toggle("notifications", setNotifications, notifications)} />
+                <ToggleRow title="Strict mode" description="Increase sensitivity for high-risk sources and suspicious uploads." checked={strictMode} onChange={() => toggle("strict_mode", setStrictMode, strictMode)} />
+                <ToggleRow title="Auto-sync global database" description="Keep threat fingerprints and moderation policies aligned automatically." checked={autoSync} onChange={() => toggle("auto_sync", setAutoSync, autoSync)} />
+              </div>
 
-          <div className={styles.sliderBlock}>
-            <div className={styles.sliderHeader}>
-              <strong>Auto-block threshold</strong>
-              <span>{threshold}%</span>
-            </div>
-            <input type="range" min="50" max="99" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} className={styles.range} />
-            <div className={styles.sliderFoot}>
-              <span>Cautious</span>
-              <span>Aggressive</span>
-            </div>
-          </div>
+              <div className={styles.sliderBlock}>
+                <div className={styles.sliderHeader}>
+                  <strong>Auto-block threshold</strong>
+                  <span>{threshold}%</span>
+                </div>
+                <input type="range" min="50" max="99" value={threshold} onChange={handleThresholdChange} onMouseUp={handleThresholdCommit} onTouchEnd={handleThresholdCommit} className={styles.range} />
+                <div className={styles.sliderFoot}>
+                  <span>Cautious</span>
+                  <span>Aggressive</span>
+                </div>
+              </div>
+            </>
+          )}
         </article>
 
         <article className={`${layout.settingCard} ${styles.settingPanel}`}>
@@ -154,49 +246,54 @@ export default function Settings() {
         <article className={`${layout.settingCard} ${styles.settingPanel}`}>
           <div className={layout.panelHeader}>
             <div>
-              <div className={layout.panelTitle}>Connected Extensions</div>
-              <div className={layout.panelSub}>Manage browser extensions linked to your portal account</div>
+              <div className={layout.panelTitle}>Connected Extension</div>
+              <div className={layout.panelSub}>The browser extension linked to your portal account</div>
             </div>
-            <span className={layout.pill}><LinkIcon className={styles.smallIcon} />{devices.filter((item) => item.is_active).length} active</span>
+            <span className={layout.pill}><LinkIcon className={styles.smallIcon} />{activeDevice ? "1 connected" : "disconnected"}</span>
           </div>
 
           <div className={styles.extensionBanner}>
             <CheckIcon className={styles.themeIcon} />
             <div>
-              <strong>One-time secure linking</strong>
-              <p>Users sign in on the portal once, approve the extension connection, and future captures are saved under the correct account automatically.</p>
+              <strong>Secure linking</strong>
+              <p>When you connect the extension to your portal, background captures sync securely to your account. Only one active extension link is permitted at a time; new links automatically disconnect older ones.</p>
             </div>
           </div>
 
           {devicesLoading ? (
-            <div className={styles.emptyBox}>Loading linked extensions…</div>
+            <div className={styles.emptyBox}>Checking connection status…</div>
           ) : devicesError ? (
             <div className={styles.errorBox}>{devicesError}</div>
-          ) : devices.length === 0 ? (
-            <div className={styles.emptyBox}>No linked extensions yet. Open the browser extension popup and click <strong>Connect to Portal</strong>.</div>
+          ) : !activeDevice ? (
+            <div className={styles.emptyBox}>
+              <p style={{marginBottom: 12}}>No browser extension connected.</p>
+              <button 
+                onClick={() => window.postMessage({ type: "A2U_PORTAL_CONNECT" }, "*")}
+                style={{ background: "var(--primary)", color: "white", padding: "8px 16px", borderRadius: 8, border: "none", fontWeight: 600, cursor: "pointer"}}
+              >
+                Connect Extension Automatically
+              </button>
+            </div>
           ) : (
             <div className={styles.deviceList}>
-              {devices.map((device) => (
-                <div key={device.id} className={styles.deviceCard}>
-                  <div>
-                    <strong>{device.device_name}</strong>
-                    <p>Version: {device.extension_version || "Unknown"}</p>
-                    <p>Linked: {device.created_at ? new Date(device.created_at).toLocaleString() : "Unknown"}</p>
-                    <p>Last seen: {device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : "No activity yet"}</p>
-                  </div>
-                  <div className={styles.deviceActions}>
-                    <span className={device.is_active ? styles.deviceActive : styles.deviceRevoked}>{device.is_active ? "Active" : "Revoked"}</span>
-                    {device.is_active ? (
-                      <button type="button" className={styles.revokeButton} onClick={() => revokeDevice(device.id)} disabled={revokingId === device.id}>
-                        {revokingId === device.id ? "Revoking…" : "Revoke"}
-                      </button>
-                    ) : null}
-                  </div>
+              <div key={activeDevice.id} className={styles.deviceCard}>
+                <div>
+                  <strong>{activeDevice.device_name}</strong>
+                  <p>Version: {activeDevice.extension_version || "Unknown"}</p>
+                  <p>Linked: {activeDevice.created_at ? formatDateTime(activeDevice.created_at) : "Unknown"}</p>
+                  <p>Last seen: {activeDevice.last_seen_at ? formatDateTime(activeDevice.last_seen_at) : "No activity yet"}</p>
                 </div>
-              ))}
+                <div className={styles.deviceActions}>
+                  <span className={styles.deviceActive}>Active</span>
+                  <button type="button" className={styles.revokeButton} onClick={() => revokeDevice(activeDevice.id)} disabled={revokingId === activeDevice.id}>
+                    {revokingId === activeDevice.id ? "Disconnecting…" : "Disconnect"}
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </article>
+
 
         <article className={`${layout.settingCard} ${styles.settingPanel}`}>
           <div className={layout.panelHeader}>

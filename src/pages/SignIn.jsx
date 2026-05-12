@@ -1,14 +1,17 @@
 import React, { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import AuthLayout from "../components/AuthLayout";
 import form from "../shared/AuthForm.module.css";
-import { loginUser } from "../api/auth";
+import { loginUser, saveSession } from "../api/auth";
 import { getDeviceId } from "../utils/devices";
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
 
 export default function SignIn() {
   const nav = useNavigate();
+  const location = useLocation();
+  const notice = location.state?.notice || "";
+
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPw, setShowPw] = useState(false);
@@ -38,9 +41,12 @@ export default function SignIn() {
         return;
       }
 
-      // trusted device -> direct login
-      localStorage.setItem("token", result.token);
-      localStorage.setItem("user", JSON.stringify(result.user));
+      // Admin-provisioned accounts must set a permanent password first
+      saveSession(result.token, result.user, result.role);
+      if (result.must_change_password) {
+        nav("/change-password", { replace: true });
+        return;
+      }
       nav("/dashboard", { replace: true });
 
     } catch (err) {
@@ -61,6 +67,7 @@ export default function SignIn() {
 
   return (
     <AuthLayout title="Sign In" subtitle="Enter your email and password to sign in">
+      {notice && <div style={{ background: "#052e16", border: "1px solid #22c55e", color: "#86efac", borderRadius: 8, padding: "10px 14px", marginBottom: 12, fontSize: 14 }}>{notice}</div>}
       {error ? <div style={{ color: "red", marginBottom: 12 }}>{error}</div> : null}
 
       <div className={form.socialGrid}>
@@ -110,6 +117,8 @@ export default function SignIn() {
             >
               {showPw ? "Hide" : "Show"}
             </button>
+          </div>
+          <div style={{ marginTop: 8 }}>
             <a href="/forgot-password" className={form.link}>Forgot password?</a>
           </div>
         </div>

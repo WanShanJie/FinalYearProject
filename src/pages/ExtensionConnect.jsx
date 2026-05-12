@@ -1,5 +1,6 @@
 import React from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { formatDateTime } from "../utils/formatDate";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./ExtensionConnect.module.css";
 import { LinkIcon, ShieldIcon, SyncIcon, CheckIcon } from "../components/system/SystemIcons";
@@ -112,7 +113,7 @@ export default function ExtensionConnect() {
                 <div className={styles.summaryRow}><span>Request ID</span><strong>{requestId}</strong></div>
                 <div className={styles.summaryRow}><span>Device</span><strong>{info?.device_name || "Chrome Extension"}</strong></div>
                 <div className={styles.summaryRow}><span>Version</span><strong>{info?.extension_version || "Unknown"}</strong></div>
-                <div className={styles.summaryRow}><span>Expires at</span><strong>{info?.expires_at ? new Date(info.expires_at).toLocaleString() : "Unknown"}</strong></div>
+                <div className={styles.summaryRow}><span>Expires at</span><strong>{info?.expires_at ? formatDateTime(info.expires_at) : "Unknown"}</strong></div>
               </div>
 
               {approved ? (

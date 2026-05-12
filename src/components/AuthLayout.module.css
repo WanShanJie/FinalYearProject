@@ -20,7 +20,7 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #fff;
+  background: #ffffff;
   padding: 40px 24px;
 }
 
@@ -44,19 +44,20 @@
   gap: 8px;
 }
 
-.backLink:hover { color: #334155; }
+.backLink:hover { color: #e2e8f0; }
 
 .title {
   margin: 0;
   font-size: 30px;
   font-weight: 600;
   letter-spacing: -0.2px;
+  color: #1e293b;
 }
 
 .subtitle {
   margin: 8px 0 0;
   font-size: 14px;
-  color: var(--muted);
+  color: #64748b;
 }
 
 .formSpace { margin-top: 24px; }

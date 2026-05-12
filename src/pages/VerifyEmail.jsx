@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import AuthLayout from "../components/AuthLayout";
 import form from "../shared/AuthForm.module.css";
-import { verifyEmailOtp } from "../api/auth";
+import { verifyEmailOtp, saveSession } from "../api/auth";
 import { getDeviceId } from "../utils/devices";
 
 export default function VerifyEmail() {
@@ -37,10 +37,19 @@ export default function VerifyEmail() {
         trust_device: true,
       });
 
-      localStorage.setItem("token", result.token);
-      localStorage.setItem("user", JSON.stringify(result.user));
       sessionStorage.removeItem("pending_verify_email");
 
+      if (result.approval_required) {
+        // Account verified but not yet approved — show message, don't issue token
+        setError("");
+        nav("/signin", {
+          replace: true,
+          state: { notice: result.message || "Email verified! Your account is pending admin approval." },
+        });
+        return;
+      }
+
+      saveSession(result.token, result.user, result.role);
       nav("/dashboard", { replace: true });
     } catch (err) {
       setError(err?.message || "Verification failed");

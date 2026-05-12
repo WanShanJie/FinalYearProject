@@ -369,8 +369,444 @@
   padding: 36px !important;
 }
 
+/* ── Historical metrics panel ─────────────────────── */
+.historyPanel {
+  border-radius: 18px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+  margin-bottom: 28px;
+}
+
+.historyHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.historyLeft {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.historyControls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.historyBody {
+  padding: 20px 20px 16px;
+}
+
+/* ── Segmented button group ───────────────────────── */
+.segmentGroup {
+  display: flex;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  overflow: hidden;
+}
+
+.segmentBtn {
+  padding: 6px 14px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+}
+
+.segmentBtn:hover {
+  background: var(--surface-3);
+  color: var(--text);
+}
+
+.segmentActive {
+  background: var(--primary) !important;
+  color: #fff !important;
+}
+
+/* ── Empty chart placeholder ──────────────────────── */
+.chartEmpty {
+  height: 220px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 0.9rem;
+  gap: 6px;
+  text-align: center;
+}
+
+/* ── Uptime bars ──────────────────────────────────── */
+.uptimeList {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.uptimeRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.uptimeLabel {
+  font-size: 0.83rem;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 120px;
+}
+
+.uptimePct {
+  font-size: 0.83rem;
+  font-weight: 700;
+  min-width: 48px;
+  text-align: right;
+}
+
+.tone_green  { color: var(--success); }
+.tone_amber  { color: var(--warning); }
+.tone_red    { color: var(--danger); }
+.tone_muted  { color: var(--muted); }
+
+/* ── Incident log ─────────────────────────────────── */
+.incidentHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.incidentTitle {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.incidentEmpty {
+  padding: 12px 0;
+  font-size: 0.85rem;
+}
+
+.incidentList {
+  display: grid;
+  gap: 10px;
+}
+
+.incidentRow {
+  display: flex;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.incidentActive {
+  border-color: rgba(239, 68, 68, 0.35);
+  background: rgba(239, 68, 68, 0.06);
+}
+
+.incidentBody {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+}
+
+.incidentService {
+  font-size: 0.86rem;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.incidentOngoing {
+  font-size: 0.72rem;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.incidentMeta {
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+/* ── Extension connectivity ───────────────────────── */
+.extSummary {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* Big status card */
+.extStatusBig {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+}
+
+.extStatusBig strong {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text);
+  display: block;
+  margin-bottom: 4px;
+}
+
+.extStatusBig p {
+  font-size: 0.82rem;
+  color: var(--muted);
+  margin: 0;
+  line-height: 1.5;
+}
+
+.extStatusBigDot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  margin-top: 3px;
+}
+
+.extStatusBigOnline  { border-color: rgba(34,197,94,0.3);  background: rgba(34,197,94,0.07);  }
+.extStatusBigIdle    { border-color: rgba(245,158,11,0.3); background: rgba(245,158,11,0.07); }
+.extStatusBigOffline { border-color: rgba(239,68,68,0.3);  background: rgba(239,68,68,0.07);  }
+.extStatusBigNone    { border-color: var(--border);        background: var(--surface-2);      }
+
+.extStatusBigOnline  .extStatusBigDot { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.extStatusBigIdle    .extStatusBigDot { background: var(--warning); box-shadow: 0 0 6px var(--warning); }
+.extStatusBigOffline .extStatusBigDot { background: var(--danger);  box-shadow: 0 0 6px var(--danger);  }
+.extStatusBigNone    .extStatusBigDot { background: var(--muted-2); }
+
+/* Detail rows */
+.extDetail {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.extDetailRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.83rem;
+}
+
+.extDetailRow span {
+  color: var(--muted);
+}
+
+.extDetailRow strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.extBadge {
+  display: inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.extOnline  { background: var(--success-soft); color: var(--success); }
+.extIdle    { background: var(--warning-soft); color: var(--warning); }
+.extOffline { background: var(--danger-soft);  color: var(--danger); }
+.extNever   { background: var(--surface-3);    color: var(--muted); }
+
+.extLegend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  font-size: 0.76rem;
+  color: var(--muted);
+  border-top: 1px solid var(--border);
+  margin-top: 4px;
+}
+
+/* ── Service health row ───────────────────────────── */
+.healthGrid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 28px;
+}
+
+.healthCard {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.healthOk   { border-color: rgba(34, 197, 94, 0.3); }
+.healthFail { border-color: rgba(239, 68, 68, 0.3); }
+
+.healthDot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.healthOk   .healthDot { background: var(--success); box-shadow: 0 0 6px var(--success); }
+.healthFail .healthDot { background: var(--danger);  box-shadow: 0 0 6px var(--danger); }
+
+.healthText {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.healthText strong {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.healthText span {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
+.healthStatus {
+  font-size: 0.74rem;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.healthOk   .healthStatus { background: var(--success-soft); color: var(--success); }
+.healthFail .healthStatus { background: var(--danger-soft);  color: var(--danger); }
+
+/* ── Resource gauges ──────────────────────────────── */
+.gaugeList {
+  display: grid;
+  gap: 20px;
+}
+
+.gaugeRow {
+  display: grid;
+  gap: 6px;
+}
+
+.gaugeMeta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.gaugeLabel {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.gaugeValue {
+  font-size: 0.84rem;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.gaugeSub {
+  font-size: 0.76rem;
+  color: var(--muted);
+}
+
+.gaugeTrack {
+  height: 8px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+
+.gaugeFill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.6s cubic-bezier(0.4, 0, 0.2, 1);
+  min-width: 3px;
+}
+
+.gaugeBarOk     { background: var(--success); }
+.gaugeBarWarn   { background: var(--warning); }
+.gaugeBarDanger { background: var(--danger); }
+
+/* ── Queue stats grid ─────────────────────────────── */
+.queueGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+.queueStat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 14px 8px;
+  border-radius: 12px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  text-align: center;
+}
+
+.queueWarn {
+  border-color: rgba(245, 158, 11, 0.4);
+  background: rgba(245, 158, 11, 0.07);
+}
+
+.queueNum {
+  font-size: 1.6rem;
+  font-weight: 900;
+  letter-spacing: -0.03em;
+  color: var(--text);
+  line-height: 1;
+}
+
+.queueWarn .queueNum { color: var(--warning); }
+
+.queueLabel {
+  font-size: 0.74rem;
+  font-weight: 600;
+  color: var(--muted);
+  text-align: center;
+}
+
 /* ── Responsive ───────────────────────────────────── */
 @media (max-width: 1100px) {
-  .kpiGrid   { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .rowSplit  { grid-template-columns: 1fr; }
+  .kpiGrid    { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .rowSplit   { grid-template-columns: 1fr; }
+  .healthGrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .queueGrid  { grid-template-columns: repeat(2, 1fr); }
 }

@@ -4,6 +4,7 @@ import layout from "../components/system/SystemLayout.module.css";
 import styles from "./MediaAnalysis.module.css";
 import { AlertIcon, ImageIcon } from "../components/system/SystemIcons";
 import { buildReasoning, getDisplayMetrics, getPolicyAction } from "./mediaAnalysisShared";
+import { formatDateTime } from "../utils/formatDate";
 
 function RiskRing({ riskScore, color }) {
   const radius = 40;
@@ -206,7 +207,7 @@ export default function MediaAnalysisDetail() {
             </div>
             <div className={styles.metadataGrid}>
               <MetaRow label="Type" value={item.meta?.media_type || "Unknown"} />
-              <MetaRow label="Captured" value={item.created_at ? new Date(item.created_at).toLocaleString() : "Unknown"} />
+              <MetaRow label="Captured" value={item.created_at ? formatDateTime(item.created_at) : "Unknown"} />
               <MetaRow label="Scan ID" value={item.id} />
               <MetaRow label="Frames" value={item.meta?.frame_count || "N/A"} />
               <MetaRow label="Mode" value={item.meta?.capture_mode || "N/A"} />

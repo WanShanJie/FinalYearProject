@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import AuthLayout from "../components/AuthLayout";
 import form from "../shared/AuthForm.module.css";
-import { verifyMfa } from "../api/auth";
+import { verifyMfa, saveSession } from "../api/auth";
 import { getDeviceId } from "../utils/devices";
 
 export default function MfaVerify() {
@@ -35,14 +35,22 @@ export default function MfaVerify() {
         trust_device: trustDevice,
       });
 
-      localStorage.setItem("token", result.token);
-      localStorage.setItem("user", JSON.stringify(result.user || {}));
+      // Clear MFA session data BEFORE saving the new session so that
+      // PublicOnly doesn't race with the nav("/dashboard") call.
       sessionStorage.removeItem("mfa_token");
       sessionStorage.removeItem("mfa_email");
 
+      saveSession(result.token, result.user || {}, result.role);
+
+      // Mirror the SignIn flow: force-change password if required
+      if (result.must_change_password) {
+        nav("/change-password", { replace: true });
+        return;
+      }
+
       nav("/dashboard", { replace: true });
     } catch (err) {
-      setError(err?.response?.data?.detail || "Invalid code.");
+      setError(err?.message || err?.response?.data?.detail || "Invalid code.");
     } finally {
       setLoading(false);
     }

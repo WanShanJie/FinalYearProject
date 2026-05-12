@@ -15,15 +15,16 @@ from fastapi import FastAPI, Depends, HTTPException, Request, UploadFile, File, 
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer
-from sqlalchemy import or_, func
+from sqlalchemy import or_, func, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from starlette.middleware.sessions import SessionMiddleware
 from jose import jwt, JWTError
 
 from db import SessionLocal, engine, Base
-from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ModelRun, ExtensionLinkRequest, LinkedExtension, GlobalBlocklist
-from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn, SetRoleIn, AdminCreateUserIn, SetInitialPasswordIn, UpdateProfileIn
+from models import User, OAuthAccount, PasswordReset, MfaChallenge, EmailVerification, TrustedDevice, MediaAnalysis, ModelRun, ExtensionLinkRequest, LinkedExtension, GlobalBlocklist, SystemMetricSnapshot
+from schemas import RegisterIn, LoginIn, UserOut, ForgotPasswordIn, ResetPasswordIn, MfaVerifyIn, VerifyEmailOtpIn, ExtensionLinkRequestIn, ExtensionLinkApproveIn, ExtensionLinkRedeemIn, SetRoleIn, AdminCreateUserIn, SetInitialPasswordIn, UpdateProfileIn, UserSettingsIn
 from auth import hash_password, verify_password, create_token, create_extension_token
 from oauth_routes import router as oauth_router
 from password_reset import make_reset_token, hash_token, expires_at_dt
@@ -45,6 +46,96 @@ import os as _os
 # Force UTF-8 output so AltFreezing's logger doesn't crash on Windows
 _os.environ.setdefault("PYTHONUTF8", "1")
 from scripts import altfreezing_service
+
+# ── Metrics background collector ──────────────────────────────────────────────
+import threading as _threading
+
+def _metrics_collector_loop():
+    """Daemon thread: snapshot system metrics into DB every 60 s."""
+    import time as _time
+    import psutil as _psutil
+    import redis as _redis_lib
+
+    _time.sleep(10)  # let uvicorn finish starting before first snapshot
+    while True:
+        try:
+            cpu  = _psutil.cpu_percent(interval=1)
+            mem  = _psutil.virtual_memory()
+            try:
+                disk = _psutil.disk_usage(_os.path.abspath("/"))
+            except Exception:
+                disk = _psutil.disk_usage(_os.getcwd())
+
+            q_depth  = 0
+            _redis_ok = False
+            try:
+                _rc = _redis_lib.from_url(_os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=2)
+                _rc.ping()
+                _redis_ok = True
+                q_depth = _rc.llen("deepfake") or 0
+            except Exception:
+                pass
+
+            a_tasks    = 0
+            _worker_ok = False
+            try:
+                if _CELERY_AVAILABLE and _celery_app:
+                    _insp = _celery_app.control.inspect(timeout=1)
+                    _ping = _insp.ping() or {}
+                    _worker_ok = len(_ping) > 0
+                    if _worker_ok:
+                        _am    = _insp.active() or {}
+                        a_tasks = sum(len(v) for v in _am.values())
+            except Exception:
+                pass
+
+            db = SessionLocal()
+            try:
+                _db_ok = False
+                try:
+                    db.execute(text("SELECT 1"))
+                    _db_ok = True
+                except Exception:
+                    pass
+
+                cutoff = datetime.utcnow() - timedelta(minutes=10)
+                stuck = db.query(func.count(MediaAnalysis.id)).filter(
+                    MediaAnalysis.status.in_(["PENDING", "PROCESSING"]),
+                    MediaAnalysis.created_at < cutoff,
+                ).scalar() or 0
+
+                db.add(SystemMetricSnapshot(
+                    recorded_at  = datetime.utcnow(),
+                    cpu_pct      = round(cpu, 1),
+                    ram_pct      = round(mem.percent, 1),
+                    ram_used_gb  = round(mem.used / 1024**3, 2),
+                    disk_pct     = round(disk.percent, 1),
+                    disk_used_gb = round(disk.used / 1024**3, 2),
+                    queue_depth  = q_depth,
+                    active_tasks = a_tasks,
+                    stuck_jobs   = stuck,
+                    redis_ok     = _redis_ok,
+                    worker_ok    = _worker_ok,
+                    db_ok        = _db_ok,
+                ))
+                db.commit()
+
+                # Prune snapshots older than 7 days to keep table small
+                prune_before = datetime.utcnow() - timedelta(days=7)
+                db.query(SystemMetricSnapshot).filter(
+                    SystemMetricSnapshot.recorded_at < prune_before
+                ).delete(synchronize_session=False)
+                db.commit()
+            finally:
+                db.close()
+        except Exception as _me:
+            print(f"[MetricsCollector] Error: {_me}")
+
+        _time.sleep(59)  # ~60 s between snapshots
+
+_metrics_thread = _threading.Thread(target=_metrics_collector_loop, daemon=True, name="metrics-collector")
+_metrics_thread.start()
+print("[Startup] Metrics collector started — snapshot every 60 s")
 from scripts.altfreezing_config import SEQUENCE_LENGTH as ALT_ANALYSIS_SEQUENCE_LENGTH
 from scripts import wav2lip_service
 from scripts import vit_service
@@ -128,6 +219,21 @@ def require_admin(current_user: User = Depends(get_current_user)):
     return current_user
 
 
+# Role hierarchy: ADMIN > ANALYST > VIEWER
+# VIEWER can only read existing results.
+# ANALYST can submit analyses, manage blocklist, view results.
+# ADMIN has full access including user management and monitoring.
+_ANALYST_ROLES = {"ADMIN", "ANALYST"}
+
+def require_analyst(current_user: User = Depends(get_current_user)):
+    """Dependency: raises HTTP 403 if role is VIEWER (read-only)."""
+    role = getattr(current_user, "role", "USER") or "USER"
+    # Legacy USER accounts are treated as ANALYST (full non-admin access)
+    if role not in _ANALYST_ROLES and role != "USER":
+        raise HTTPException(status_code=403, detail="Analyst access required. Your account is read-only.")
+    return current_user
+
+
 def get_portal_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
@@ -208,19 +314,41 @@ class _StageTimer:
 # Adds an X-Process-Time header (ms) to every response — visible in DevTools
 # Network tab without any extra tooling. Also logs to stdout.
 
+_api_request_log: list = []   # in-memory ring buffer, max 500 entries
+_API_LOG_MAX = 500
+
 @app.middleware("http")
 async def _request_timing_middleware(request: Request, call_next):
     t0 = time.perf_counter()
     response = await call_next(request)
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 1)
     response.headers["X-Process-Time-Ms"] = str(elapsed_ms)
-    # Skip high-frequency polling endpoints to avoid log spam
-    _path = request.url.path
-    _is_status_poll = _path.endswith("/status") and request.method == "GET"
-    _is_blocklist    = "/api/blocklist/" in _path and request.method == "GET"
-    if not _is_status_poll and not _is_blocklist:
+    _path   = request.url.path
+    _method = request.method
+    _status = response.status_code
+
+    _MONITORING_POLL_PATHS = {
+        "/api/admin/health", "/api/admin/metrics/history", "/api/admin/downtime",
+        "/api/admin/traffic", "/api/admin/pipeline", "/api/admin/infra",
+        "/api/admin/model-analytics", "/api/admin/stats", "/api/admin/logs",
+    }
+    _skip = (
+        (_path.endswith("/status") and _method == "GET") or
+        ("/api/blocklist/" in _path and _method == "GET") or
+        (_path in _MONITORING_POLL_PATHS and _method == "GET")
+    )
+    if not _skip:
+        _api_request_log.append({
+            "ts":     datetime.utcnow().isoformat() + "Z",
+            "method": _method,
+            "path":   _path,
+            "status": _status,
+            "ms":     elapsed_ms,
+        })
+        if len(_api_request_log) > _API_LOG_MAX:
+            _api_request_log.pop(0)
         if "/api/analysis/" in _path or "/api/admin/" in _path or "/api/capture" in _path:
-            print(f"[Perf][API] {request.method} {_path} → {response.status_code}  {elapsed_ms} ms")
+            print(f"[Perf][API] {_method} {_path} → {_status}  {elapsed_ms} ms")
     return response
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -595,8 +723,8 @@ def _get_verdict_thresholds(
     temporal_diversity: Optional[float],
 ) -> tuple:
     """Return (fake_threshold, real_threshold) adjusted for video context."""
-    fake_threshold = 0.75
-    real_threshold = 0.43
+    fake_threshold = 0.80
+    real_threshold = 0.69
 
     # Small face or unstable track — model predictions are unreliable
     if avg_blur < 30 or avg_iou < 0.50:
@@ -729,8 +857,8 @@ def fuse_decision(
     vit_fake_score,
     xception_fake_score=None,
     vit_score_std=None,
-    fake_threshold: float = 0.75,
-    real_threshold: float = 0.43,
+    fake_threshold: float = 0.80,
+    real_threshold: float = 0.69,
     xception_confused: bool = False,
 ):
     alt_score = _clamp01(altfreezing_score)
@@ -745,10 +873,10 @@ def fuse_decision(
     # temporal_diversity below.  Xception receives more weight as a spatial anchor.
     # Wav2Lip is only useful for lip-sync attacks — face-swaps keep original audio so
     # a "synced" reading carries no exculpatory value.
-    alt_weight = 0.35       # reduced from 0.45 — browser JPEG artefacts bias AltFreezing high
-    wav_weight = 0.05
-    vit_weight = 0.20
-    xception_weight = 0.40  # raised from 0.30 — more stable spatial anchor
+    alt_weight = 0.40       # Increased for balanced temporal weighting
+    wav_weight = 0.10       # Increased for audio signal impact
+    vit_weight = 0.10       # Reduced to secondary verification
+    xception_weight = 0.40  # Balanced spatial anchor
 
     # Wav2Lip: only treat OUT-OF-SYNC as a positive manipulation signal.
     # A synced result is neutral, not evidence of real — face-swap deepfakes always
@@ -1267,12 +1395,18 @@ def _delete_analysis_records(db: Session, analyses: List[MediaAnalysis], user_id
 
 def _issue_user_token(user: User) -> dict:
     role = getattr(user, "role", "USER") or "USER"
-    token = create_token(user.id, user.email, role)
+    m_password = bool(getattr(user, "must_change_password", False))
+    token = create_token(user.id, user.email, role, m_password)
     return {
         "token": token,
         "role": role,
-        "must_change_password": bool(getattr(user, "must_change_password", False)),
-        "user": UserOut(id=user.id, email=user.email, first_name=user.first_name, last_name=user.last_name),
+        "must_change_password": m_password,
+        "user": {
+            "id": user.id,
+            "email": user.email,
+            "first_name": user.first_name,
+            "last_name": user.last_name
+        }
     }
 
 def _create_or_refresh_trusted_device(db: Session, user_id: int, device_id: str) -> None:
@@ -1283,6 +1417,8 @@ def _create_or_refresh_trusted_device(db: Session, user_id: int, device_id: str)
     now = _utcnow()
     expires = now + timedelta(days=TRUST_DEVICE_DAYS)
 
+    # Always look up by (user_id, device_hash) — regardless of expiry.
+    # An expired-but-present row must be UPDATED, not re-inserted (unique constraint).
     existing = (
         db.query(TrustedDevice)
         .filter(TrustedDevice.user_id == user_id, TrustedDevice.device_hash == device_hash)
@@ -1290,18 +1426,33 @@ def _create_or_refresh_trusted_device(db: Session, user_id: int, device_id: str)
         .first()
     )
 
-    if existing and existing.trusted_until and existing.trusted_until > now:
+    if existing:
+        # Always refresh the expiry — even if the row is currently expired.
         existing.trusted_until = expires
         db.commit()
         return
 
+    # No row at all — insert a new one.
     td = TrustedDevice(
         user_id=user_id,
         device_hash=device_hash,
         trusted_until=expires,
     )
-    db.add(td)
-    db.commit()
+    try:
+        db.add(td)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # Narrow race: another request inserted between our SELECT and INSERT.
+        # Retry the update path.
+        existing = (
+            db.query(TrustedDevice)
+            .filter(TrustedDevice.user_id == user_id, TrustedDevice.device_hash == device_hash)
+            .first()
+        )
+        if existing:
+            existing.trusted_until = expires
+            db.commit()
 
 
 def _is_trusted_device(db: Session, user_id: int, device_id: str) -> bool:
@@ -1346,8 +1497,14 @@ app.add_middleware(
 
 app.add_middleware(
     CORSMiddleware,
-    # allow_origins=[os.getenv("FRONTEND_BASE_URL", "http://localhost:5173")],
-    allow_origins=["*"],  # dev only
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1385,9 +1542,9 @@ def register(data: RegisterIn, db: Session = Depends(get_db)):
         privacy_version=data.privacy_version or PRIVACY_VERSION,
         email_verified=False,
         email_verified_at=None,
-        # Closed-access: all new users are pending admin approval
+        # Open access: all new users are immediately approved
         role="USER",
-        is_approved=False,
+        is_approved=True,
     )
     db.add(user)
     db.commit()
@@ -1415,9 +1572,6 @@ def verify_email_otp(data: VerifyEmailOtpIn, request: Request, db: Session = Dep
 
     # If already verified, issue a token only if the account is approved
     if getattr(user, "email_verified", False):
-        if not getattr(user, "is_approved", False):
-            return {"approval_required": True, "email": user.email,
-                    "message": "Email already verified. Your account is pending admin approval."}
         if data.trust_device and data.device_id:
             _create_or_refresh_trusted_device(db, user.id, data.device_id)
         return _issue_user_token(user)
@@ -1446,11 +1600,8 @@ def verify_email_otp(data: VerifyEmailOtpIn, request: Request, db: Session = Dep
     if data.trust_device and data.device_id:
         _create_or_refresh_trusted_device(db, user.id, data.device_id)
 
-    # Only issue a JWT if the account is already approved (e.g. bootstrap admin).
-    # Normal new users are is_approved=False — return "pending approval" instead.
-    if not getattr(user, "is_approved", False):
-        return {"approval_required": True, "email": user.email,
-                "message": "Email verified! Your account is pending admin approval. You will receive access once an administrator approves your request."}
+    # Issue JWT directly without waiting for admin approval
+    return _issue_user_token(user)
 
     return _issue_user_token(user)
 
@@ -1464,9 +1615,6 @@ def login(request: Request, data: LoginIn, db: Session = Depends(get_db)):
 
     # Google OAuth accounts: rely on Google (including their MFA if enabled)
     if getattr(user, "provider", "local") == "google":
-        # Check approval for OAuth users too
-        if not getattr(user, "is_approved", False):
-            raise HTTPException(status_code=403, detail="Your account is pending admin approval. Please wait for an administrator to approve your access.")
         return _issue_user_token(user)
 
     # Must verify email first (signup OTP)
@@ -1479,9 +1627,7 @@ def login(request: Request, data: LoginIn, db: Session = Depends(get_db)):
             raise HTTPException(status_code=500, detail=f"Failed to send verification email: {e}")
         return {"verification_required": True, "email": user.email, "message": "Email not verified. We sent a new verification code."}
 
-    # ── CLOSED ACCESS: block unapproved users ──────────────────────────────
-    if not getattr(user, "is_approved", False):
-        raise HTTPException(status_code=403, detail="Your account is pending admin approval. Please wait for an administrator to approve your access.")
+    # ── OPEN ACCESS ──────────────────────────────
 
     # Trusted device? -> no OTP needed
     if _is_trusted_device(db, user.id, data.device_id):
@@ -1545,9 +1691,6 @@ def verify_mfa(request: Request, data: MfaVerifyIn, db: Session = Depends(get_db
     user = db.query(User).filter(User.id == challenge.user_id).first()
     if not user:
         raise HTTPException(status_code=400, detail="User not found")
-
-    if not getattr(user, "is_approved", False):
-        raise HTTPException(status_code=403, detail="Your account is pending admin approval.")
 
     challenge.consumed_at = now
     db.commit()
@@ -1858,6 +2001,16 @@ def revoke_current_extension_device(
     device.revoked_at = _utcnow()
     db.commit()
     return {"ok": True, "message": "Extension disconnected"}
+
+
+@app.post("/api/extension/heartbeat")
+def extension_heartbeat(current_user: User = Depends(get_current_user)):
+    """
+    Lightweight keepalive called by the service worker every 2 minutes.
+    The get_current_user dependency already updates last_seen_at on every
+    authenticated call, so this endpoint just needs to exist and return ok.
+    """
+    return {"ok": True}
 
 
 def _decide_altfreezing_verdict(score: Optional[float], quality_gate: dict, alt_result: dict) -> dict:
@@ -2527,21 +2680,11 @@ def _combine_model_signals(
     UNCONDITIONAL_REAL_REASONS = {
         "excellent_track_static_real_override",
     }
-    # Rules that set a SUSPICIOUS floor — fuse cannot go below SUSPICIOUS
-    SUSPICIOUS_FLOOR_REASONS = {
-        "decent_diversity_elevated_alt_score",      # Rule 5.5 — motion + high AltFreezing
-        "track_instability_face_jump_detected",     # Rule 1   — face jump detected
-        "high_score_but_weak_evidence",             # Rule 7
-        "high_score_downgraded_to_suspicious",      # Rule 7 variant
-        "elevated_score_on_weak_quality_sequence",  # Rule 8
-    }
-
     rule_reason = visual_decision.get("reason", "")
     rule_verdict = visual_decision.get("final_verdict", "INCONCLUSIVE")
 
     rule_is_unconditional_real  = rule_verdict == "REAL" and rule_reason in UNCONDITIONAL_REAL_REASONS
     rule_is_definitive_real     = rule_verdict == "REAL" and rule_reason in DEFINITIVE_REAL_REASONS
-    rule_sets_suspicious_floor  = rule_verdict in {"SUSPICIOUS", "FAKE"} and rule_reason in SUSPICIOUS_FLOOR_REASONS
 
     verdict = fused["verdict"]
     combined_reason = "weighted_fusion"
@@ -2555,9 +2698,6 @@ def _combine_model_signals(
     elif rule_is_definitive_real and fused["verdict"] != "FAKE":
         verdict = "REAL"
         combined_reason = f"rule_override_{rule_reason}"
-    elif rule_sets_suspicious_floor and fused["verdict"] == "REAL":
-        verdict = "SUSPICIOUS"
-        combined_reason = f"rule_floor_{rule_reason}"
     elif low_temporal_diversity:
         combined_reason = "weighted_fusion_low_temporal_diversity"
     elif single_window or flat_alt_predictions:
@@ -2659,7 +2799,7 @@ async def video_analysis(
     platform: Optional[str] = Form(None),
     page_url: Optional[str] = Form(None),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_analyst),
 ):
     """
     Accept a video file upload and enqueue it for background processing.
@@ -2858,7 +2998,7 @@ async def capture_analysis(
     request: Request,
     meta: str = Form(...),
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_analyst),
 ):
     form_data = await request.form()
     files = form_data.getlist("files")
@@ -3279,7 +3419,16 @@ async def capture_analysis(
     _t.mark("fusion_decision")
 
     analysis.score = float(decision.get("score")) if decision.get("score") is not None else 0.0
-    analysis.verdict = decision["final_verdict"]
+    
+    user = db.query(User).filter(User.id == analysis.user_id).first()
+    settings = user.settings if user and user.settings else _SETTINGS_DEFAULTS
+    if settings.get("strict_mode", False) and decision.get("final_verdict", "").upper() == "SUSPICIOUS":
+        analysis.verdict = "SUSPICIOUS"
+        final_status = "PENDING_REVIEW"
+    else:
+        analysis.verdict = decision["final_verdict"]
+        final_status = "DONE"
+        
     meta_data["altfreezing"] = alt_result
     meta_data["decision"] = decision
     analysis.meta = meta_data
@@ -3293,7 +3442,7 @@ async def capture_analysis(
         xception_result=xception_result,
         wav2lip_result=wav2lip_result,
     )
-    _finalize_analysis_log(db, analysis, start_time, status="DONE")
+    _finalize_analysis_log(db, analysis, start_time, status=final_status)
     _t.mark("db_write")
 
     # Auto-insert into global blocklist when result meets the risk threshold
@@ -3332,11 +3481,18 @@ BLOCKLIST_RISK_THRESHOLD = int(os.getenv("BLOCKLIST_RISK_THRESHOLD", "70"))
 
 def _maybe_insert_blocklist(analysis: MediaAnalysis, db: Session):
     """Insert into global_blocklist only when the result is strong enough."""
+    user = db.query(User).filter(User.id == analysis.user_id).first()
+    settings = user.settings if user and user.settings else _SETTINGS_DEFAULTS
+    auto_block = settings.get("auto_block", True)
+    if not auto_block:
+        return  # Auto-block disabled
+
+    risk_threshold = settings.get("threshold", BLOCKLIST_RISK_THRESHOLD)
     score_pct = round(float(analysis.score or 0) * 100)
     verdict = (analysis.verdict or "").upper()
 
-    if verdict not in ("FAKE", "SUSPICIOUS") or score_pct < BLOCKLIST_RISK_THRESHOLD:
-        return  # Not strong enough — skip
+    if verdict not in ("FAKE", "SUSPICIOUS") or score_pct < risk_threshold:
+        return  # Not strong enough - skip
 
     # Build a stable fingerprint from what we know:
     # Prefer video_id (most stable), else hash of page_url
@@ -3536,6 +3692,14 @@ def check_blocklist(payload: dict, db: Session = Depends(get_db), current_user: 
     matched_hashes = set()
     matched_video_ids = set()
 
+    settings = current_user.settings if current_user and current_user.settings else _SETTINGS_DEFAULTS
+    if not settings.get("global_protection", True):
+        return {
+            "ok": True,
+            "matched_hashes": [],
+            "matched_video_ids": [],
+        }
+
     if hashes:
         rows = db.query(GlobalBlocklist.fingerprint_hash).filter(
             GlobalBlocklist.fingerprint_hash.in_(hashes),
@@ -3556,6 +3720,504 @@ def check_blocklist(payload: dict, db: Session = Depends(get_db), current_user: 
         "matched_video_ids": list(matched_video_ids),
     }
 # --- Monitoring & Admin API -------------------------------------------------
+
+@app.get("/api/admin/infra")
+def get_infra(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
+    """Tab 1 — Infrastructure & Hardware: current snapshot + uptime % per service."""
+    import psutil, redis as _redis
+    cpu  = psutil.cpu_percent(interval=0.5)
+    mem  = psutil.virtual_memory()
+    try:
+        disk = psutil.disk_usage("/")
+    except Exception:
+        disk = psutil.disk_usage(os.getcwd())
+
+    redis_ok = worker_ok = db_ok = False
+    redis_mem_mb = redis_clients = None
+    queue_depth = active_tasks = 0
+    try:
+        _r = _redis.from_url(os.getenv("REDIS_URL","redis://localhost:6379/0"), socket_connect_timeout=2)
+        _r.ping(); redis_ok = True
+        _ri = _r.info("memory"); redis_mem_mb = round(_ri.get("used_memory",0)/1024/1024,1)
+        _rc = _r.info("clients"); redis_clients = _rc.get("connected_clients",0)
+        queue_depth = _r.llen("deepfake") or 0
+    except Exception: pass
+    try:
+        if _CELERY_AVAILABLE and _celery_app:
+            _insp = _celery_app.control.inspect(timeout=2)
+            _ping = _insp.ping() or {}
+            worker_ok = len(_ping) > 0
+            if worker_ok:
+                _am = _insp.active() or {}
+                active_tasks = sum(len(v) for v in _am.values())
+    except Exception: pass
+    try:
+        db.execute(text("SELECT 1")); db_ok = True
+    except Exception: pass
+
+    # Uptime % from last 24 h of snapshots
+    since_24h = datetime.utcnow() - timedelta(hours=24)
+    snaps = db.query(SystemMetricSnapshot).filter(SystemMetricSnapshot.recorded_at >= since_24h).all()
+    def _up(attr):
+        vals = [getattr(s,attr) for s in snaps if getattr(s,attr) is not None]
+        return round(sum(vals)/len(vals)*100,1) if vals else None
+
+    return {"ok": True, "current": {
+        "cpu_pct": round(cpu,1), "ram_pct": round(mem.percent,1),
+        "ram_used_gb": round(mem.used/1024**3,1), "ram_total_gb": round(mem.total/1024**3,1),
+        "disk_pct": round(disk.percent,1), "disk_used_gb": round(disk.used/1024**3,1),
+        "disk_total_gb": round(disk.total/1024**3,1),
+        "redis": {"ok": redis_ok, "mem_mb": redis_mem_mb, "clients": redis_clients},
+        "worker": {"ok": worker_ok, "active_tasks": active_tasks},
+        "database": {"ok": db_ok},
+        "queue_depth": queue_depth,
+    }, "uptime_24h": {
+        "Redis Broker":   _up("redis_ok"),
+        "Celery Worker":  _up("worker_ok"),
+        "MySQL Database": _up("db_ok"),
+    }}
+
+
+@app.get("/api/admin/pipeline")
+def get_pipeline(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
+    """Tab 2 — Application & Pipeline: queue stats, job history, stuck jobs, incidents."""
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=10)
+
+    total   = db.query(func.count(MediaAnalysis.id)).scalar() or 0
+    done    = db.query(func.count(MediaAnalysis.id)).filter(MediaAnalysis.status=="DONE").scalar() or 0
+    failed  = db.query(func.count(MediaAnalysis.id)).filter(MediaAnalysis.status=="FAILED").scalar() or 0
+    pending = db.query(func.count(MediaAnalysis.id)).filter(MediaAnalysis.status.in_(["PENDING","PROCESSING"])).scalar() or 0
+    stuck   = db.query(func.count(MediaAnalysis.id)).filter(
+        MediaAnalysis.status.in_(["PENDING","PROCESSING"]), MediaAnalysis.created_at < cutoff).scalar() or 0
+    avg_time = db.query(func.avg(MediaAnalysis.processing_time)).filter(
+        MediaAnalysis.status=="DONE", MediaAnalysis.processing_time.isnot(None)).scalar() or 0
+
+    # Jobs per hour for last 24 h (bucketed)
+    since = now - timedelta(hours=24)
+    recent = db.query(MediaAnalysis).filter(MediaAnalysis.created_at >= since).all()
+    hourly: dict = {}
+    for r in recent:
+        if r.created_at:
+            h = r.created_at.replace(minute=0, second=0, microsecond=0)
+            key = h.isoformat() + "Z"
+            if key not in hourly:
+                hourly[key] = {"ts": key, "total": 0, "done": 0, "failed": 0}
+            hourly[key]["total"] += 1
+            if r.status == "DONE":   hourly[key]["done"]   += 1
+            if r.status == "FAILED": hourly[key]["failed"] += 1
+    throughput = sorted(hourly.values(), key=lambda x: x["ts"])
+
+    # Incidents from snapshots (last 24 h)
+    snaps = db.query(SystemMetricSnapshot).filter(
+        SystemMetricSnapshot.recorded_at >= since).order_by(SystemMetricSnapshot.recorded_at).all()
+    def _incidents(attr, svc):
+        out, in_out, start = [], False, None
+        for s in snaps:
+            v = getattr(s, attr)
+            if v is None: continue
+            if not v and not in_out: in_out, start = True, s.recorded_at
+            elif v and in_out:
+                in_out = False
+                out.append({"service": svc, "started_at": start.isoformat()+"Z",
+                            "ended_at": s.recorded_at.isoformat()+"Z",
+                            "duration_s": int((s.recorded_at-start).total_seconds()), "resolved": True})
+        if in_out and start:
+            out.append({"service": svc, "started_at": start.isoformat()+"Z",
+                        "ended_at": None, "duration_s": int((now-start).total_seconds()), "resolved": False})
+        return out
+    incidents = _incidents("worker_ok","Celery Worker") + _incidents("redis_ok","Redis Broker") + _incidents("db_ok","MySQL Database")
+    incidents.sort(key=lambda i:(i["resolved"], i["started_at"]), reverse=True)
+
+    # Extension last-seen
+    exts = db.query(LinkedExtension).filter(
+        LinkedExtension.is_active==True, LinkedExtension.revoked_at.is_(None)).all()
+    best = sorted([e for e in exts if e.last_seen_at], key=lambda e: e.last_seen_at, reverse=True)
+    ext_status = None
+    if best:
+        e = best[0]; age = int((now - e.last_seen_at).total_seconds()/60)
+        ext_status = {"device_name": e.device_name, "version": e.extension_version,
+                      "last_seen_at": e.last_seen_at.isoformat()+"Z", "age_minutes": age,
+                      "status": "online" if age<=5 else "idle" if age<=30 else "offline"}
+    elif exts:
+        ext_status = {"status": "never_seen", "device_name": exts[0].device_name,
+                      "version": exts[0].extension_version, "last_seen_at": None, "age_minutes": None}
+
+    return {"ok": True,
+        "jobs": {"total": total, "done": done, "failed": failed, "pending": pending,
+                 "stuck": stuck, "avg_processing_time": round(float(avg_time),2),
+                 "success_rate": round(done/total*100,1) if total else 0},
+        "throughput": throughput, "incidents": incidents, "extension": ext_status}
+
+
+@app.get("/api/admin/traffic")
+def get_traffic(current_user: User = Depends(require_admin)):
+    """Tab 3 — API & Traffic: request counts, error rate, latency, recent log."""
+    logs = list(_api_request_log)  # snapshot
+    total = len(logs)
+    if total == 0:
+        return {"ok": True, "summary": {"total": 0, "errors": 0, "error_rate": 0, "avg_ms": 0, "p95_ms": 0},
+                "by_path": [], "timeline": [], "recent": []}
+
+    errors    = sum(1 for l in logs if l["status"] >= 400)
+    latencies = sorted(l["ms"] for l in logs)
+    avg_ms    = round(sum(latencies)/len(latencies), 1)
+    p95_ms    = latencies[int(len(latencies)*0.95)]
+
+    # Group by path
+    path_map: dict = {}
+    for l in logs:
+        key = l["path"]
+        if key not in path_map:
+            path_map[key] = {"path": key, "count": 0, "errors": 0, "total_ms": 0}
+        path_map[key]["count"]    += 1
+        path_map[key]["total_ms"] += l["ms"]
+        if l["status"] >= 400: path_map[key]["errors"] += 1
+    by_path = sorted(path_map.values(), key=lambda x: x["count"], reverse=True)[:15]
+    for p in by_path:
+        p["avg_ms"] = round(p["total_ms"]/p["count"], 1)
+        del p["total_ms"]
+
+    # Requests per minute buckets (last 30 min)
+    now = datetime.utcnow()
+    rpm: dict = {}
+    for l in logs:
+        try:
+            dt = datetime.fromisoformat(l["ts"].rstrip("Z"))
+            if (now - dt).total_seconds() <= 1800:
+                key = dt.replace(second=0, microsecond=0).isoformat()+"Z"
+                rpm.setdefault(key, {"ts": key, "requests": 0, "errors": 0})
+                rpm[key]["requests"] += 1
+                if l["status"] >= 400: rpm[key]["errors"] += 1
+        except Exception: pass
+    timeline = sorted(rpm.values(), key=lambda x: x["ts"])
+
+    return {"ok": True,
+        "summary": {"total": total, "errors": errors,
+                    "error_rate": round(errors/total*100,1), "avg_ms": avg_ms, "p95_ms": p95_ms},
+        "by_path": by_path, "timeline": timeline,
+        "recent": list(reversed(logs))[:50]}
+
+
+@app.get("/api/admin/model-analytics")
+def get_model_analytics(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
+    """Tab 4 — AI Model Forensic Analytics: per-model stats, verdict distribution, confidence."""
+    # Per-model aggregates
+    model_names = ["altfreezing", "vit", "xception", "wav2lip"]
+    model_stats = []
+    for name in model_names:
+        runs = db.query(ModelRun).filter(ModelRun.model_name == name).all()
+        if not runs:
+            model_stats.append({"model": name, "total": 0, "done": 0, "failed": 0,
+                                 "avg_score": None, "verdict_counts": {}})
+            continue
+        done   = [r for r in runs if r.status == "DONE"]
+        failed = [r for r in runs if r.status == "FAILED"]
+        scores = [r.score for r in done if r.score is not None]
+        vcounts: dict = {}
+        for r in done:
+            if r.verdict: vcounts[r.verdict] = vcounts.get(r.verdict, 0) + 1
+        model_stats.append({
+            "model":          name,
+            "total":          len(runs),
+            "done":           len(done),
+            "failed":         len(failed),
+            "avg_score":      round(sum(scores)/len(scores),3) if scores else None,
+            "verdict_counts": vcounts,
+        })
+
+    # Overall verdict distribution
+    overall_verdicts = db.query(MediaAnalysis.verdict, func.count(MediaAnalysis.id))\
+        .filter(MediaAnalysis.status=="DONE").group_by(MediaAnalysis.verdict).all()
+    verdict_dist = {v: c for v, c in overall_verdicts if v}
+
+    # Platform × verdict breakdown
+    plat_rows = db.query(MediaAnalysis.platform, MediaAnalysis.verdict, func.count(MediaAnalysis.id))\
+        .filter(MediaAnalysis.status=="DONE")\
+        .group_by(MediaAnalysis.platform, MediaAnalysis.verdict).all()
+    plat_map: dict = {}
+    for plat, v, c in plat_rows:
+        p = plat or "Direct Upload"
+        plat_map.setdefault(p, {})
+        if v: plat_map[p][v] = c
+    platform_breakdown = [{"platform": k, **v} for k, v in plat_map.items()]
+
+    # Score distribution buckets (0-10%, 10-20%, ... 90-100%)
+    done_analyses = db.query(MediaAnalysis.score).filter(
+        MediaAnalysis.status=="DONE", MediaAnalysis.score.isnot(None)).all()
+    buckets = [0]*10
+    for (s,) in done_analyses:
+        idx = min(int(s*10), 9)
+        buckets[idx] += 1
+    score_dist = [{"range": f"{i*10}-{i*10+10}%", "count": buckets[i]} for i in range(10)]
+
+    # Detection trend last 7 days (daily)
+    since_7d = datetime.utcnow() - timedelta(days=7)
+    recent = db.query(MediaAnalysis).filter(
+        MediaAnalysis.status=="DONE", MediaAnalysis.created_at >= since_7d).all()
+    daily: dict = {}
+    for r in recent:
+        if r.created_at:
+            key = r.created_at.date().isoformat()
+            daily.setdefault(key, {"date": key, "total": 0, "fake": 0, "real": 0})
+            daily[key]["total"] += 1
+            v = (r.verdict or "").upper()
+            if v in ("FAKE","SUSPICIOUS"): daily[key]["fake"] += 1
+            elif v == "REAL":              daily[key]["real"] += 1
+    trend = sorted(daily.values(), key=lambda x: x["date"])
+
+    return {"ok": True, "model_stats": model_stats, "verdict_dist": verdict_dist,
+            "platform_breakdown": platform_breakdown, "score_dist": score_dist, "trend": trend}
+
+@app.get("/api/admin/health")
+def get_system_health(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
+    """Return real-time system health: Redis, Celery worker, DB, CPU/RAM/Disk, queue depth, stuck jobs."""
+    import psutil, redis as _redis
+
+    # ── Redis ──────────────────────────────────────────────────────────────────
+    redis_ok = False
+    redis_mem_mb = None
+    redis_clients = None
+    try:
+        _r = _redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=2)
+        _r.ping()
+        redis_ok = True
+        info = _r.info("memory")
+        redis_mem_mb = round(info.get("used_memory", 0) / 1024 / 1024, 1)
+        ci = _r.info("clients")
+        redis_clients = ci.get("connected_clients", 0)
+    except Exception:
+        pass
+
+    # ── Celery worker ──────────────────────────────────────────────────────────
+    worker_alive = False
+    queue_depth  = 0
+    active_tasks = 0
+    try:
+        if _CELERY_AVAILABLE and _celery_app:
+            insp = _celery_app.control.inspect(timeout=2)
+            ping_res = insp.ping() or {}
+            worker_alive = len(ping_res) > 0
+            # active tasks
+            active_map = insp.active() or {}
+            active_tasks = sum(len(v) for v in active_map.values())
+            # queue depth via Redis list length
+            _r2 = _redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"), socket_connect_timeout=2)
+            queue_depth = _r2.llen("deepfake") or 0
+    except Exception:
+        pass
+
+    # ── Database ───────────────────────────────────────────────────────────────
+    db_ok = False
+    try:
+        db.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        pass
+
+    # ── System resources ───────────────────────────────────────────────────────
+    cpu_pct  = psutil.cpu_percent(interval=0.2)
+    mem      = psutil.virtual_memory()
+    ram_pct  = mem.percent
+    ram_used_gb = round(mem.used / 1024**3, 1)
+    ram_total_gb = round(mem.total / 1024**3, 1)
+    disk     = psutil.disk_usage("/")
+    disk_pct = disk.percent
+    disk_used_gb  = round(disk.used  / 1024**3, 1)
+    disk_total_gb = round(disk.total / 1024**3, 1)
+
+    # ── Stuck jobs (PENDING/PROCESSING > 10 min) ───────────────────────────────
+    cutoff = _utcnow() - timedelta(minutes=10)
+    stuck_count = (
+        db.query(func.count(MediaAnalysis.id))
+        .filter(
+            MediaAnalysis.status.in_(["PENDING", "PROCESSING"]),
+            MediaAnalysis.created_at < cutoff,
+        )
+        .scalar() or 0
+    )
+
+    # ── Application counters ───────────────────────────────────────────────────
+    blocklist_count = db.query(func.count(GlobalBlocklist.id)).filter(GlobalBlocklist.status == "active").scalar() or 0
+    linked_ext_count = db.query(func.count(LinkedExtension.id)).filter(LinkedExtension.is_active == True).scalar() or 0
+
+    return {
+        "ok": True,
+        "health": {
+            "redis":       {"ok": redis_ok, "mem_mb": redis_mem_mb, "clients": redis_clients},
+            "worker":      {"ok": worker_alive, "active_tasks": active_tasks},
+            "queue_depth": queue_depth,
+            "database":    {"ok": db_ok},
+            "cpu_pct":     cpu_pct,
+            "ram":         {"pct": ram_pct, "used_gb": ram_used_gb, "total_gb": ram_total_gb},
+            "disk":        {"pct": disk_pct, "used_gb": disk_used_gb, "total_gb": disk_total_gb},
+            "stuck_jobs":  stuck_count,
+            "blocklist_count":  blocklist_count,
+            "linked_extensions": linked_ext_count,
+        },
+    }
+
+
+@app.get("/api/admin/downtime")
+def get_downtime(
+    range: str = "24h",
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Return downtime incidents derived from snapshot history + extension last-seen status.
+    An incident = consecutive snapshots where a service flag is False.
+    range: 24h | 7d
+    """
+    range_hours = {"24h": 24, "7d": 168}.get(range, 24)
+    since = datetime.utcnow() - timedelta(hours=range_hours)
+
+    rows = (
+        db.query(SystemMetricSnapshot)
+        .filter(SystemMetricSnapshot.recorded_at >= since)
+        .order_by(SystemMetricSnapshot.recorded_at.asc())
+        .all()
+    )
+
+    # ── Derive incidents per service ──────────────────────────────────────────
+    def _extract_incidents(snapshots, flag_attr, service_name):
+        incidents = []
+        in_outage  = False
+        outage_start = None
+        for snap in snapshots:
+            is_ok = getattr(snap, flag_attr)
+            if is_ok is None:
+                continue
+            if not is_ok and not in_outage:
+                in_outage    = True
+                outage_start = snap.recorded_at
+            elif is_ok and in_outage:
+                in_outage = False
+                duration_s = int((snap.recorded_at - outage_start).total_seconds())
+                incidents.append({
+                    "service":    service_name,
+                    "started_at": outage_start.isoformat() + "Z",
+                    "ended_at":   snap.recorded_at.isoformat() + "Z",
+                    "duration_s": duration_s,
+                    "resolved":   True,
+                })
+        # Still ongoing outage
+        if in_outage and outage_start:
+            duration_s = int((datetime.utcnow() - outage_start).total_seconds())
+            incidents.append({
+                "service":    service_name,
+                "started_at": outage_start.isoformat() + "Z",
+                "ended_at":   None,
+                "duration_s": duration_s,
+                "resolved":   False,
+            })
+        return incidents
+
+    incidents = []
+    incidents += _extract_incidents(rows, "redis_ok",  "Redis Broker")
+    incidents += _extract_incidents(rows, "worker_ok", "Celery Worker")
+    incidents += _extract_incidents(rows, "db_ok",     "MySQL Database")
+    # Sort: unresolved first, then most recent
+    incidents.sort(key=lambda i: (i["resolved"], i["started_at"]), reverse=True)
+
+    # ── Uptime % per service ──────────────────────────────────────────────────
+    def _uptime_pct(snapshots, flag_attr):
+        vals = [getattr(s, flag_attr) for s in snapshots if getattr(s, flag_attr) is not None]
+        if not vals:
+            return None
+        return round(sum(vals) / len(vals) * 100, 1)
+
+    uptime = {
+        "Redis Broker":   _uptime_pct(rows, "redis_ok"),
+        "Celery Worker":  _uptime_pct(rows, "worker_ok"),
+        "MySQL Database": _uptime_pct(rows, "db_ok"),
+    }
+
+    # ── Extension last-seen status ────────────────────────────────────────────
+    now = datetime.utcnow()
+    extensions = (
+        db.query(LinkedExtension)
+        .filter(LinkedExtension.is_active == True, LinkedExtension.revoked_at.is_(None))
+        .order_by(func.isnull(LinkedExtension.last_seen_at), LinkedExtension.last_seen_at.desc())
+        .all()
+    )
+    ext_status = []
+    for ext in extensions:
+        if ext.last_seen_at is None:
+            status = "never_seen"
+            age_min = None
+        else:
+            age_min = int((now - ext.last_seen_at).total_seconds() / 60)
+            if age_min <= 5:
+                status = "online"
+            elif age_min <= 30:
+                status = "idle"
+            else:
+                status = "offline"
+        ext_status.append({
+            "id":           ext.id,
+            "device_name":  ext.device_name,
+            "version":      ext.extension_version,
+            "last_seen_at": ext.last_seen_at.isoformat() + "Z" if ext.last_seen_at else None,
+            "age_minutes":  age_min,
+            "status":       status,
+        })
+
+    return {
+        "ok":        True,
+        "range":     range,
+        "incidents": incidents,
+        "uptime":    uptime,
+        "extensions": ext_status,
+        "snapshot_count": len(rows),
+    }
+
+
+@app.get("/api/admin/metrics/history")
+def get_metrics_history(
+    range: str = "1h",
+    start_ts: Optional[str] = None,
+    end_ts: Optional[str] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """Return time-series metric snapshots.
+    If start_ts and end_ts are provided, filter between those dates.
+    Otherwise, use the relative 'range' (15m | 1h | 6h | 24h).
+    """
+    query = db.query(SystemMetricSnapshot)
+    
+    if start_ts and end_ts:
+        try:
+            start = datetime.fromisoformat(start_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            end = datetime.fromisoformat(end_ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            query = query.filter(SystemMetricSnapshot.recorded_at.between(start, end))
+        except ValueError:
+            raise HTTPException(400, "Invalid timestamp format")
+    else:
+        range_minutes = {"15m": 15, "1h": 60, "6h": 360, "24h": 1440}.get(range, 60)
+        since = datetime.utcnow() - timedelta(minutes=range_minutes)
+        query = query.filter(SystemMetricSnapshot.recorded_at >= since)
+
+    rows = query.order_by(SystemMetricSnapshot.recorded_at.asc()).all()
+
+    return {
+        "ok":    True,
+        "range": range,
+        "data":  [
+            {
+                "ts":     r.recorded_at.isoformat() + "Z",
+                "cpu":    r.cpu_pct,
+                "ram":    r.ram_pct,
+                "disk":   r.disk_pct,
+                "queue":  r.queue_depth,
+                "active": r.active_tasks,
+                "stuck":  r.stuck_jobs,
+            }
+            for r in rows
+        ],
+    }
+
 
 @app.get("/api/admin/stats")
 def get_admin_stats(db: Session = Depends(get_db), current_user: User = Depends(require_admin)):
@@ -3680,6 +4342,7 @@ def list_users(
                 "role": getattr(u, "role", "USER") or "USER",
                 "is_approved": getattr(u, "is_approved", False),
                 "email_verified": getattr(u, "email_verified", False),
+                "must_change_password": getattr(u, "must_change_password", False),
                 "created_at": u.created_at.isoformat() if u.created_at else None,
             }
             for u in users
@@ -3732,13 +4395,15 @@ def set_user_role(
     target = db.query(User).filter(User.id == user_id).first()
     if not target:
         raise HTTPException(status_code=404, detail="User not found.")
+    allowed_roles = {"ADMIN", "ANALYST", "VIEWER", "USER"}
+    if data.role not in allowed_roles:
+        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {', '.join(sorted(allowed_roles))}")
     target.role = data.role
     # Promoting to ADMIN also ensures is_approved so the account can log in
     if data.role == "ADMIN":
         target.is_approved = True
     db.commit()
-    action = "promoted to ADMIN" if data.role == "ADMIN" else "demoted to USER"
-    return {"ok": True, "message": f"User {target.email} {action}."}
+    return {"ok": True, "message": f"User {target.email} role set to {data.role}."}
 
 
 @app.post("/api/admin/users/create")
@@ -3815,13 +4480,52 @@ def set_initial_password(
     current_user: User = Depends(get_current_user),
 ):
     """
-    Let an admin-provisioned user set their own permanent password.
-    Only callable when must_change_password=True on the account.
+    Allow any authenticated user to set a new permanent password.
+    Originally designed just for admin-provisioned accounts, now used universally by the profile panel.
     """
-    if not getattr(current_user, "must_change_password", False):
-        raise HTTPException(status_code=400, detail="Password change is not required for this account.")
-    current_user.password_hash = hash_password(data.new_password)
-    current_user.must_change_password = False
+    user = db.get(User, current_user.id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    user.password_hash = hash_password(data.new_password)
+    user.must_change_password = False
     db.commit()
-    # Re-issue token so the frontend session stays valid
-    return {**_issue_user_token(current_user), "ok": True, "message": "Password updated successfully."}
+    db.refresh(user)
+    # Re-issue token so the frontend session stays valid (with must_change_password=False)
+    return {**_issue_user_token(user), "ok": True, "message": "Password updated successfully."}
+
+
+# ── User Settings ─────────────────────────────────────────────────────────────
+
+_SETTINGS_DEFAULTS = {
+    "analyst_review":   True,
+    "notifications":    True,
+    "strict_mode":      False,
+    "auto_sync":        True,
+    "threshold":        85,
+    "auto_block":       True,
+    "global_protection": True,
+}
+
+
+@app.get("/api/settings")
+def get_settings(current_user: User = Depends(get_current_user)):
+    """Return the current user's persisted settings, merged with defaults."""
+    saved = current_user.settings or {}
+    merged = {**_SETTINGS_DEFAULTS, **saved}
+    return {"ok": True, "settings": merged}
+
+
+@app.put("/api/settings")
+def update_settings(
+    data: UserSettingsIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Persist user settings. Only supplied fields are updated (partial update)."""
+    existing = dict(current_user.settings or {})
+    patch = {k: v for k, v in data.model_dump().items() if v is not None}
+    existing.update(patch)
+    current_user.settings = existing
+    db.commit()
+    merged = {**_SETTINGS_DEFAULTS, **existing}
+    return {"ok": True, "settings": merged}

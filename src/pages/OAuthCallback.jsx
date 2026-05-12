@@ -1,5 +1,6 @@
 import React, { useEffect } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { saveSession } from "../api/auth";
 
 export default function OAuthCallback() {
   const nav = useNavigate();
@@ -20,8 +21,20 @@ export default function OAuthCallback() {
       return;
     }
 
-    localStorage.setItem("token", token);
-    // if backend also sends user JSON, you can parse it. For now token is enough.
+    // Parse user from URL params if backend sends it; otherwise just store token.
+    let userObj = null;
+    const userParam = params.get("user");
+    if (userParam) { try { userObj = JSON.parse(decodeURIComponent(userParam)); } catch { } }
+    saveSession(token, userObj);
+
+    // Check must_change_password in the JWT payload
+    try {
+      const payload = JSON.parse(atob(token.split(".")[1]));
+      if (payload.must_change_password) {
+        nav("/change-password", { replace: true });
+        return;
+      }
+    } catch { }
 
     nav("/dashboard", { replace: true });
   }, [nav, params]);

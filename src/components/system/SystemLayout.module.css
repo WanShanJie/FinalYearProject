@@ -345,6 +345,11 @@
     color: var(--text);
 }
 
+.selectControl option {
+    background-color: var(--bg);
+    color: var(--text);
+}
+
 .inputControl::placeholder {
     color: var(--muted-2);
 }

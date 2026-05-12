@@ -91,7 +91,7 @@ def run_video_analysis(
     import cv2 as _cv2
 
     from db import SessionLocal
-    from models import MediaAnalysis, ModelRun
+    from models import MediaAnalysis, ModelRun, User
     from opencv_pipeline import process_frames_for_sequence
     from scripts import altfreezing_service, vit_service, xception_service, wav2lip_service
     from scripts.altfreezing_config import SEQUENCE_LENGTH as ALT_SEQ_LEN
@@ -107,6 +107,7 @@ def run_video_analysis(
         _persist_model_runs,
         _maybe_insert_blocklist,
         _prune_analysis_uploads,
+        _SETTINGS_DEFAULTS,
     )
     # ──────────────────────────────────────────────────────────────────────────
 
@@ -382,7 +383,16 @@ def run_video_analysis(
         _update(self, "saving")
 
         analysis.score   = float(combined_decision.get("score") or 0.0)
-        analysis.verdict = combined_decision["final_verdict"]
+        
+        user = db.query(User).filter(User.id == analysis.user_id).first()
+        settings = user.settings if user and user.settings else _SETTINGS_DEFAULTS
+        if settings.get("strict_mode", False) and combined_decision["final_verdict"].upper() == "SUSPICIOUS":
+            analysis.verdict = "SUSPICIOUS"
+            final_status = "PENDING_REVIEW"
+        else:
+            analysis.verdict = combined_decision["final_verdict"]
+            final_status = "DONE"
+
         analysis.meta    = meta_data
 
         _persist_model_runs(
@@ -394,7 +404,7 @@ def run_video_analysis(
             xception_result=xception_result,
             wav2lip_result=wav2lip_result,
         )
-        _finalize_analysis_log(db, analysis, start_time, status="DONE")
+        _finalize_analysis_log(db, analysis, start_time, status=final_status)
 
         try:
             _maybe_insert_blocklist(analysis, db)
@@ -472,7 +482,7 @@ def run_capture_analysis(
         _sys.path.insert(0, _bd)
 
     from db import SessionLocal
-    from models import MediaAnalysis
+    from models import MediaAnalysis, User
     from opencv_pipeline import process_frames_for_sequence
     from scripts import altfreezing_service, vit_service, xception_service, wav2lip_service
     from scripts.altfreezing_config import SEQUENCE_LENGTH as ALT_SEQ_LEN
@@ -484,6 +494,7 @@ def run_capture_analysis(
         _persist_model_runs,
         _maybe_insert_blocklist,
         _prune_analysis_uploads,
+        _SETTINGS_DEFAULTS,
     )
 
     upload_dir = Path(upload_dir_str)
@@ -624,8 +635,9 @@ def run_capture_analysis(
 
             _update(self, "inference_wav2lip")
             if audio_path and os.path.exists(audio_path):
+                seq_dir = upload_dir / f"{analysis_id}_seq"
                 wav2lip_result = wav2lip_service.wav2lip_sync_score(
-                    frames_dir=str(raw_dir),
+                    frames_dir=str(seq_dir),
                     audio_path=audio_path,
                     weights_path="checkpoints/wav2lip_gan.pth",
                 )
@@ -680,7 +692,16 @@ def run_capture_analysis(
         _update(self, "saving")
 
         analysis.score   = float(combined_decision.get("score") or 0.0)
-        analysis.verdict = combined_decision["final_verdict"]
+        
+        user = db.query(User).filter(User.id == analysis.user_id).first()
+        settings = user.settings if user and user.settings else _SETTINGS_DEFAULTS
+        if settings.get("strict_mode", False) and combined_decision["final_verdict"].upper() == "SUSPICIOUS":
+            analysis.verdict = "SUSPICIOUS"
+            final_status = "PENDING_REVIEW"
+        else:
+            analysis.verdict = combined_decision["final_verdict"]
+            final_status = "DONE"
+
         analysis.meta    = meta_data
 
         _persist_model_runs(
@@ -689,7 +710,7 @@ def run_capture_analysis(
             vit_result=vit_result, xception_result=xception_result,
             wav2lip_result=wav2lip_result,
         )
-        _finalize_analysis_log(db, analysis, start_time, status="DONE")
+        _finalize_analysis_log(db, analysis, start_time, status=final_status)
 
         try:
             _maybe_insert_blocklist(analysis, db)

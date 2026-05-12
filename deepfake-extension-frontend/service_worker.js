@@ -155,6 +155,31 @@ chrome.webNavigation.onHistoryStateUpdated.addListener(handleNavigation, {
   url: [{ hostContains: "youtube.com" }],
 });
 
+// ── Extension heartbeat ───────────────────────────────────────────────────────
+// Fires every 2 minutes to keep last_seen_at fresh on the backend so the
+// monitoring dashboard shows the extension as "Online".  The backend's
+// get_current_user dependency updates last_seen_at on every authenticated call,
+// so this endpoint is just a lightweight keepalive.
+async function sendHeartbeat() {
+  let token = null;
+  try {
+    const st = await chrome.storage.local.get(["extensionToken", "extensionTokenMap"]);
+    token = st.extensionToken;
+    if (!token) {
+      const map = st.extensionTokenMap || {};
+      for (const e of Object.values(map)) { if (e?.token) { token = e.token; break; } }
+    }
+  } catch { }
+  if (!token) return;
+  try {
+    await fetch(`${API_BASE}/api/extension/heartbeat`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+  } catch { /* network down — will retry on next alarm */ }
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
 chrome.runtime.onInstalled.addListener(async () => {
   const st = await chrome.storage.local.get(["monitoringEnabled", "scanned", "blocked"]);
   await chrome.storage.local.set({
@@ -166,13 +191,22 @@ chrome.runtime.onInstalled.addListener(async () => {
   });
   syncBlocklist().catch(() => { });
   chrome.alarms.create("blocklist_sync", { periodInMinutes: 30 });
+  chrome.alarms.create("extension_heartbeat", { periodInMinutes: 2 });
 });
 
 // Re-populate the in-memory set whenever the SW wakes up after being killed.
 chrome.runtime.onStartup.addListener(() => {
   rebuildBlockedSet().catch(() => { });
+  // Ensure the heartbeat alarm is always running (recreate if the SW was killed)
+  chrome.alarms.get("extension_heartbeat", (alarm) => {
+    if (!alarm) chrome.alarms.create("extension_heartbeat", { periodInMinutes: 2 });
+  });
+  sendHeartbeat().catch(() => { });
 });
 rebuildBlockedSet().catch(() => { });
+// Send a heartbeat immediately when the SW loads so the monitoring dashboard
+// reflects "Online" as soon as the extension starts or is updated.
+sendHeartbeat().catch(() => { });
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -276,8 +310,19 @@ async function waitUntilReady(tabId, lockedVideoId) {
   return false;
 }
 
-async function postToBackend(meta, blobs, audioBlob = null) {
-  const { extensionToken } = await chrome.storage.local.get(["extensionToken"]);
+async function postToBackend(meta, blobs, audioBlob = null, userId = null) {
+  // Prefer the per-user token so that multiple users can each have their own
+  // portal link active simultaneously (e.g. regular + incognito windows).
+  let extensionToken = null;
+  if (userId) {
+    const { extensionTokenMap } = await chrome.storage.local.get(["extensionTokenMap"]);
+    extensionToken = (extensionTokenMap || {})[userId]?.token || null;
+  }
+  if (!extensionToken) {
+    // Fallback to the legacy single-token slot (backward compat)
+    const st = await chrome.storage.local.get(["extensionToken"]);
+    extensionToken = st.extensionToken;
+  }
   if (!extensionToken) throw new Error("Connect the extension to the portal first.");
   const fd = new FormData();
   fd.append("meta", JSON.stringify(meta));
@@ -311,7 +356,44 @@ async function postToBackend(meta, blobs, audioBlob = null) {
     const txt = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status} ${txt}`.trim());
   }
-  return res.json();
+  const json = await res.json();
+
+  // If the backend queued the task (Celery available), poll until DONE/ERROR.
+  // This keeps the popup informed of progress without blocking the upload.
+  if (json.status === "queued" && json.analysis_id) {
+    return await _pollCaptureUntilDone(json, extensionToken);
+  }
+  return json;
+}
+
+async function _pollCaptureUntilDone(queued, extensionToken) {
+  const analysisId = queued.analysis_id;
+  const deadline   = Date.now() + 300_000; // 5-minute timeout
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 3000));
+    try {
+      const res = await fetch(`${API_BASE}/api/analysis/${analysisId}/status`, {
+        headers: { Authorization: `Bearer ${extensionToken}` },
+      });
+      if (!res.ok) continue;
+      const status = await res.json();
+      console.log(`[SW][Poll] analysis_id=${analysisId} status=${status.status} progress=${status.progress ?? "?"}% stage=${status.stage ?? "?"}`);
+      if (status.status === "DONE" || status.status === "ERROR") {
+        return {
+          ok:          status.status === "DONE",
+          analysis_id: analysisId,
+          verdict:     status.verdict  ?? "INCONCLUSIVE",
+          score:       status.score    ?? 0,
+          status:      status.status,
+          confidence:  status.confidence,
+          reason:      status.reason,
+          signals:     status.signals,
+        };
+      }
+    } catch { /* network blip — retry next interval */ }
+  }
+  // Timed out — return whatever we have
+  return { ok: false, analysis_id: analysisId, verdict: "INCONCLUSIVE", score: 0, status: "TIMEOUT", detail: "Analysis timed out after 5 minutes" };
 }
 
 async function ensureOffscreenDocument() {
@@ -402,6 +484,8 @@ async function handleCaptureSuccess(out, meta) {
     lastAnalysisVerdict: out?.verdict ?? null,
     lastAnalysisScore: out?.score ?? 0,
     lastAnalysisStatus: out?.status ?? null,
+    lastAnalysisReason: out?.reason ?? null,
+    lastAnalysisConfidence: out?.confidence ?? null,
     lastAnalysisMeta: meta ?? null,
     lastPortalUrl: out?.analysis_id
       ? `${PORTAL_ANALYSIS_URL}/${encodeURIComponent(out.analysis_id)}`
@@ -444,6 +528,7 @@ async function syncBlocklist() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "blocklist_sync") syncBlocklist().catch(() => { });
+  if (alarm.name === "extension_heartbeat") sendHeartbeat().catch(() => { });
   // capture_keepalive: no-op — just wakes the SW to prevent it being killed mid-capture.
 });
 
@@ -471,11 +556,72 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   if (msg?.type === "DISCONNECT_EXTENSION") {
     (async () => {
+      // Remove only the specific user's entry from the token map (if provided).
+      const userId = msg.userId || null;
+      if (userId) {
+        const { extensionTokenMap } = await chrome.storage.local.get(["extensionTokenMap"]);
+        const map = extensionTokenMap || {};
+        delete map[userId];
+        await chrome.storage.local.set({ extensionTokenMap: map });
+      }
       await revokeLinkedExtensionSelf();
       await clearExtensionLinkState();
       try { await chrome.runtime.sendMessage({ type: "EXTENSION_LINK_UPDATED" }); } catch { }
       sendResponse({ ok: true });
     })().catch(err => sendResponse({ ok: false, error: String(err?.message || err) }));
+  }
+
+  if (msg?.type === "PORTAL_INITIATE_CONNECT") {
+    (async () => {
+      try {
+        // Build cryptographic PKCE link similar to popup.js to keep state within the SW
+        function randomString(length = 64) {
+          const bytes = new Uint8Array(length);
+          crypto.getRandomValues(bytes);
+          return Array.from(bytes, b => (b % 36).toString(36)).join("");
+        }
+        function base64UrlEncode(bytes) {
+          let binary = "";
+          bytes.forEach(b => (binary += String.fromCharCode(b)));
+          return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+        }
+        async function sha256Base64Url(input) {
+          const encoded = new TextEncoder().encode(input);
+          const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
+          return base64UrlEncode(new Uint8Array(hashBuffer));
+        }
+
+        const requestId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        const codeVerifier = randomString(96);
+        const codeChallenge = await sha256Base64Url(codeVerifier);
+        
+        const res = await fetch(`${API_BASE}/api/extension/link/request`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ request_id: requestId, code_challenge: codeChallenge, device_name: "Chrome Extension (Portal Link)", extension_version: chrome.runtime.getManifest().version }),
+        });
+        const json = await res.json();
+        if (!res.ok || !json.ok) throw new Error(json.detail || "Failed to create link request.");
+        
+        await chrome.storage.local.set({
+          extensionLinkStatus: "pending", extensionLinkRequestId: requestId,
+          extensionCodeVerifier: codeVerifier, extensionLinkError: "",
+          extensionToken: null, linkedUser: null, linkedDevice: null,
+        });
+
+        const CONNECT_URL = `${FRONTEND_BASE}/extension/connect`;
+        // Navigate or create tab to the Connect window
+        await chrome.tabs.create({ url: `${CONNECT_URL}?request_id=${encodeURIComponent(requestId)}` });
+        
+        // Also trigger popup's check if it happens to be open
+        try { await chrome.runtime.sendMessage({ type: "EXTENSION_LINK_UPDATED" }); } catch {}
+        sendResponse({ ok: true });
+        
+      } catch (err) {
+        await chrome.storage.local.set({ extensionLinkStatus: "error", extensionLinkError: err.message || "Failed to connect via portal." });
+        try { await chrome.runtime.sendMessage({ type: "EXTENSION_LINK_UPDATED" }); } catch {}
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
     return true;
   }
 
@@ -591,30 +737,54 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
       const shouldFallback = !nativeRes?.ok || !Array.isArray(nativeRes.frames) ||
         nativeRes.frames.length === 0 || nativeBlankRatio >= BLANK_FALLBACK_THRESHOLD;
 
-      if (shouldFallback) {
-        sendResponse({
-          ok: false, error: "live_capture_insufficient_frames",
-          detail: `Got ${nativeRes?.frames?.length ?? 0} frames (blank ratio: ${nativeBlankRatio.toFixed(2)}).`,
-          capture_debug: captureDebug,
-        });
-        return;
-      }
+      let blobs = [];
+      let tsMs = [];
+      let audioBlob = null;
+      let usedFallback = false;
 
-      const blobs = [];
-      for (let i = 0; i < nativeRes.frames.length; i++) {
-        const blob = dataUrlToBlob(nativeRes.frames[i]);
-        blob.__filename = `frame_${String(i).padStart(3, "0")}.jpg`;
-        blobs.push(blob);
+      if (shouldFallback) {
+        // Canvas capture blocked (DRM / taint) — fall back to tabCapture via offscreen doc
+        console.warn(`[SW] Canvas capture failed (blank ratio: ${nativeBlankRatio.toFixed(2)}), falling back to tabCapture.`);
+        try {
+          const offscreenRes = await captureViaOffscreenTab(tabId);
+          if (offscreenRes?.blobs?.length > 0) {
+            blobs = offscreenRes.blobs;
+            tsMs  = offscreenRes.tsMs || [];
+            if (offscreenRes.audioBlob) audioBlob = offscreenRes.audioBlob;
+            usedFallback = true;
+            console.log(`[SW] tabCapture fallback succeeded: ${blobs.length} frames`);
+          } else {
+            sendResponse({
+              ok: false, error: "live_capture_insufficient_frames",
+              detail: `Canvas blank (ratio: ${nativeBlankRatio.toFixed(2)}) and tabCapture fallback returned no frames.`,
+              capture_debug: captureDebug,
+            });
+            return;
+          }
+        } catch (fallbackErr) {
+          console.warn("[SW] tabCapture fallback failed:", fallbackErr);
+          sendResponse({
+            ok: false, error: "live_capture_insufficient_frames",
+            detail: `Canvas blank (ratio: ${nativeBlankRatio.toFixed(2)}) and tabCapture fallback failed: ${fallbackErr.message}`,
+            capture_debug: captureDebug,
+          });
+          return;
+        }
+      } else {
+        for (let i = 0; i < nativeRes.frames.length; i++) {
+          const blob = dataUrlToBlob(nativeRes.frames[i]);
+          blob.__filename = `frame_${String(i).padStart(3, "0")}.jpg`;
+          blobs.push(blob);
+        }
+        tsMs = nativeRes.tsMs || [];
       }
-      const tsMs = nativeRes.tsMs || [];
 
       // Audio blob recorded by content script alongside frames (for Wav2Lip)
-      let audioBlob = null;
-      if (nativeRes.audioB64) {
+      if (!usedFallback && nativeRes.audioB64) {
         audioBlob = dataUrlToBlob(nativeRes.audioB64);
         audioBlob.__filename = "audio.webm";
         console.log("[SW] Audio captured from video element, size:", audioBlob.size);
-      } else {
+      } else if (!usedFallback) {
         console.warn("[SW] Content-script capture returned no audio. Trying offscreen tab audio fallback.", {
           captureDebug,
         });
@@ -649,7 +819,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         has_audio: !!audioBlob,
       };
 
-      const out = await postToBackend(meta, blobs, audioBlob);
+      const out = await postToBackend(meta, blobs, audioBlob, msg.userId || null);
       await handleCaptureSuccess(out, meta);
 
       // ── Metric: capture_latency (full user-facing wall-clock) ────────────────

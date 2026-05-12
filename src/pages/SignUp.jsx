@@ -3,10 +3,12 @@ import { useNavigate } from "react-router-dom";
 import AuthLayout from "../components/AuthLayout";
 import form from "../shared/AuthForm.module.css";
 import page from "./SignUp.module.css";
-import { registerUser } from "../api/auth";
+import { registerUser, saveSession } from "../api/auth";
 import LegalModal from "../components/LegalModal";
 import TermsContent from "../components/TermsContent";
 import PrivacyContent from "../components/PrivacyContent";
+import PasswordStrengthMeter from "../components/PasswordStrengthMeter";
+import { isStrongPassword } from "../utils/passwordStrength";
 
 const BACKEND = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
 
@@ -33,8 +35,8 @@ export default function SignUp() {
     setError("");
 
     // 1. Frontend Validation
-    if (password.length < 8 || password.length > 72) {
-      setError("Password must be 8 to 72 characters.");
+    if (!isStrongPassword(password)) {
+      setError("Password does not meet the strength requirements shown below.");
       return;
     }
 
@@ -66,8 +68,7 @@ export default function SignUp() {
 
       // If backend returns token directly (shouldn't for local signup in your expectation)
       if (result?.token) {
-        localStorage.setItem("token", result.token);
-        localStorage.setItem("user", JSON.stringify(result.user));
+        saveSession(result.token, result.user);
         nav("/dashboard", { replace: true });
         return;
       }
@@ -163,6 +164,7 @@ export default function SignUp() {
               </button>
 
             </div>
+            <PasswordStrengthMeter password={password} />
           </div>
 
           <label className={page.termsRow}>

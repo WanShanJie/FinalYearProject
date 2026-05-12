@@ -6,12 +6,7 @@ export default function AuthLayout({ title, subtitle, children }) {
     <div className={styles.root}>
       <div className={styles.grid}>
         <div className={styles.leftPanel}>
-          <div className={styles.backLinkWrap}>
-            <a href="#" className={styles.backLink}>
-              <span style={{ fontSize: 18 }}>‹</span>
-              {/* Back to dashboard */}
-            </a>
-          </div>
+
 
           <div className={styles.leftInner}>
             <h1 className={styles.title}>{title}</h1>
@@ -43,9 +38,7 @@ export default function AuthLayout({ title, subtitle, children }) {
             </div>
           </div>
 
-          <button type="button" className={styles.fab} aria-label="Theme">
-            ☾
-          </button>
+
         </div>
       </div>
     </div>

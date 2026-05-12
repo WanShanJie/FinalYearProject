@@ -1,13 +1,16 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./MediaAnalysis.module.css";
 import { ImageIcon, SearchIcon } from "../components/system/SystemIcons";
 import { getDisplayMetrics } from "./mediaAnalysisShared";
 import { getAnalysisStatus } from "../api/auth";
+import { formatDate } from "../utils/formatDate";
 
 // ── In-progress states that should trigger polling ────────────────────────────
 const ACTIVE_STATUSES = new Set(["PENDING", "PROCESSING"]);
+// Stop polling jobs that have been active for more than 12 minutes client-side
+const MAX_POLL_AGE_MS = 12 * 60 * 1000;
 
 // ── Progress bar shown for PENDING / PROCESSING rows ─────────────────────────
 const STAGE_LABELS = {
@@ -70,8 +73,167 @@ function VerdictBadge({ verdict, color, bg }) {
   );
 }
 
+const API_BASE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function UploadPanel({ onQueued }) {
+  const [file, setFile] = React.useState(null);
+  const [title, setTitle] = React.useState("");
+  const [platform, setPlatform] = React.useState("");
+  const [dragging, setDragging] = React.useState(false);
+  const [uploading, setUploading] = React.useState(false);
+  const [uploadMsg, setUploadMsg] = React.useState("");
+  const inputRef = React.useRef(null);
+
+  function pickFile(f) {
+    if (!f) return;
+    setFile(f);
+    if (!title) setTitle(f.name.replace(/\.[^.]+$/, ""));
+    setUploadMsg("");
+  }
+
+  function onDrop(e) {
+    e.preventDefault();
+    setDragging(false);
+    const f = e.dataTransfer?.files?.[0];
+    if (f) pickFile(f);
+  }
+
+  async function handleSubmit() {
+    if (!file) return;
+    setUploading(true);
+    setUploadMsg("Uploading…");
+    try {
+      const token = localStorage.getItem("token");
+      const fd = new FormData();
+      fd.append("file", file);
+      if (title) fd.append("title", title);
+      if (platform) fd.append("platform", platform);
+
+      const res = await fetch(`${API_BASE}/api/analysis/video`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` },
+        body: fd,
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) throw new Error(json.detail || "Upload failed");
+
+      setUploadMsg(`Queued — analysis #${json.analysis_id}`);
+      onQueued({
+        id: json.analysis_id,
+        title: title || file.name,
+        platform: platform || "upload",
+        status: "PENDING",
+        verdict: "PENDING",
+        score: 0,
+        created_at: new Date().toISOString(),
+        _progress: 0,
+        _stage: "queued",
+      });
+      setFile(null);
+      setTitle("");
+      setPlatform("");
+    } catch (err) {
+      setUploadMsg(`Error: ${err.message}`);
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  return (
+    <article className={styles.uploadPanel}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+        <div>
+          <div style={{ fontWeight: 700, fontSize: "1rem", color: "var(--text)" }}>Submit Video for Analysis</div>
+          <div style={{ fontSize: "0.8rem", color: "var(--muted)", marginTop: 2 }}>
+            Upload a video file — it will be queued and processed in the background
+          </div>
+        </div>
+      </div>
+
+      <div
+        className={dragging ? `${styles.uploadZone} ${styles.uploadZoneDrag}` : styles.uploadZone}
+        onDragOver={e => { e.preventDefault(); setDragging(true); }}
+        onDragLeave={() => setDragging(false)}
+        onDrop={onDrop}
+        onClick={() => inputRef.current?.click()}
+      >
+        <input
+          ref={inputRef}
+          type="file"
+          accept="video/*,.mp4,.mov,.avi,.webm,.mkv"
+          style={{ display: "none" }}
+          onChange={e => pickFile(e.target.files?.[0])}
+        />
+        <div className={styles.uploadZoneText}>
+          {dragging ? "Drop to upload" : "Click or drag a video file here"}
+        </div>
+        <div className={styles.uploadZoneSub}>MP4, MOV, AVI, WebM, MKV — any size</div>
+      </div>
+
+      {file && (
+        <div className={styles.uploadFileSelected}>
+          <span style={{ fontSize: "1.2rem" }}>🎬</span>
+          <span className={styles.uploadFileName}>{file.name}</span>
+          <span className={styles.uploadFileSize}>{formatBytes(file.size)}</span>
+        </div>
+      )}
+
+      {file && (
+        <div className={styles.uploadFields}>
+          <div className={styles.uploadField}>
+            <input
+              type="text"
+              placeholder="Title (optional)"
+              value={title}
+              onChange={e => setTitle(e.target.value)}
+            />
+          </div>
+          <div className={styles.uploadField}>
+            <select value={platform} onChange={e => setPlatform(e.target.value)}>
+              <option value="">Platform (optional)</option>
+              <option value="youtube">YouTube</option>
+              <option value="facebook">Facebook</option>
+              <option value="tiktok">TikTok</option>
+              <option value="upload">Direct Upload</option>
+            </select>
+          </div>
+        </div>
+      )}
+
+      {file && (
+        <div className={styles.uploadActions}>
+          <button
+            className={styles.uploadSubmitBtn}
+            onClick={handleSubmit}
+            disabled={uploading}
+          >
+            {uploading ? "Uploading…" : "Analyze Video"}
+          </button>
+          <button
+            className={styles.uploadClearBtn}
+            onClick={() => { setFile(null); setTitle(""); setPlatform(""); setUploadMsg(""); }}
+            disabled={uploading}
+          >
+            Clear
+          </button>
+          {uploadMsg && (
+            <span className={styles.uploadProgress}>{uploadMsg}</span>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
 export default function MediaAnalysis() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [query, setQuery] = useState("");
   const [currentPage, setCurrentPage] = useState(1);
   const [detections, setDetections] = useState([]);
@@ -109,11 +271,25 @@ export default function MediaAnalysis() {
     }
   }, [navigate]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => { 
+    fetchData(); 
+    window.addEventListener("force-sync", fetchData);
+    return () => window.removeEventListener("force-sync", fetchData);
+  }, [fetchData]);
 
   // ── Poll active jobs every 3 s, stop when none remain ────────────────────
   useEffect(() => {
-    const activeItems = detections.filter(d => ACTIVE_STATUSES.has(d.status));
+    const now = Date.now();
+    const activeItems = detections.filter(d =>
+      ACTIVE_STATUSES.has(d.status) &&
+      (now - new Date(d.created_at).getTime()) < MAX_POLL_AGE_MS
+    );
+    // Mark timed-out items as ERROR locally so they stop being polled
+    detections.forEach(d => {
+      if (ACTIVE_STATUSES.has(d.status) && (now - new Date(d.created_at).getTime()) >= MAX_POLL_AGE_MS) {
+        setDetections(prev => prev.map(x => x.id === d.id ? { ...x, status: "ERROR", verdict: "INCONCLUSIVE" } : x));
+      }
+    });
     if (activeItems.length === 0) {
       clearTimeout(pollTimerRef.current);
       return;
@@ -254,12 +430,32 @@ export default function MediaAnalysis() {
   }
 
   const filteredItems = useMemo(() => {
-    const value = query.trim().toLowerCase();
-    if (!value) return detections;
-    return detections.filter((item) =>
-      [item.title, item.platform, item.verdict, item.page_url].join(" ").toLowerCase().includes(value)
-    );
-  }, [query, detections]);
+    let result = detections;
+    
+    // Combine local query with Sidebar search params
+    const sq = (query || searchParams.get("search") || "").trim().toLowerCase();
+    const dt = searchParams.get("date");
+    const vd = searchParams.get("verdict");
+
+    if (sq) {
+      result = result.filter(item =>
+        [item.title, item.platform, item.verdict, item.page_url].join(" ").toLowerCase().includes(sq)
+      );
+    }
+    
+    if (dt) {
+      result = result.filter(item => item.created_at && item.created_at.startsWith(dt));
+    }
+    
+    if (vd && vd !== "All") {
+      result = result.filter(item => {
+        const metrics = getDisplayMetrics(item.verdict, item.score);
+        return metrics.displayVerdict.toLowerCase() === vd.toLowerCase();
+      });
+    }
+    
+    return result;
+  }, [query, detections, searchParams]);
 
   useEffect(() => {
     setCurrentPage(1);
@@ -295,6 +491,8 @@ export default function MediaAnalysis() {
           <span>History overview</span>
         </div>
       </section>
+
+
 
       {feedback && (
         <section className={feedback.type === "error" ? styles.feedbackError : styles.feedbackSuccess}>
@@ -359,7 +557,7 @@ export default function MediaAnalysis() {
                       </div>
                       <div className={styles.mediaMeta}>
                         <strong>{item.title || "Untitled media"}</strong>
-                        <span>{item.platform || "Web"} – {new Date(item.created_at).toLocaleDateString()}</span>
+                        <span>{item.platform || "Web"} – {formatDate(item.created_at)}</span>
                         {!isActive && (
                           <span className={styles.riskLabel} style={{ color: metrics.scoreColor }}>
                             {metrics.riskLevel} – {metrics.riskScore}%

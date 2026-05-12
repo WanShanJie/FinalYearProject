@@ -185,6 +185,8 @@ async function fingerprintElement(el) {
 
 async function processMedia(el) {
   if (window.__captureInProgress || !monitoringEnabled) return;
+  if (_scannedMedia.has(el)) return;
+  _scannedMedia.add(el);
   try {
     const hash = await fingerprintElement(el);
     if (!hash) return;
@@ -332,6 +334,7 @@ function addWatchPageWarning(entry) {
 
 async function checkVideoIdOnPage() {
   if (window.__captureInProgress) return;
+  if (!monitoringEnabled) return;
   try {
     // ── Metric: watch_page_to_blocked_covered ──────────────────────────────
     const t0Watch = performance.now();
@@ -387,6 +390,7 @@ var YT_CARD_SELECTORS = [
 ].join(", ");
 
 var _scannedCards = new WeakSet();
+var _scannedMedia = new WeakSet();
 
 function extractCardVideoId(card) {
   // New YouTube UI lockup model stores video ID in a data attribute
@@ -607,6 +611,7 @@ async function processYouTubeCard(card) {
 
 function scanYouTubeCards(root = document) {
   if (window.__captureInProgress) return;
+  if (!monitoringEnabled) return;
   if (!location.hostname.includes("youtube.com")) return;
   try {
     root.querySelectorAll(YT_CARD_SELECTORS).forEach(card => {
@@ -638,6 +643,7 @@ window.addEventListener("yt-navigate-finish", () => {
   currentUrl = location.href;
   _videoIdCache.clear();
   _scannedCards = new WeakSet();
+  _scannedMedia = new WeakSet();
   document.querySelectorAll("[data-df-warning]").forEach(el => el.remove());
   document.querySelectorAll("[data-df-watch-warning]").forEach(el => el.remove());
   clearTimeout(scanTimer);
@@ -664,6 +670,7 @@ var mo = new MutationObserver((mutations) => {
     currentUrl = location.href;
     _videoIdCache.clear();
     _scannedCards = new WeakSet();
+    _scannedMedia = new WeakSet();
     document.querySelectorAll("[data-df-warning]").forEach(el => el.remove());
     document.querySelectorAll("[data-df-watch-warning]").forEach(el => el.remove());
     clearTimeout(scanTimer);
@@ -1173,6 +1180,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg?.type === "BLOCKLIST_UPDATED") {
       _videoIdCache.clear();
       _scannedCards = new WeakSet();
+      _scannedMedia = new WeakSet();
       if (!window.__captureInProgress) {
         checkVideoIdOnPage().catch(() => { });
         scanExisting();
@@ -1181,10 +1189,48 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return;
     }
 
+    if (msg?.type === "GET_PORTAL_USER") {
+      // Called by the extension popup/SW to determine which portal account is
+      // active in this tab, enabling per-user token isolation.
+      try {
+        const raw = localStorage.getItem("token");
+        if (!raw) { sendResponse({ ok: false }); return; }
+        const payload = JSON.parse(atob(raw.split(".")[1]));
+        sendResponse({ ok: true, userId: String(payload.sub), email: payload.email || null });
+      } catch { sendResponse({ ok: false }); }
+      return;
+    }
+
     sendResponse({ ok: false, error: "unknown_message_type" });
   })();
 
   return true;
+});
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (msg?.type === "EXTENSION_LINK_UPDATED") {
+    window.postMessage({ type: "A2U_EXTENSION_STATUS_CHANGED" }, "*");
+  }
+});
+
+// ── Bridge between Web Portal (Settings.jsx) and Extension ──────────────────
+window.addEventListener("message", (event) => {
+  const data = event.data;
+  if (!data || !data.type) return;
+
+  if (data.type === "A2U_PORTAL_REVOKED") {
+    try {
+      const raw = localStorage.getItem("token");
+      const payload = raw ? JSON.parse(atob(raw.split(".")[1])) : null;
+      safeSendMessage({ type: "DISCONNECT_EXTENSION", userId: payload ? String(payload.sub) : null });
+    } catch {
+      safeSendMessage({ type: "DISCONNECT_EXTENSION" });
+    }
+  }
+  
+  if (data.type === "A2U_PORTAL_CONNECT") {
+    safeSendMessage({ type: "PORTAL_INITIATE_CONNECT" });
+  }
 });
 
 // ── Init ──────────────────────────────────────────────────────────────────────

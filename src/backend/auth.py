@@ -18,13 +18,14 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, hashed: str) -> bool:
     return pwd_ctx.verify(password, hashed)
 
-def create_token(user_id: int, email: str, role: str = "USER"):
-    """Create a signed JWT with user_id, email, role, and 24-hour expiry."""
+def create_token(user_id: int, email: str, role: str = "USER", must_change_password: bool = False):
+    """Create a signed JWT with user_id, email, role, must_change_password, and 24-hour expiry."""
     expire = datetime.utcnow() + timedelta(minutes=TOKEN_EXPIRE_MIN)
     payload = {
         "sub": str(user_id),
         "email": email,
         "role": role,
+        "must_change_password": must_change_password,
         "exp": expire,
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)

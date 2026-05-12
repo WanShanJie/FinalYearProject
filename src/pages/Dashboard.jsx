@@ -2,7 +2,7 @@ import React from "react";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./Dashboard.module.css";
 import { AlertIcon, EyeIcon, ImageIcon, SearchIcon, ShieldIcon } from "../components/system/SystemIcons";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
 
 import { VERDICT_CONFIG } from "../constants/verdictColors";
@@ -162,6 +162,7 @@ function DashboardPreview({ analysisId, alt }) {
 
 export default function Dashboard() {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [stats, setStats] = React.useState({
     totalScans: 0,
     threatsBlocked: 0,
@@ -172,46 +173,77 @@ export default function Dashboard() {
   const [loading, setLoading] = React.useState(true);
   const [trendRange, setTrendRange] = React.useState("7d");
 
-  React.useEffect(() => {
-    async function fetchData() {
-      try {
-        const token = localStorage.getItem("token");
-        const [statsRes, activityRes] = await Promise.all([
-          fetch("http://localhost:8000/api/analysis/stats", {
-            headers: { Authorization: `Bearer ${token}` }
-          }),
-          fetch("http://localhost:8000/api/analysis", {
-            headers: { Authorization: `Bearer ${token}` }
-          })
-        ]);
+  const fetchData = React.useCallback(async () => {
+    try {
+      setLoading(true);
+      const token = localStorage.getItem("token");
+      const [statsRes, activityRes] = await Promise.all([
+        fetch("http://localhost:8000/api/analysis/stats", {
+          headers: { Authorization: `Bearer ${token}` }
+        }),
+        fetch("http://localhost:8000/api/analysis", {
+          headers: { Authorization: `Bearer ${token}` }
+        })
+      ]);
 
-        if (statsRes.status === 401 || activityRes.status === 401) {
-          localStorage.removeItem("token");
-          localStorage.removeItem("user");
-          navigate("/signin", { replace: true });
-          return;
-        }
-
-        const statsData = await statsRes.json();
-        const activityData = await activityRes.json();
-
-        if (statsData.ok) {
-          setStats((prev) => ({ ...prev, ...statsData.stats }));
-        }
-        if (activityData.ok && activityData.data) {
-          setActivity(activityData.data);
-        }
-      } catch (err) {
-        console.error("Dashboard fetch error:", err);
-      } finally {
-        setLoading(false);
+      if (statsRes.status === 401 || activityRes.status === 401) {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        navigate("/signin", { replace: true });
+        return;
       }
+
+      const statsData = await statsRes.json();
+      const activityData = await activityRes.json();
+
+      if (statsData.ok) {
+        setStats((prev) => ({ ...prev, ...statsData.stats }));
+      }
+      if (activityData.ok && activityData.data) {
+        setActivity(activityData.data);
+      }
+    } catch (err) {
+      console.error("Dashboard fetch error:", err);
+    } finally {
+      setLoading(false);
     }
-    fetchData();
   }, [navigate]);
 
-  const recentActivity = React.useMemo(() => activity.slice(0, 4), [activity]);
-  const trendData = React.useMemo(() => buildTrendSeries(activity, trendRange), [activity, trendRange]);
+  React.useEffect(() => {
+    fetchData();
+    window.addEventListener("force-sync", fetchData);
+    return () => window.removeEventListener("force-sync", fetchData);
+  }, [fetchData]);
+
+  // --- Filtering based on SystemSidebar search parameters ---
+  const filteredActivity = React.useMemo(() => {
+    let result = activity;
+    const sq = searchParams.get("search")?.toLowerCase();
+    const dt = searchParams.get("date");
+    const vd = searchParams.get("verdict");
+
+    if (sq) {
+      result = result.filter(a => 
+        (a.title && a.title.toLowerCase().includes(sq)) || 
+        (a.page_url && a.page_url.toLowerCase().includes(sq))
+      );
+    }
+    if (dt) {
+      // dt is YYYY-MM-DD from input[type="date"]
+      result = result.filter(a => a.created_at && a.created_at.startsWith(dt));
+    }
+    if (vd && vd !== "All") {
+      result = result.filter(a => {
+        const met = getDashboardMetrics(a.verdict, a.score);
+        return met.displayLabel.toLowerCase() === vd.toLowerCase();
+      });
+    }
+
+    return result;
+  }, [activity, searchParams]);
+
+  const recentActivity = React.useMemo(() => filteredActivity.slice(0, 4), [filteredActivity]);
+  const trendData = React.useMemo(() => buildTrendSeries(filteredActivity, trendRange), [filteredActivity, trendRange]);
 
   const trendSummary = React.useMemo(() => {
     let scans = 0;
@@ -229,7 +261,7 @@ export default function Dashboard() {
     let inconclusive = 0;
     let threatCount = 0;
 
-    activity.forEach((item) => {
+    filteredActivity.forEach((item) => {
       const { displayLabel, isThreat } = getDashboardMetrics(item.verdict, item.score);
       if (isThreat) threatCount++;
       if (displayLabel === "Fake") fake++;
@@ -238,7 +270,7 @@ export default function Dashboard() {
     });
 
     return { total: threatCount, fake, suspicious, inconclusive };
-  }, [activity]);
+  }, [filteredActivity]);
 
   return (
     <div className={layout.page}>
@@ -410,10 +442,10 @@ export default function Dashboard() {
           <div className={styles.timelineList}>
             {loading ? (
               <div className={styles.panelMessage}>Loading timeline...</div>
-            ) : activity.length === 0 ? (
+            ) : filteredActivity.length === 0 ? (
               <div className={styles.panelMessage}>No activity found.</div>
             ) : (
-              activity.slice(0, 5).map((item) => {
+              filteredActivity.slice(0, 5).map((item) => {
                 const { displayLabel, color, bg } = getDashboardMetrics(item.verdict, item.score);
                 return (
                   <button

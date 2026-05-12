@@ -34,10 +34,13 @@
   "content_scripts": [
     {
       "matches": [
-        "<all_urls>",
         "https://www.youtube.com/*",
         "https://*.youtube.com/*",
-        "https://youtu.be/*"
+        "https://youtu.be/*",
+        "https://www.facebook.com/*",
+        "https://*.facebook.com/*",
+        "https://www.tiktok.com/*",
+        "http://localhost:5173/*"
       ],
       "js": [
         "shared/verdictColors.js",

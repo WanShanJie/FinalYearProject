@@ -35,6 +35,16 @@ async function handleResponse(res) {
   }
 
   if (!res.ok) {
+    if (res.status === 401) {
+      if (typeof window !== "undefined") {
+        localStorage.removeItem("token");
+        localStorage.removeItem("user");
+        localStorage.removeItem("role");
+        if (!window.location.pathname.startsWith("/signin")) {
+          window.location.href = "/signin";
+        }
+      }
+    }
     throw new Error(extractErrorMessage(data));
   }
 
@@ -114,6 +124,49 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+// ── Session helpers ───────────────────────────────────────────────────────────
+// Always clear the previous user's data before writing a new session.
+// This prevents cross-user data leakage when two accounts share the same browser.
+
+export function clearSession() {
+  localStorage.removeItem("token");
+  localStorage.removeItem("user");
+  localStorage.removeItem("role");
+  // Dispatch a storage event so other open tabs (same origin) detect the change.
+  window.dispatchEvent(new Event("session-changed"));
+}
+
+export function saveSession(token, user, role) {
+  // Wipe any previous session first so stale data can never bleed through.
+  localStorage.removeItem("token");
+  localStorage.removeItem("user");
+  localStorage.removeItem("role");
+  localStorage.setItem("token", token);
+  if (user) localStorage.setItem("user", JSON.stringify(user));
+  // Store role from response payload (or decode from JWT as fallback)
+  const resolvedRole = role || getRoleFromToken(token) || "USER";
+  localStorage.setItem("role", resolvedRole);
+  window.dispatchEvent(new Event("session-changed"));
+}
+
+/**
+ * Decode the role from the JWT payload without a library.
+ * Returns "USER" | "ADMIN" | null.
+ */
+export function getRoleFromToken(token) {
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    return payload.role || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Convenience: returns the stored role string or "USER" as default. */
+export function getStoredRole() {
+  return localStorage.getItem("role") || "USER";
+}
+
 export async function getAdminStats() {
   const res = await fetch(`${API_BASE}/api/admin/stats`, {
     headers: authHeaders(),
@@ -125,6 +178,45 @@ export async function getAdminLogs(limit = 20) {
   const res = await fetch(`${API_BASE}/api/admin/logs?limit=${limit}`, {
     headers: authHeaders(),
   });
+  return handleResponse(res);
+}
+
+export async function getAdminHealth() {
+  const res = await fetch(`${API_BASE}/api/admin/health`, {
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function getAdminInfra() {
+  const res = await fetch(`${API_BASE}/api/admin/infra`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+export async function getAdminPipeline() {
+  const res = await fetch(`${API_BASE}/api/admin/pipeline`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+export async function getAdminTraffic() {
+  const res = await fetch(`${API_BASE}/api/admin/traffic`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+export async function getAdminModelAnalytics() {
+  const res = await fetch(`${API_BASE}/api/admin/model-analytics`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+export async function getAdminDowntime(range = "24h") {
+  const res = await fetch(`${API_BASE}/api/admin/downtime?range=${range}`, {
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function getAdminMetricsHistory(range = "1h", start = null, end = null) {
+  let url = `${API_BASE}/api/admin/metrics/history?range=${range}`;
+  if (start && end) {
+    url += `&start_ts=${encodeURIComponent(start)}&end_ts=${encodeURIComponent(end)}`;
+  }
+  const res = await fetch(url, { headers: authHeaders() });
   return handleResponse(res);
 }
 
@@ -164,44 +256,6 @@ export async function submitVideoAnalysis(file, meta = {}) {
  *   verdict?, score?, reason?,  // when DONE
  *   error?,                     // when ERROR
  * }>}
- */
-export async function getAnalysisStatus(analysisId) {
-  const res = await fetch(`${API_BASE}/api/analysis/${analysisId}/status`, {
-    headers: authHeaders(),
-  });
-  return handleResponse(res);
-}
-
-// ── Async video analysis (Celery task queue) ─────────────────────────────────
-
-/**
- * Submit a video file for background deepfake analysis.
- * Returns immediately with { ok, analysis_id, status: "queued" }.
- * Use getAnalysisStatus() or submitAndPoll() to track progress.
- *
- * @param {File}   videoFile
- * @param {object} opts  - { title, platform, page_url }
- */
-export async function submitVideoAnalysis(videoFile, { title = "", platform = "", page_url = "" } = {}) {
-  const form = new FormData();
-  form.append("file", videoFile);
-  if (title)    form.append("title", title);
-  if (platform) form.append("platform", platform);
-  if (page_url) form.append("page_url", page_url);
-
-  // Do NOT set Content-Type header — the browser sets the multipart boundary.
-  const res = await fetch(`${API_BASE}/api/analysis/video`, {
-    method: "POST",
-    headers: authHeaders(),
-    body: form,
-  });
-  return handleResponse(res);
-}
-
-/**
- * Poll the status of a single analysis.
- * @param {number} analysisId
- * @returns {{ ok, analysis_id, status, progress?, verdict?, score?, reason? }}
  */
 export async function getAnalysisStatus(analysisId) {
   const res = await fetch(`${API_BASE}/api/analysis/${analysisId}/status`, {
@@ -264,3 +318,69 @@ export async function submitAndPoll(
 
   setTimeout(_poll, intervalMs);
 }
+
+// ── User / Admin API ──────────────────────────────────────────────────────────
+
+export async function getMe() {
+  const res = await fetch(`${API_BASE}/api/me`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+
+export async function updateProfile(payload) {
+  const res = await fetch(`${API_BASE}/api/me`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(res);
+}
+
+export async function listUsers() {
+  const res = await fetch(`${API_BASE}/api/admin/users`, { headers: authHeaders() });
+  return handleResponse(res);
+}
+
+export async function approveUser(userId) {
+  const res = await fetch(`${API_BASE}/api/admin/users/${userId}/approve`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function revokeUser(userId) {
+  const res = await fetch(`${API_BASE}/api/admin/users/${userId}/revoke`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  return handleResponse(res);
+}
+
+export async function setUserRole(userId, role) {
+  const res = await fetch(`${API_BASE}/api/admin/users/${userId}/set-role`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ role }),
+  });
+  return handleResponse(res);
+}
+
+export async function createAdminUser(payload) {
+  // payload: { email, first_name, last_name, role }
+  const res = await fetch(`${API_BASE}/api/admin/users/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleResponse(res);
+}
+
+export async function setInitialPassword(newPassword) {
+  const res = await fetch(`${API_BASE}/api/auth/set-initial-password`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify({ new_password: newPassword }),
+  });
+  return handleResponse(res);
+}
+

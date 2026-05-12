@@ -1,20 +1,71 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import layout from "../components/system/SystemLayout.module.css";
 import styles from "./BlocklistManager.module.css";
+import { formatDate } from "../utils/formatDate";
 import { blockControls, moderationRules, moderationWorkflow } from "../data/systemMockData";
 import { AlertIcon, LockIcon, ShieldIcon, SyncIcon } from "../components/system/SystemIcons";
+
+const API_BASE = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+function authHeaders() {
+  return { "Content-Type": "application/json", Authorization: `Bearer ${localStorage.getItem("token")}` };
+}
 
 export default function BlocklistManager() {
   const navigate = useNavigate();
   const [autoBlock, setAutoBlock] = useState(blockControls.autoBlockEnabled);
   const [globalProtection, setGlobalProtection] = useState(blockControls.globalProtection);
   const [strictMode, setStrictMode] = useState(blockControls.strictMode);
+  const [controlsLoaded, setControlsLoaded] = useState(false);
+  const [saveStatus, setSaveStatus] = useState(null);
+  const saveTimer = useRef(null);
   const [blockedItems, setBlockedItems] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [removingId, setRemovingId] = useState(null);
   const [feedback, setFeedback] = useState(null);
+
+  // ── Load controls from backend on mount ──────────────────────────────────
+  useEffect(() => {
+    async function loadControls() {
+      try {
+        const res = await fetch(`${API_BASE}/api/settings`, { headers: authHeaders() });
+        if (res.status === 401) { navigate("/signin", { replace: true }); return; }
+        const json = await res.json();
+        if (json.ok && json.settings) {
+          const s = json.settings;
+          setAutoBlock(s.auto_block ?? blockControls.autoBlockEnabled);
+          setGlobalProtection(s.global_protection ?? blockControls.globalProtection);
+          setStrictMode(s.strict_mode ?? blockControls.strictMode);
+        }
+      } catch { /* keep defaults */ }
+      finally { setControlsLoaded(true); }
+    }
+    loadControls();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const persistControls = useCallback(async (patch) => {
+    setSaveStatus("saving");
+    clearTimeout(saveTimer.current);
+    try {
+      const res = await fetch(`${API_BASE}/api/settings`, {
+        method: "PUT",
+        headers: authHeaders(),
+        body: JSON.stringify(patch),
+      });
+      if (res.status === 401) { navigate("/signin", { replace: true }); return; }
+      const json = await res.json();
+      setSaveStatus(json.ok ? "saved" : "error");
+    } catch { setSaveStatus("error"); }
+    saveTimer.current = setTimeout(() => setSaveStatus(null), 2000);
+  }, [navigate]);
+
+  function toggleControl(field, setter, current) {
+    const next = !current;
+    setter(next);
+    persistControls({ [field]: next });
+  }
 
   function resolveApiError(payload, fallbackMessage) {
     if (typeof payload?.detail === "string") return payload.detail;
@@ -109,9 +160,14 @@ export default function BlocklistManager() {
             Configure blocking controls and remove blocked media when it should become accessible again. Active entries shown here are enforced by the backend and extension sync.
           </p>
         </div>
-        <div className={layout.pill}>
-          <ShieldIcon className={styles.smallIcon} />
-          <span>Policy-driven enforcement</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {saveStatus === "saving" && <span style={{ fontSize: 13, color: "#94a3b8" }}>Saving…</span>}
+          {saveStatus === "saved"  && <span style={{ fontSize: 13, color: "#22c55e" }}>Saved</span>}
+          {saveStatus === "error"  && <span style={{ fontSize: 13, color: "#ef4444" }}>Save failed</span>}
+          <div className={layout.pill}>
+            <ShieldIcon className={styles.smallIcon} />
+            <span>Policy-driven enforcement</span>
+          </div>
         </div>
       </section>
 
@@ -126,22 +182,25 @@ export default function BlocklistManager() {
           title="Auto-block deepfakes"
           description="Automatically block content when fake confidence crosses the configured threshold."
           checked={autoBlock}
-          onChange={() => setAutoBlock((prev) => !prev)}
+          onChange={() => toggleControl("auto_block", setAutoBlock, autoBlock)}
           tone="blue"
+          disabled={!controlsLoaded}
         />
         <ControlCard
           title="Global blocking protection"
           description="Apply synced community rules and known threat fingerprints to new detections."
           checked={globalProtection}
-          onChange={() => setGlobalProtection((prev) => !prev)}
+          onChange={() => toggleControl("global_protection", setGlobalProtection, globalProtection)}
           tone="cyan"
+          disabled={!controlsLoaded}
         />
         <ControlCard
           title="Strict suspicious policy"
           description="Keep suspicious items in review queue unless explicitly allowed by an analyst."
           checked={strictMode}
-          onChange={() => setStrictMode((prev) => !prev)}
+          onChange={() => toggleControl("strict_mode", setStrictMode, strictMode)}
           tone="amber"
+          disabled={!controlsLoaded}
         />
       </section>
 
@@ -267,7 +326,7 @@ export default function BlocklistManager() {
                       </span>
                     </td>
                     <td>{entry.analysis_id ? `#${entry.analysis_id}` : "-"}</td>
-                    <td>{entry.created_at ? new Date(entry.created_at).toLocaleDateString() : "-"}</td>
+                    <td>{entry.created_at ? formatDate(entry.created_at) : "-"}</td>
                     <td>
                       <button
                         type="button"
@@ -289,7 +348,7 @@ export default function BlocklistManager() {
   );
 }
 
-function ControlCard({ title, description, checked, onChange, tone }) {
+function ControlCard({ title, description, checked, onChange, tone, disabled }) {
   return (
     <article className={`${layout.card} ${styles.controlCard}`}>
       <div className={styles.controlTop}>
@@ -301,6 +360,7 @@ function ControlCard({ title, description, checked, onChange, tone }) {
           type="button"
           role="switch"
           aria-checked={checked}
+          disabled={disabled}
           className={checked ? `${styles.switch} ${styles[`switch_${tone}`]} ${styles.switchActive}` : styles.switch}
           onClick={onChange}
         >

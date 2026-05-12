@@ -1,7 +1,7 @@
 import React from "react";
 import { NavLink, useNavigate } from "react-router-dom";
+import { clearSession, getStoredRole } from "../../api/auth";
 import styles from "./SystemLayout.module.css";
-import { headerNav } from "../../data/systemMockData";
 import logo from "../../assets/deepfake_logo.png";
 import {
   BellIcon,
@@ -16,34 +16,52 @@ import {
   UserIcon,
 } from "./SystemIcons";
 
+import UserMenu from "./UserMenu";
+
 const iconMap = {
   dashboard:  DashboardIcon,
   media:      SearchIcon,
   blocklist:  ListIcon,
+  "admin-panel": DashboardIcon,
   monitoring: MonitorIcon,
-  settings:   SettingsIcon,
 };
 
 export default function SystemHeader({ theme, onToggleTheme }) {
   const navigate = useNavigate();
   const [user, setUser] = React.useState(null);
 
-  React.useEffect(() => {
+  function readUser() {
     try {
       const storedUser = localStorage.getItem("user");
-      if (storedUser) {
-        setUser(JSON.parse(storedUser));
-      }
-    } catch (e) {
-      console.error("Error parsing user from localStorage", e);
+      setUser(storedUser ? JSON.parse(storedUser) : null);
+    } catch {
+      setUser(null);
     }
+  }
+
+  React.useEffect(() => {
+    readUser();
+    // Re-read user whenever another tab or the current tab changes the session
+    // (saveSession / clearSession both dispatch "session-changed").
+    window.addEventListener("session-changed", readUser);
+    window.addEventListener("storage", readUser);
+    return () => {
+      window.removeEventListener("session-changed", readUser);
+      window.removeEventListener("storage", readUser);
+    };
   }, []);
 
-  function logout() {
-    localStorage.removeItem("token");
-    localStorage.removeItem("user");
-    navigate("/signin", { replace: true });
-  }
+  const [role, setRole] = React.useState(getStoredRole);
+
+  React.useEffect(() => {
+    function readRole() { setRole(getStoredRole()); }
+    window.addEventListener("session-changed", readRole);
+    window.addEventListener("storage", readRole);
+    return () => {
+      window.removeEventListener("session-changed", readRole);
+      window.removeEventListener("storage", readRole);
+    };
+  }, []);
 
   return (
     <header className={styles.header}>
@@ -56,7 +74,17 @@ export default function SystemHeader({ theme, onToggleTheme }) {
       </div>
 
       <nav className={styles.navTabs} aria-label="Primary navigation">
-        {headerNav.map((item) => {
+        {/* Base nav items — visible to all authenticated users */}
+        {[
+          { label: "Dashboard",      to: "/dashboard",       key: "dashboard" },
+          { label: "Media Analysis", to: "/media-analysis",  key: "media" },
+          { label: "Blocklist",      to: "/blocklist-manager", key: "blocklist" },
+          // Admin-only items
+          ...(role === "ADMIN" ? [
+            { label: "Admin Panel",  to: "/admin/panel",     key: "admin-panel" },
+            { label: "Monitoring",   to: "/admin/monitoring", key: "monitoring" },
+          ] : []),
+        ].map((item) => {
           const Icon = iconMap[item.key] || DashboardIcon;
           return (
             <NavLink
@@ -83,20 +111,7 @@ export default function SystemHeader({ theme, onToggleTheme }) {
           <span className={styles.notificationDot} />
         </button>
 
-        <div className={styles.userProfile}>
-          <div className={styles.userInfo}>
-            <span className={styles.userName}>{user ? `${user.first_name || ""} ${user.last_name || ""}` : "User"}</span>
-            <span className={styles.userRole}>Analyst</span>
-          </div>
-          <button className={styles.avatarButton} type="button" aria-label="User account">
-            <UserIcon className={styles.actionIcon} />
-          </button>
-        </div>
-
-        <button className={styles.logoutButton} type="button" onClick={logout}>
-          <LogoutIcon className={styles.actionIcon} />
-          <span>Logout</span>
-        </button>
+        <UserMenu user={user} />
       </div>
     </header>
   );
