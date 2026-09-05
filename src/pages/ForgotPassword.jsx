@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { forgotPassword } from "../api/auth";
 import AuthLayout from "../components/AuthLayout";
 import form from "../shared/AuthForm.module.css";
@@ -9,6 +10,7 @@ export default function ForgotPassword() {
   const [isErr, setIsErr] = useState(false);
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
+  const navigate = useNavigate();
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -31,6 +33,7 @@ export default function ForgotPassword() {
     <AuthLayout
       title="Forgot Password"
       subtitle="Enter your account email and we'll send a reset link."
+      onBack={() => navigate("/signin")}
     >
       {msg && (
         <div style={{
